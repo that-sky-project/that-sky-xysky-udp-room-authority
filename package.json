@@ -1,0 +1,32 @@
+{
+  "name": "hermes-room-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "High-concurrency manager-side room orchestration service and node protocol standard.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "tsc -p tsconfig.json && node --watch dist/runtime/main.js",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/runtime/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@isaacs/ttlcache": "^1.4.1",
+    "fast-json-stringify": "^6.0.1",
+    "ioredis": "^5.5.0",
+    "lru-cache": "^11.0.2",
+    "pino": "^9.5.0",
+    "pino-std-serializers": "^7.0.0",
+    "ws": "^8.21.3",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.0"
+  }
+}
