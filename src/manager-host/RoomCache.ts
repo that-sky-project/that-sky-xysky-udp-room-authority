@@ -8,6 +8,7 @@ export interface PlayerLocation {
   nodeId: NodeId;
   roomId: RoomId;
   updatedAt: UnixMs;
+  level?: number | undefined;
 }
 
 export interface RoomCacheOptions {
@@ -117,8 +118,16 @@ export class RoomCache {
     return results;
   }
 
-  public trackPlayer(playerId: PlayerId, nodeId: NodeId, roomId: RoomId): void {
-    this.playerLocations.set(playerId, { playerId, nodeId, roomId, updatedAt: asUnixMs(Date.now()) });
+  public trackPlayer(playerId: PlayerId, nodeId: NodeId, roomId: RoomId, level?: number): void {
+    const previous = this.playerLocations.get(playerId);
+    this.playerLocations.set(playerId, {
+      playerId,
+      nodeId,
+      roomId,
+      updatedAt: asUnixMs(Date.now()),
+      // Keep a previously reported level if this update omits it (e.g. re-tracking without player payload).
+      level: level ?? previous?.level
+    });
   }
 
   public untrackPlayer(playerId: PlayerId, roomId?: RoomId): void {
@@ -161,7 +170,7 @@ export class RoomCache {
     }
 
     if (event.event === "player.join" && event.data.player?.playerId && event.data.roomId) {
-      this.trackPlayer(event.data.player.playerId, event.data.nodeId, event.data.roomId);
+      this.trackPlayer(event.data.player.playerId, event.data.nodeId, event.data.roomId, event.data.player.level);
       this.bumpPlayers(event.data.roomId, 1, event.data.version);
     }
 

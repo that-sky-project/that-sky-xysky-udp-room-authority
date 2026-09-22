@@ -7,7 +7,7 @@ import type { Logger } from "../infra/logger/logger.js";
 import type { ManagerConfig } from "../config/env.js";
 import type { ManagerRuntime } from "./ManagerRuntime.js";
 import type { NodeTransport } from "./NodeRegistry.js";
-import { asNodeId, asProtocolVersion, asRoomId, asUnixMs } from "../types/branded.js";
+import { asNodeId, asPlayerId, asProtocolVersion, asRoomId, asUnixMs } from "../types/branded.js";
 import { AllocationRequestSchema, NodeAckSchema, NodeEventSchema, type IManagerCommand, type INodeEvent } from "../types/contracts.js";
 import { ErrorCode, HermesError, isHermesError } from "../types/errors.js";
 
@@ -140,6 +140,35 @@ export class ManagerGateway {
         const playerId = decodeURIComponent(encodedPlayerId);
         const friendIds = await this.runtime.social.getFriendIds(playerId, url.searchParams.get("refresh") === "1");
         this.writeJson(res, 200, { playerId, friendIds });
+        return;
+      }
+
+      const roomMatch = method === "GET" ? /^\/players\/([^/]+)\/room$/.exec(url.pathname) : undefined;
+      if (roomMatch) {
+        const encodedPlayerId = roomMatch[1];
+        if (!encodedPlayerId) throw new HermesError(ErrorCode.BAD_REQUEST, "playerId is required");
+        const playerId = asPlayerId(decodeURIComponent(encodedPlayerId));
+
+        const location = this.runtime.rooms.getPlayerLocation(playerId);
+        if (!location) throw new HermesError(ErrorCode.NOT_FOUND, "player is not in any known room", { playerId });
+
+        const room = this.runtime.rooms.getRoom(location.roomId);
+        if (!room) throw new HermesError(ErrorCode.NOT_FOUND, "player room is no longer available", { playerId, roomId: location.roomId });
+
+        const telemetry = this.runtime.moves.telemetry.get(playerId);
+        this.writeJson(res, 200, {
+          code: ErrorCode.OK,
+          data: {
+            playerId,
+            roomId: room.roomId,
+            udp: { host: room.udpHost, port: room.udpPort },
+            players: room.players,
+            capacity: room.capacity,
+            level: location.level ?? null,
+            levelId: telemetry?.levelId ?? null,
+            updatedAt: location.updatedAt
+          }
+        });
         return;
       }
 
