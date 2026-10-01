@@ -6,25 +6,41 @@ export interface StoredTelemetry extends PlayerTelemetry {
   receivedAt: number;
   stableDissatisfaction: number;
   migrationPressure: number;
+  emaVelocity?: number | undefined;
   lastMigratedAt?: number | undefined;
+}
+
+export interface TelemetryStoreOptions {
+  stateEmaHalfLifeMs: number;
 }
 
 export class TelemetryStore {
   private readonly players = new Map<PlayerId, StoredTelemetry>();
   private readonly reservations = new Map<RoomId, Map<string, { expiresAt: number; slots: number }>>();
 
+  public constructor(private readonly options: TelemetryStoreOptions = { stateEmaHalfLifeMs: 3_000 }) {}
+
   public upsert(roomId: RoomId, input: PlayerTelemetry, now = Date.now()): StoredTelemetry {
     const previous = this.players.get(input.playerId);
+    const rawVelocity = input.velocity ?? previous?.velocity ?? 0;
     const next: StoredTelemetry = {
       ...previous,
       ...input,
       roomId,
       receivedAt: now,
       stableDissatisfaction: previous?.stableDissatisfaction ?? 0.5,
-      migrationPressure: previous?.migrationPressure ?? 0
+      migrationPressure: previous?.migrationPressure ?? 0,
+      emaVelocity: this.smooth(previous?.emaVelocity, rawVelocity, previous?.receivedAt, now)
     };
     this.players.set(input.playerId, next);
     return next;
+  }
+
+  private smooth(prev: number | undefined, value: number, prevAt: number | undefined, now: number): number {
+    if (prev === undefined || prevAt === undefined) return value;
+    const dt = Math.max(0, now - prevAt);
+    const alpha = 1 - Math.pow(0.5, dt / Math.max(1, this.options.stateEmaHalfLifeMs));
+    return prev + alpha * (value - prev);
   }
 
   public remove(playerId: PlayerId): void { this.players.delete(playerId); }
@@ -76,17 +92,5 @@ export class TelemetryStore {
     if (slots >= hold.slots) holds.delete(moveId);
     else holds.set(moveId, { ...hold, slots: hold.slots - Math.max(0, slots) });
     if (holds.size === 0) this.reservations.delete(roomId);
-  }
-
-  public updatePressure(playerId: PlayerId, dissatisfaction: number, dtMs: number): StoredTelemetry | undefined {
-    const player = this.players.get(playerId);
-    if (!player) return undefined;
-    const alpha = 1 - Math.exp(-Math.max(0, dtMs) / 20_000);
-    const stableDissatisfaction = player.stableDissatisfaction + alpha * (dissatisfaction - player.stableDissatisfaction);
-    const threshold = 0.35;
-    const pressure = Math.max(0, Math.min(1, player.migrationPressure + (dtMs / 1000) * (0.04 * Math.max(0, stableDissatisfaction - threshold) - 0.015 * player.migrationPressure)));
-    const next = { ...player, stableDissatisfaction, migrationPressure: pressure };
-    this.players.set(playerId, next);
-    return next;
   }
 }

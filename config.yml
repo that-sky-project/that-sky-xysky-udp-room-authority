@@ -1,0 +1,72 @@
+# Hermes Room Manager (QWD) configuration.
+# This file is the single source of configuration. The manager does NOT read
+# any environment variables.
+
+# ---------------------------------------------------------------------------
+# Listener
+# ---------------------------------------------------------------------------
+# One HTTP server serves BOTH:
+#   - the WebSocket control channel that UDP room nodes connect to (path "/")
+#   - the HTTP JSON API, including POST {allocate_path} used by XYSky/matchmakers
+host: 0.0.0.0
+port: 1131
+allocate_path: /allocate
+
+logging:
+  # pino level: fatal | error | warn | info | debug | trace
+  level: info
+
+# ---------------------------------------------------------------------------
+# Room cache
+# ---------------------------------------------------------------------------
+rooms:
+  max_rooms: 100000          # LRU capacity for the room snapshot cache
+  candidate_room_limit: 256  # max rooms scanned per allocation request
+  stale_room_ms: 120000      # drop a room snapshot after this long without updates
+  max_players_per_room: 8    # hard per-room cap (Sky rooms are 8 players)
+
+# ---------------------------------------------------------------------------
+# Node health
+# ---------------------------------------------------------------------------
+nodes:
+  stale_ms: 10000                 # a node is unhealthy after this long without events
+  backpressure_limit_bytes: 8388608  # stop sending if a node's WS send buffer exceeds this
+  circuit_open_ms: 5000           # how long a node's circuit stays open after tripping
+  circuit_failure_threshold: 5    # consecutive command failures that trip the circuit
+
+# ---------------------------------------------------------------------------
+# Allocation / reservations
+# ---------------------------------------------------------------------------
+assignment:
+  ttl_ms: 30000                   # lifetime of a RoomAssignment returned to a caller
+  reservation_shadow_ttl_ms: 10000  # lifetime of a local shadow hold before the node confirms
+
+# ---------------------------------------------------------------------------
+# Node command channel
+# ---------------------------------------------------------------------------
+commands:
+  timeout_ms: 3000      # wait this long for a node ack before failing a command
+  max_pending: 100000   # cap on outstanding (unacked) commands
+
+# ---------------------------------------------------------------------------
+# Cross-room moves (merge / rebalance)
+# ---------------------------------------------------------------------------
+move:
+  budget_per_cycle: 8         # max moves started per planning cycle
+  transaction_timeout_ms: 15000  # abort a move transaction that does not complete in time
+  room_cooldown_ms: 20000     # hysteresis: skip a room as move source/target for this long after a move
+  state_ema_half_life_ms: 3000  # smoothing half-life for velocity-derived signals (anti-thrash)
+  distance_radius: 30         # length scale for proximity = exp(-dist/radius); GAME UNITS, calibrate
+  cluster_radius: 12          # same-level players within this distance form a move cluster
+  isolation_pressure_weight: 0.6  # how much spatial isolation drives per-player migration pressure
+  stale_pressure_weight: 0.4  # how much staleness drives per-player migration pressure
+  merge_pressure_threshold: 0.55  # a room becomes a move source above this
+  minimum_gain: 0.2           # a plan must exceed this gain to execute
+
+# ---------------------------------------------------------------------------
+# Debug HTTP endpoints (/debug/allnode, /debug/move).
+# Leave api_token empty to keep them disabled; set a token to require it via
+# the "x-debug-token" header or an "Authorization: Bearer <token>" header.
+# ---------------------------------------------------------------------------
+debug:
+  api_token: ""

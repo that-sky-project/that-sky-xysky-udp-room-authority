@@ -47,36 +47,6 @@ export class CrossCoordinator {
     );
   }
 
-  public async redirectPlayer(plan: RedirectPlan, signal?: AbortSignal): Promise<INodeAck> {
-    const fromLocation = this.rooms.getPlayerLocation(plan.playerId);
-    if (!fromLocation) {
-      throw new HermesError(ErrorCode.NOT_FOUND, "player location is unknown", { playerId: plan.playerId });
-    }
-
-    const fromTransport = this.nodes.getTransport(fromLocation.nodeId);
-    if (!fromTransport || !fromTransport.writable || !this.nodes.isAvailableForCommand(fromLocation.nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, "source node is not writable", { nodeId: fromLocation.nodeId });
-    }
-
-    return this.sendToNode(
-      fromLocation.nodeId,
-      {
-        v: asProtocolVersion(1),
-        cmd: "player.redirect",
-        data: {
-          playerId: plan.playerId,
-          fromRoomId: plan.fromRoomId,
-          toRoomId: plan.to.roomId,
-          udpHost: plan.to.udpHost,
-          udpPort: plan.to.udpPort,
-          reason: plan.reason
-        }
-      },
-      (command) => fromTransport.send(command),
-      signal
-    );
-  }
-
   public async redirectPlayers(plan: RedirectPlan & { playerIds: PlayerId[]; moveId?: string }, signal?: AbortSignal): Promise<INodeAck> {
     const firstPlayerId = plan.playerIds[0];
     if (!firstPlayerId) throw new HermesError(ErrorCode.BAD_REQUEST, "move has no players");
@@ -97,45 +67,6 @@ export class CrossCoordinator {
         reason: plan.reason
       }
     }, (command) => transport.send(command), signal);
-  }
-
-  public async destroyRoom(roomId: RoomId, signal?: AbortSignal): Promise<INodeAck> {
-    const room = this.rooms.getRoom(roomId);
-    if (!room) throw new HermesError(ErrorCode.NOT_FOUND, "room is unknown", { roomId });
-
-    const transport = this.nodes.getTransport(room.nodeId);
-    if (!transport || !transport.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, "target node is not writable", { nodeId: room.nodeId });
-    }
-
-    return this.sendToNode(
-      room.nodeId,
-      {
-        v: asProtocolVersion(1),
-        cmd: "room.destroy",
-        data: { roomId, expectedVersion: room.version }
-      },
-      (command) => transport.send(command),
-      signal
-    );
-  }
-
-  public async drainNode(nodeId: NodeId, signal?: AbortSignal): Promise<INodeAck> {
-    const transport = this.nodes.getTransport(nodeId);
-    if (!transport || !transport.writable || !this.nodes.isAvailableForCommand(nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, "target node is not writable", { nodeId });
-    }
-    this.nodes.markDraining(nodeId, true);
-    return this.sendToNode(
-      nodeId,
-      {
-        v: asProtocolVersion(1),
-        cmd: "node.drain",
-        data: { mode: "graceful" }
-      },
-      (command) => transport.send(command),
-      signal
-    );
   }
 
   private async sendToNode<TData>(

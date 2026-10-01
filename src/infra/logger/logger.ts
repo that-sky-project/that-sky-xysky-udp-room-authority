@@ -1,7 +1,9 @@
 import pino from "pino";
 
+// Level defaults to "info" and is overridden from config.yml at startup
+// (see runtime/main.ts). The manager does not read environment variables.
 export const logger = pino({
-  level: process.env.LOG_LEVEL ?? "info",
+  level: "info",
   base: {
     service: "hermes-room-manager"
   },

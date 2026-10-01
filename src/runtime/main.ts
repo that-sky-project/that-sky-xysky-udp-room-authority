@@ -1,9 +1,10 @@
-import { loadConfig } from "../config/env.js";
+import { loadConfig } from "../config/index.js";
 import { logger } from "../infra/logger/logger.js";
 import { ManagerGateway } from "../manager-host/ManagerGateway.js";
 import { createManagerRuntime } from "../manager-host/ManagerRuntime.js";
 
 const config = loadConfig();
+logger.level = config.logLevel;
 const runtime = createManagerRuntime(config);
 const gateway = new ManagerGateway(config, runtime, logger);
 await gateway.start();

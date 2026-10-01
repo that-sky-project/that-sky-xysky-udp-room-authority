@@ -3,7 +3,7 @@ import type { NodeRegistry } from "./NodeRegistry.js";
 import type { PolicyEngine } from "./PolicyEngine.js";
 import type { ReservationTracker } from "./ReservationTracker.js";
 import type { RoomCache } from "./RoomCache.js";
-import { asUnixMs, type PlayerId } from "../types/branded.js";
+import { asUnixMs, type PlayerId, type RoomId } from "../types/branded.js";
 import type { IAllocationReply, IAllocationRequest, RoomAssignment } from "../types/contracts.js";
 import { ErrorCode, HermesError, isHermesError } from "../types/errors.js";
 
@@ -20,7 +20,11 @@ export class RequestRouter {
     private readonly policy: PolicyEngine,
     private readonly reservations: ReservationTracker,
     private readonly coordinator: CrossCoordinator,
-    private readonly options: RequestRouterOptions
+    private readonly options: RequestRouterOptions,
+    // Move reservations live in the MoveCoordinator's TelemetryStore; fold them
+    // into the effective occupancy so allocation never fills slots an in-flight
+    // move already claimed on the same target room.
+    private readonly moveReserved: (roomId: RoomId) => number = () => 0
   ) {}
 
   public async allocate(request: IAllocationRequest, signal?: AbortSignal): Promise<IAllocationReply> {
@@ -57,7 +61,7 @@ export class RequestRouter {
     });
 
     while (candidates.length > 0) {
-      const selection = this.policy.selectRoom(context, candidates, nodeHealth, (room) => this.reservations.effectivePlayers(room));
+      const selection = this.policy.selectRoom(context, candidates, nodeHealth, (room) => this.reservations.effectivePlayers(room) + this.moveReserved(room.roomId));
       if (!selection) break;
 
       const index = candidates.findIndex((room) => room.roomId === selection.room.roomId);

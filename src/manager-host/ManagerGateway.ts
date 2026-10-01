@@ -4,7 +4,7 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { randomUUID } from "node:crypto";
 import { jsonStringify } from "../infra/ws/json.js";
 import type { Logger } from "../infra/logger/logger.js";
-import type { ManagerConfig } from "../config/env.js";
+import type { ManagerConfig } from "../config/index.js";
 import type { ManagerRuntime } from "./ManagerRuntime.js";
 import type { NodeTransport } from "./NodeRegistry.js";
 import { asNodeId, asPlayerId, asProtocolVersion, asRoomId, asUnixMs } from "../types/branded.js";
@@ -130,16 +130,6 @@ export class ManagerGateway {
         if (typeof input.reason === "string") moveInput.reason = input.reason;
         const transaction = await this.runtime.moves.manualMove(moveInput);
         this.writeJson(res, 200, { code: ErrorCode.OK, data: transaction });
-        return;
-      }
-
-      const friendsMatch = method === "GET" ? /^\/players\/([^/]+)\/friends$/.exec(url.pathname) : undefined;
-      if (friendsMatch) {
-        const encodedPlayerId = friendsMatch[1];
-        if (!encodedPlayerId) throw new HermesError(ErrorCode.BAD_REQUEST, "playerId is required");
-        const playerId = decodeURIComponent(encodedPlayerId);
-        const friendIds = await this.runtime.social.getFriendIds(playerId, url.searchParams.get("refresh") === "1");
-        this.writeJson(res, 200, { playerId, friendIds });
         return;
       }
 

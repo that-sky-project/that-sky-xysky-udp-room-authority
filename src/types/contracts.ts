@@ -100,7 +100,6 @@ export const NodeEventSchema = z
             position: z.tuple([z.number(), z.number(), z.number()]).optional(),
             velocity: z.number().nonnegative().optional(),
             stateAt: unixMs.optional(),
-            friendIds: z.array(stringId.transform(asPlayerId)).max(32).optional(),
             affinity: z.record(z.number().min(0).max(1)).optional(),
             lastMoveAt: unixMs.optional()
           }).strict()).max(8)
@@ -153,7 +152,6 @@ export interface PlayerTelemetry {
   position?: [number, number, number] | undefined;
   velocity?: number | undefined;
   stateAt?: UnixMs | undefined;
-  friendIds?: PlayerId[] | undefined;
   affinity?: Record<string, number> | undefined;
   lastMoveAt?: UnixMs | undefined;
 }

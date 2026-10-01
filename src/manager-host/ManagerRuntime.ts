@@ -6,8 +6,7 @@ import { ReservationTracker } from "./ReservationTracker.js";
 import { RequestRouter } from "./RequestRouter.js";
 import { RoomCache } from "./RoomCache.js";
 import { MoveCoordinator } from "./MoveCoordinator.js";
-import { SocialDirectory } from "./SocialDirectory.js";
-import type { ManagerConfig } from "../config/env.js";
+import type { ManagerConfig } from "../config/index.js";
 
 export interface ManagerRuntime {
   nodes: NodeRegistry;
@@ -18,7 +17,6 @@ export interface ManagerRuntime {
   coordinator: CrossCoordinator;
   router: RequestRouter;
   moves: MoveCoordinator;
-  social: SocialDirectory;
 }
 
 export const createManagerRuntime = (config: ManagerConfig): ManagerRuntime => {
@@ -38,13 +36,25 @@ export const createManagerRuntime = (config: ManagerConfig): ManagerRuntime => {
     preferredFillTarget: 7
   });
   const coordinator = new CrossCoordinator(nodes, rooms, pending, { commandTimeoutMs: config.commandTimeoutMs });
+  const moves = new MoveCoordinator(rooms, nodes, pending, coordinator, {
+    moveBudgetPerCycle: config.moveBudgetPerCycle,
+    moveTransactionTimeoutMs: config.moveTransactionTimeoutMs,
+    roomCooldownMs: config.moveRoomCooldownMs,
+    stateEmaHalfLifeMs: config.moveStateEmaHalfLifeMs,
+    planner: {
+      distanceRadius: config.moveDistanceRadius,
+      clusterRadius: config.moveClusterRadius,
+      isolationPressureWeight: config.moveIsolationPressureWeight,
+      stalePressureWeight: config.moveStalePressureWeight,
+      mergePressureThreshold: config.moveMergePressureThreshold,
+      minimumGain: config.moveMinimumGain
+    }
+  });
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {
     nodeStaleMs: config.nodeStaleMs,
     assignmentTtlMs: config.assignmentTtlMs,
     candidateRoomLimit: config.candidateRoomLimit
-  });
-  const social = new SocialDirectory({ baseUrl: config.socialApiUrl, friendsPath: config.socialFriendsPath, token: config.socialApiToken, ttlMs: config.socialCacheTtlMs });
-  const moves = new MoveCoordinator(rooms, nodes, pending, coordinator, { moveBudgetPerCycle: config.moveBudgetPerCycle, moveTransactionTimeoutMs: config.moveTransactionTimeoutMs }, social);
+  }, (roomId) => moves.telemetry.reserved(roomId));
 
-  return { nodes, rooms, pending, policy, reservations, coordinator, router, moves, social };
+  return { nodes, rooms, pending, policy, reservations, coordinator, router, moves };
 };
