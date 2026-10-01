@@ -4,7 +4,7 @@ English | [中文](README_zh.md)
 
 **Hermes** is the central room-orchestration manager — referred to as **QWD** (Room Authority /
 Room Manager) across the XYSky ecosystem. It coordinates a fleet of
-[XYSKY UDP](../that-sky-xysky-udp-team/README.md) room nodes: it allocates players to rooms,
+[XYSKY UDP](https://github.com/that-sky-project/that-sky-xysky-udp-team/blob/main/README.md) room nodes: it allocates players to rooms,
 maintains a live view of the fleet, and autonomously migrates players between rooms to
 consolidate and balance activity.
 
