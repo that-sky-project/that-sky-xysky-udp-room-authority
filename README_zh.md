@@ -3,7 +3,7 @@
 [English](README.md) | 中文
 
 **Hermes** 是中心化的房间编排管理器——在 XYSky 生态中称为 **QWD**（房间权威 / 房间管理器）。
-它负责协调一组 [XYSKY UDP](../that-sky-xysky-udp-team/README_zh.md) 房间节点：将玩家分配到房间、
+它负责协调一组 [XYSKY UDP](https://github.com/that-sky-project/that-sky-xysky-udp-team/blob/main/README_zh.md) 房间节点：将玩家分配到房间、
 维护整个集群的实时视图，并自动在房间之间迁移玩家以合并与均衡活跃度。
 
 它是单进程的 Node.js / TypeScript 服务。所有权威运行时状态都保存在**内存**中（实时路径中没有数据库）。
