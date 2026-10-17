@@ -14,7 +14,7 @@ export interface RedirectPlan {
   playerId: PlayerId;
   fromRoomId: RoomId;
   to: RoomAssignment;
-  reason: "merge" | "split" | "manual" | "capacity-rebalance";
+  reason: "merge" | "split" | "manual" | "capacity-rebalance" | "level-consolidation";
 }
 
 export class CrossCoordinator {

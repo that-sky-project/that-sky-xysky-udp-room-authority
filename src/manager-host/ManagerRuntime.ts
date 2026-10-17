@@ -48,6 +48,12 @@ export const createManagerRuntime = (config: ManagerConfig): ManagerRuntime => {
       stalePressureWeight: config.moveStalePressureWeight,
       mergePressureThreshold: config.moveMergePressureThreshold,
       minimumGain: config.moveMinimumGain
+    },
+    levelMigration: {
+      minSourceLevelPlayers: config.levelMigrationMinSourcePlayers,
+      minTargetLevelPlayers: config.levelMigrationMinTargetPlayers,
+      levelChangeCooldownMs: config.levelMigrationCooldownMs,
+      maxPlayersPerMove: config.levelMigrationMaxPlayers
     }
   });
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {

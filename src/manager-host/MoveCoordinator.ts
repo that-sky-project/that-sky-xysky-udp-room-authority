@@ -8,8 +8,10 @@ import type { PendingRequestMap } from "./PendingRequestMap.js";
 import type { RoomCache } from "./RoomCache.js";
 import { MovePlanner, type MovePlan, type MovePlannerOptions } from "./MovePlanner.js";
 import { TelemetryStore } from "./TelemetryStore.js";
+import { LevelMigrationPlanner, type LevelMigrationPlan, type LevelMigrationOptions } from "./LevelMigrationPlanner.js";
 
 interface MoveTransaction extends MovePlan { moveId: string; status: "prepared" | "committed" | "completed" | "failed"; createdAt: number; joinedPlayers: string[]; leftPlayers: string[]; }
+type LevelMoveTransaction = Omit<MoveTransaction, keyof MovePlan> & LevelMigrationPlan;
 
 export interface MoveCoordinatorOptions {
   moveBudgetPerCycle?: number;
@@ -17,26 +19,35 @@ export interface MoveCoordinatorOptions {
   roomCooldownMs?: number;
   stateEmaHalfLifeMs?: number;
   planner?: Partial<MovePlannerOptions>;
+  levelMigration?: Partial<LevelMigrationOptions>;
 }
 
 export class MoveCoordinator {
   public readonly telemetry: TelemetryStore;
   private readonly planner: MovePlanner;
-  private readonly transactions = new Map<string, MoveTransaction>();
+  private readonly levelMigrationPlanner: LevelMigrationPlanner;
+  private readonly transactions = new Map<string, MoveTransaction | LevelMoveTransaction>();
   private readonly roomCooldownUntil = new Map<string, number>();
   private readonly pendingCancels = new Map<string, { roomId: RoomId; moveId: string; playerIds: string[] }>();
   private lastPlanAt = 0;
+  private readonly playerLevelChangeEvents = new Map<string, { levelId: number; timestamp: number }>();
 
   public constructor(private readonly rooms: RoomCache, private readonly nodes: NodeRegistry, private readonly pending: PendingRequestMap, private readonly cross: CrossCoordinator, private readonly options: MoveCoordinatorOptions = {}) {
     this.telemetry = new TelemetryStore({ stateEmaHalfLifeMs: options.stateEmaHalfLifeMs ?? 3_000 });
     this.planner = new MovePlanner(options.planner ?? {});
+    this.levelMigrationPlanner = new LevelMigrationPlanner(options.levelMigration ?? {});
   }
 
   public ingest(event: INodeEvent): void {
     if (event.event === "room.telemetry" && event.data.roomId) {
       const telemetryPlayers = Array.isArray(event.data.players) ? event.data.players : [];
       for (const player of telemetryPlayers) {
+        const previous = this.telemetry.get(player.playerId);
         this.telemetry.upsert(event.data.roomId, player);
+
+        if (previous && previous.levelId !== undefined && player.levelId !== undefined && previous.levelId !== player.levelId) {
+          this.playerLevelChangeEvents.set(player.playerId, { levelId: player.levelId, timestamp: Date.now() });
+        }
       }
       const room = this.rooms.getRoom(event.data.roomId);
       if (room) {
@@ -76,7 +87,7 @@ export class MoveCoordinator {
     }
   }
 
-  public async planAndExecute(signal?: AbortSignal, now = Date.now()): Promise<MoveTransaction[]> {
+  public async planAndExecute(signal?: AbortSignal, now = Date.now()): Promise<Array<MoveTransaction | LevelMoveTransaction>> {
     if (now - this.lastPlanAt < 2_000) return [...this.transactions.values()];
     this.lastPlanAt = now;
     this.drainPendingCancels();
@@ -87,11 +98,32 @@ export class MoveCoordinator {
         this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, tx.playerIds);
       }
     }
+
+    for (const [playerId, event] of this.playerLevelChangeEvents) {
+      if (now - event.timestamp > 60_000) {
+        this.playerLevelChangeEvents.delete(playerId);
+      }
+    }
+
     const rooms = this.rooms.listRooms();
     const byRoom = new Map(rooms.map((room) => [room.roomId as string, this.telemetry.listRoom(room.roomId, now)]));
     this.planner.calibrate(rooms, byRoom, now);
+
+    const levelPlans = this.planLevelMigrations(rooms, now);
+
     const plans = this.planner.plan(rooms, byRoom, now);
     const usedSources = new Set<string>(); const usedTargets = new Set<string>(); let moveBudget = this.options.moveBudgetPerCycle ?? 8;
+
+    for (const levelPlan of levelPlans) {
+      if (moveBudget < levelPlan.playerIds.length || usedSources.has(levelPlan.sourceRoomId) || usedTargets.has(levelPlan.targetRoomId)) continue;
+      const executed = await this.executeLevelMigration(levelPlan, now, signal);
+      if (executed) {
+        usedSources.add(levelPlan.sourceRoomId);
+        usedTargets.add(levelPlan.targetRoomId);
+        moveBudget -= levelPlan.playerIds.length;
+      }
+    }
+
     for (const plan of plans) {
       if (moveBudget < plan.playerIds.length || usedSources.has(plan.sourceRoomId) || usedTargets.has(plan.targetRoomId) || this.inCooldown(plan.sourceRoomId, now) || this.inCooldown(plan.targetRoomId, now)) continue;
       const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
@@ -123,8 +155,80 @@ export class MoveCoordinator {
     return [...this.transactions.values()];
   }
 
-  public list(): MoveTransaction[] { return [...this.transactions.values()]; }
-  public async manualMove(input: { sourceRoomId: string; targetRoomId: string; playerIds: string[]; reason?: string }, signal?: AbortSignal, now = Date.now()): Promise<MoveTransaction> {
+  private planLevelMigrations(rooms: RoomSnapshot[], now: number): LevelMigrationPlan[] {
+    const plans: LevelMigrationPlan[] = [];
+    const processedPlayers = new Set<string>();
+
+    for (const [playerId, event] of this.playerLevelChangeEvents) {
+      if (processedPlayers.has(playerId)) continue;
+
+      if (!this.levelMigrationPlanner.onPlayerLevelChange(playerId, event.levelId, now)) {
+        continue;
+      }
+
+      const plan = this.levelMigrationPlanner.planForPlayer(playerId, rooms, this.telemetry, now);
+      if (plan) {
+        plans.push(plan);
+        for (const pid of plan.playerIds) {
+          processedPlayers.add(pid);
+        }
+      }
+    }
+
+    const batchPlans = this.levelMigrationPlanner.planBatch(rooms, this.telemetry, now);
+    for (const plan of batchPlans) {
+      const hasProcessed = plan.playerIds.some(pid => processedPlayers.has(pid));
+      if (!hasProcessed) {
+        plans.push(plan);
+      }
+    }
+
+    return plans;
+  }
+
+  private async executeLevelMigration(plan: LevelMigrationPlan, now: number, signal?: AbortSignal): Promise<boolean> {
+    const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
+    const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
+    if (!source || !target || this.transactionsForPlayer(plan.playerIds).length > 0) return false;
+    if (this.inCooldown(plan.sourceRoomId, now) || this.inCooldown(plan.targetRoomId, now)) return false;
+
+    const moveId = `level-move-${plan.levelId}-${now}-${plan.playerIds.join("-")}`;
+    if (!this.telemetry.tryReserve(target.roomId, moveId, plan.playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) return false;
+
+    const tx: LevelMoveTransaction = {
+      ...plan,
+      moveId,
+      status: "prepared",
+      createdAt: now,
+      joinedPlayers: [],
+      leftPlayers: []
+    };
+    this.transactions.set(moveId, tx);
+
+    try {
+      const targetTransport = this.nodes.getTransport(target.nodeId);
+      if (!targetTransport || !this.nodes.isAvailableForCommand(target.nodeId)) throw new Error("target node unavailable");
+      const ack = await this.pending.send({ v: asProtocolVersion(1), cmd: "move.prepare", data: { moveId, roomId: target.roomId, playerIds: plan.playerIds, expectedVersion: target.version, ttlMs: 10_000 } }, (command) => targetTransport.send(command), signal);
+      if (ack.code !== ErrorCode.OK) throw new Error(ack.message ?? "target rejected move");
+      const first = plan.playerIds[0];
+      if (!first) throw new Error("empty level migration plan");
+      await this.cross.redirectPlayers({ playerIds: plan.playerIds.map((id) => id as PlayerId), moveId, playerId: first as PlayerId, fromRoomId: source.roomId, to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(now + 10_000) }, reason: "level-consolidation" }, signal);
+      this.transactions.set(moveId, { ...tx, status: "committed" });
+      this.telemetry.markMigrated(plan.playerIds.map((id) => id as PlayerId), now);
+      const cooldownUntil = now + (this.options.roomCooldownMs ?? 20_000);
+      this.roomCooldownUntil.set(plan.sourceRoomId, cooldownUntil);
+      this.roomCooldownUntil.set(plan.targetRoomId, cooldownUntil);
+      return true;
+    } catch {
+      this.queueCancel(target.roomId, moveId, plan.playerIds);
+      this.telemetry.releaseReservation(target.roomId, moveId);
+      this.transactions.set(moveId, { ...tx, status: "failed" });
+      return false;
+    }
+  }
+
+  public list(): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()]; }
+  public async manualMove(input: { sourceRoomId: string; targetRoomId: string; playerIds: string[]; reason?: string }, signal?: AbortSignal, now = Date.now()): Promise<MoveTransaction | LevelMoveTransaction> {
     const playerIds = [...new Set(input.playerIds.map(String).filter(Boolean))];
     if (!input.sourceRoomId || !input.targetRoomId || input.sourceRoomId === input.targetRoomId || playerIds.length === 0 || playerIds.length > 7) {
       throw new Error("invalid debug move request");
@@ -176,7 +280,7 @@ export class MoveCoordinator {
   public activitySnapshot(now = Date.now()): Array<ReturnType<MovePlanner["activity"]>> {
     return this.rooms.listRooms().map((room) => this.planner.activity(room, this.telemetry.listRoom(room.roomId, now), now));
   }
-  private transactionsForPlayer(playerIds: string[]): MoveTransaction[] { return [...this.transactions.values()].filter((tx) => tx.status === "prepared" || tx.status === "committed").filter((tx) => tx.playerIds.some((id) => playerIds.includes(id))); }
+  private transactionsForPlayer(playerIds: string[]): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()].filter((tx) => tx.status === "prepared" || tx.status === "committed").filter((tx) => tx.playerIds.some((id) => playerIds.includes(id))); }
 
   private inCooldown(roomId: string, now: number): boolean {
     const until = this.roomCooldownUntil.get(roomId);

@@ -73,7 +73,6 @@ export class MovePlanner {
     const mergePressure = occupiedFactor * ((1 - freshness) * 0.65 + (1 - occupancy) * 0.2 + (1 - activity) * 0.15) * (1 - 0.35 * cohesion);
     return { roomId: room.roomId, occupancy, freshness, movement, social, spatial, activity, mergePressure };
   }
-  // __PART3__
 
   public calibrate(rooms: RoomSnapshot[], byRoom: Map<string, StoredTelemetry[]>, now = Date.now()): void {
     const samples = rooms.map((room) => this.activity(room, byRoom.get(room.roomId) ?? [], now)).filter((sample) => sample.occupancy > 0);
@@ -92,7 +91,6 @@ export class MovePlanner {
     const total = WEIGHT_FIELDS.reduce((sum, field) => sum + raw[field], 0);
     for (const field of WEIGHT_FIELDS) this.weights[field] = raw[field] / total;
   }
-  // __PART4__
 
   public plan(rooms: RoomSnapshot[], byRoom: Map<string, StoredTelemetry[]>, now = Date.now()): MovePlan[] {
     const activities = rooms.map((room) => this.activity(room, byRoom.get(room.roomId) ?? [], now));
@@ -126,7 +124,6 @@ export class MovePlanner {
     }
     return plans.sort((a, b) => b.gain - a.gain);
   }
-  // __PART5__
 
   private velocityOf(p: StoredTelemetry): number { return p.emaVelocity ?? p.velocity ?? 0; }
 
@@ -168,7 +165,6 @@ export class MovePlanner {
     }
     return count ? total / count : 0;
   }
-  // __PART6__
 
   private cohesionPair(a: StoredTelemetry, b: StoredTelemetry, now: number): number {
     return clamp(0.5 * this.social(a, b) + 0.5 * (this.proximity(a, b, now) ?? 0));
@@ -209,7 +205,6 @@ export class MovePlanner {
     const staleCleanupBonus = 1 - sourceFreshness;
     return (targetActivity - sourceActivity) * 0.45 + staleCleanupBonus * 0.35 + pressure * 0.2 - separationLoss * 0.35 - 0.06 * group.length;
   }
-  // __PART7__
 
   private candidateGroups(players: StoredTelemetry[], maxSize: number, now: number): StoredTelemetry[][] {
     const limit = Math.min(maxSize, players.length, 7);
@@ -244,7 +239,6 @@ export class MovePlanner {
     }
     return groups;
   }
-  // __PART8__
 
   private clusterByDistance(players: StoredTelemetry[], now: number): StoredTelemetry[][] {
     const n = players.length;

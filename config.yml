@@ -62,6 +62,11 @@ move:
   stale_pressure_weight: 0.4  # how much staleness drives per-player migration pressure
   merge_pressure_threshold: 0.55  # a room becomes a move source above this
   minimum_gain: 0.2           # a plan must exceed this gain to execute
+  # Level consolidation: migrate players to rooms with more same-level players
+  level_migration_min_source_players: 2  # source room must have <= this many same-level players
+  level_migration_min_target_players: 3  # target room must have >= this many same-level players
+  level_migration_cooldown_ms: 5000      # cooldown after a player changes level
+  level_migration_max_players: 4         # max players in a single level migration
 
 # ---------------------------------------------------------------------------
 # Debug HTTP endpoints (/debug/allnode, /debug/move).
