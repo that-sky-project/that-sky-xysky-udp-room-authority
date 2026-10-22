@@ -7,6 +7,7 @@ import { RequestRouter } from "./RequestRouter.js";
 import { RoomCache } from "./RoomCache.js";
 import { MoveCoordinator } from "./MoveCoordinator.js";
 import type { ManagerConfig } from "../config/index.js";
+import type { Logger } from "../infra/logger/logger.js";
 
 export interface ManagerRuntime {
   nodes: NodeRegistry;
@@ -19,7 +20,7 @@ export interface ManagerRuntime {
   moves: MoveCoordinator;
 }
 
-export const createManagerRuntime = (config: ManagerConfig): ManagerRuntime => {
+export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): ManagerRuntime => {
   const nodes = new NodeRegistry({
     circuitOpenMs: config.nodeCircuitOpenMs,
     failureThreshold: config.nodeCircuitFailureThreshold,
@@ -33,7 +34,14 @@ export const createManagerRuntime = (config: ManagerConfig): ManagerRuntime => {
     staleNodePenalty: 30,
     loadPenaltyWeight: 40,
     sameRegionBonus: 12,
-    preferredFillTarget: 7
+    // 7 means "fill rooms to 7 before opening a new one", which concentrates
+    // every player into a single room and defeats level isolation. 2 spreads
+    // players across rooms so the level-aware score can separate them.
+    preferredFillTarget: 2,
+    // A wrong-level room must lose to any same-level or empty room that has
+    // capacity, so the penalty exceeds the widest possible fill bonus (8*7=56).
+    sameLevelBonus: 20,
+    wrongLevelPenalty: 80
   });
   const coordinator = new CrossCoordinator(nodes, rooms, pending, { commandTimeoutMs: config.commandTimeoutMs });
   const moves = new MoveCoordinator(rooms, nodes, pending, coordinator, {
@@ -49,13 +57,13 @@ export const createManagerRuntime = (config: ManagerConfig): ManagerRuntime => {
       mergePressureThreshold: config.moveMergePressureThreshold,
       minimumGain: config.moveMinimumGain
     },
-    levelMigration: {
-      minSourceLevelPlayers: config.levelMigrationMinSourcePlayers,
-      minTargetLevelPlayers: config.levelMigrationMinTargetPlayers,
-      levelChangeCooldownMs: config.levelMigrationCooldownMs,
-      maxPlayersPerMove: config.levelMigrationMaxPlayers
+    levelIsolation: {
+      minLevelPlayers: config.levelIsolationMinLevelPlayers,
+      maxPlayersPerMove: config.levelIsolationMaxPlayers,
+      sparseRoomThreshold: config.levelIsolationSparseRoomThreshold,
+      levelChangeCooldownMs: config.levelIsolationLevelChangeCooldownMs
     }
-  });
+  }, logger);
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {
     nodeStaleMs: config.nodeStaleMs,
     assignmentTtlMs: config.assignmentTtlMs,

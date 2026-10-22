@@ -14,7 +14,7 @@ export interface RedirectPlan {
   playerId: PlayerId;
   fromRoomId: RoomId;
   to: RoomAssignment;
-  reason: "merge" | "split" | "manual" | "capacity-rebalance" | "level-consolidation";
+  reason: "merge" | "split" | "manual" | "capacity-rebalance" | "level-isolation" | "level-consolidation";
 }
 
 export class CrossCoordinator {
@@ -50,13 +50,17 @@ export class CrossCoordinator {
   public async redirectPlayers(plan: RedirectPlan & { playerIds: PlayerId[]; moveId?: string }, signal?: AbortSignal): Promise<INodeAck> {
     const firstPlayerId = plan.playerIds[0];
     if (!firstPlayerId) throw new HermesError(ErrorCode.BAD_REQUEST, "move has no players");
-    const first = this.rooms.getPlayerLocation(firstPlayerId);
-    if (!first) throw new HermesError(ErrorCode.NOT_FOUND, "player location is unknown", { playerId: plan.playerIds[0] });
-    const transport = this.nodes.getTransport(first.nodeId);
-    if (!transport || !transport.writable || !this.nodes.isAvailableForCommand(first.nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, "source node is not writable", { nodeId: first.nodeId });
+    // Player locations are only maintained from player.join/leave events, so a
+    // node reconnect can leave them missing. The source room already tells us
+    // which node to address, so fall back to it instead of failing the move.
+    const sourceNodeId = this.rooms.getPlayerLocation(firstPlayerId)?.nodeId
+      ?? this.rooms.getRoom(plan.fromRoomId)?.nodeId;
+    if (!sourceNodeId) throw new HermesError(ErrorCode.NOT_FOUND, "player location is unknown", { playerId: firstPlayerId, fromRoomId: plan.fromRoomId });
+    const transport = this.nodes.getTransport(sourceNodeId);
+    if (!transport || !transport.writable || !this.nodes.isAvailableForCommand(sourceNodeId)) {
+      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, "source node is not writable", { nodeId: sourceNodeId });
     }
-    return this.sendToNode(first.nodeId, {
+    return this.sendToNode(sourceNodeId, {
       v: asProtocolVersion(1), cmd: "move.commit", data: {
         moveId: plan.moveId,
         playerIds: plan.playerIds,

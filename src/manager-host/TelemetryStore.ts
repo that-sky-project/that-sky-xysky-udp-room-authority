@@ -8,6 +8,8 @@ export interface StoredTelemetry extends PlayerTelemetry {
   migrationPressure: number;
   emaVelocity?: number | undefined;
   lastMigratedAt?: number | undefined;
+  /** When this player was last observed switching level; 0 if never seen to. */
+  levelChangedAt?: number | undefined;
 }
 
 export interface TelemetryStoreOptions {
@@ -23,6 +25,8 @@ export class TelemetryStore {
   public upsert(roomId: RoomId, input: PlayerTelemetry, now = Date.now()): StoredTelemetry {
     const previous = this.players.get(input.playerId);
     const rawVelocity = input.velocity ?? previous?.velocity ?? 0;
+    const levelChanged =
+      previous?.levelId !== undefined && input.levelId !== undefined && previous.levelId !== input.levelId;
     const next: StoredTelemetry = {
       ...previous,
       ...input,
@@ -30,7 +34,8 @@ export class TelemetryStore {
       receivedAt: now,
       stableDissatisfaction: previous?.stableDissatisfaction ?? 0.5,
       migrationPressure: previous?.migrationPressure ?? 0,
-      emaVelocity: this.smooth(previous?.emaVelocity, rawVelocity, previous?.receivedAt, now)
+      emaVelocity: this.smooth(previous?.emaVelocity, rawVelocity, previous?.receivedAt, now),
+      levelChangedAt: levelChanged ? now : previous?.levelChangedAt
     };
     this.players.set(input.playerId, next);
     return next;

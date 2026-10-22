@@ -41,9 +41,9 @@ const DEFAULT_OPTIONS: MovePlannerOptions = {
   distanceRadius: 30,
   clusterRadius: 12,
   maxStateAgeMs: 5_000,
-  moveCooldownMs: 30_000,
-  minimumGain: 0.2,
-  mergePressureThreshold: 0.55,
+  moveCooldownMs: 20_000,
+  minimumGain: 0.15,
+  mergePressureThreshold: 0.25,
   isolationPressureWeight: 0.6,
   stalePressureWeight: 0.4
 };
@@ -186,7 +186,10 @@ export class MovePlanner {
       found = true;
       if (prox > nearest) nearest = prox;
     }
-    return found ? 1 - nearest : 0;
+    // No visible peer in the source room is the strongest isolation signal there
+    // is. Reporting 0 here made a lone player's migration pressure collapse to
+    // zero, so empty rooms (the main merge case) never produced a plan.
+    return found ? 1 - nearest : 1;
   }
 
   private effectivePressure(player: StoredTelemetry, peers: StoredTelemetry[], now: number): number {

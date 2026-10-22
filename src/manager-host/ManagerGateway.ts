@@ -32,7 +32,7 @@ export class ManagerGateway {
     if (this.server) return;
 
     const server = createServer((req, res) => {
-      void this.handleHttp(req, res);
+      this.handleHttp(req, res).catch((error) => this.log.error({ err: error }, "http handler error"));
     });
     const nodeServer = new WebSocketServer({ noServer: true, maxPayload: 512 * 1024, perMessageDeflate: false });
     server.on("upgrade", (req, socket, head) => this.handleUpgrade(nodeServer, req, socket, head));
@@ -89,7 +89,7 @@ export class ManagerGateway {
         this.runtime.nodes.applyEvent(event);
         this.runtime.rooms.applyNodeEvent(event);
         this.runtime.moves.ingest(event);
-        void this.runtime.moves.planAndExecute();
+        this.runtime.moves.planAndExecute().catch((error) => this.log.error({ err: error }, "plan cycle error"));
         this.writeJson(res, 200, { code: ErrorCode.OK });
         return;
       }
@@ -231,7 +231,7 @@ export class ManagerGateway {
 
     this.runtime.nodes.register(transport);
     this.log.info({ nodeId: state.nodeId, protocolVersion: state.protocolVersion }, "node connected");
-    ws.on("message", (message, isBinary) => void this.handleNodeMessage(ws, state, message, isBinary));
+    ws.on("message", (message, isBinary) => this.handleNodeMessage(ws, state, message, isBinary).catch((error) => this.log.error({ err: error }, "node message handler error")));
     ws.on("close", () => {
       closed = true;
       const removedRooms = this.runtime.rooms.deleteRoomsByNode(state.nodeId);
@@ -275,7 +275,7 @@ export class ManagerGateway {
         this.runtime.reservations.confirm(event.data.player.playerId);
       }
       if (event.event === "room.telemetry" || event.event === "player.join" || event.event === "player.leave") {
-        void this.runtime.moves.planAndExecute();
+        this.runtime.moves.planAndExecute().catch((error) => this.log.error({ err: error }, "plan cycle error"));
       }
     } catch (error) {
       this.log.warn({ err: error, nodeId: state.nodeId }, "invalid node message");

@@ -21,6 +21,12 @@ export interface PolicyEngineOptions {
   loadPenaltyWeight: number;
   sameRegionBonus: number;
   preferredFillTarget: number;
+  /** Score bonus for a room that already runs the requesting level. */
+  sameLevelBonus: number;
+  /** Score penalty for a room running a different level; large enough to sink
+   *  it below any same-level or empty room while still allowing it as a last
+   *  resort when nothing else has capacity. */
+  wrongLevelPenalty: number;
 }
 
 export class PolicyEngine {
@@ -30,7 +36,8 @@ export class PolicyEngine {
     context: RoomRequestContext,
     rooms: RoomSnapshot[],
     nodeHealth: Map<string, NodeHealth>,
-    effectivePlayersOf: (room: RoomSnapshot) => number = (room) => room.players
+    effectivePlayersOf: (room: RoomSnapshot) => number = (room) => room.players,
+    levelsOf: (room: RoomSnapshot) => ReadonlySet<number> = () => new Set<number>()
   ): RoomSelection | undefined {
     let best: RoomSelection | undefined;
     for (const room of rooms) {
@@ -45,12 +52,25 @@ export class PolicyEngine {
       const fillDistance = Math.abs(this.options.preferredFillTarget - fillAfterJoin);
       const regionScore = context.region && room.region === context.region ? this.options.sameRegionBonus : 0;
       const loadPenalty = health.load * this.options.loadPenaltyWeight;
-      const score = 100 - fillDistance * 8 - freeSlots * 0.5 + regionScore - loadPenalty;
+      const levelScore = this.levelScore(context.level, levelsOf(room));
+      const score = 100 - fillDistance * 8 - freeSlots * 0.5 + regionScore - loadPenalty + levelScore;
 
       if (!best || score > best.score) {
         best = { room, score, reason: "highest policy score" };
       }
     }
     return best;
+  }
+
+  /**
+   * One level per room: a room that already runs the requested level is the
+   * best target, an empty room is neutral, and a room running another level is
+   * heavily penalised. The penalty is a preference rather than a hard filter so
+   * a cluster with no matching room still allocates instead of rejecting joins.
+   */
+  private levelScore(level: number | undefined, roomLevels: ReadonlySet<number>): number {
+    if (level === undefined) return 0;
+    if (roomLevels.size === 0) return 0;
+    return roomLevels.has(level) ? this.options.sameLevelBonus : -this.options.wrongLevelPenalty;
   }
 }

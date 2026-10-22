@@ -13,6 +13,8 @@ export interface RequestRouterOptions {
   candidateRoomLimit: number;
 }
 
+const EMPTY_LEVELS: ReadonlySet<number> = new Set<number>();
+
 export class RequestRouter {
   public constructor(
     private readonly rooms: RoomCache,
@@ -59,9 +61,16 @@ export class RequestRouter {
       preferredFillTarget: 7,
       limit: this.options.candidateRoomLimit
     });
+    const levelsByRoom = this.rooms.levelsByRoom();
 
     while (candidates.length > 0) {
-      const selection = this.policy.selectRoom(context, candidates, nodeHealth, (room) => this.reservations.effectivePlayers(room) + this.moveReserved(room.roomId));
+      const selection = this.policy.selectRoom(
+        context,
+        candidates,
+        nodeHealth,
+        (room) => this.reservations.effectivePlayers(room) + this.moveReserved(room.roomId),
+        (room) => levelsByRoom.get(room.roomId) ?? EMPTY_LEVELS
+      );
       if (!selection) break;
 
       const index = candidates.findIndex((room) => room.roomId === selection.room.roomId);

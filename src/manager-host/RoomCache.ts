@@ -143,6 +143,22 @@ export class RoomCache {
     return [...this.playerLocations.values()].filter((player) => player.roomId === roomId);
   }
 
+  /**
+   * Levels currently occupied in each room, from the tracked player locations.
+   * A room with an empty set has no level signal (no player reported one), which
+   * allocation treats as "usable by any level" rather than "wrong level".
+   */
+  public levelsByRoom(): Map<RoomId, Set<number>> {
+    const result = new Map<RoomId, Set<number>>();
+    for (const location of this.playerLocations.values()) {
+      if (location.level === undefined) continue;
+      const levels = result.get(location.roomId) ?? new Set<number>();
+      levels.add(location.level);
+      result.set(location.roomId, levels);
+    }
+    return result;
+  }
+
   public applyNodeEvent(event: INodeEvent): void {
     if (event.data.rooms) {
       for (const room of event.data.rooms) this.upsertRoom(room);

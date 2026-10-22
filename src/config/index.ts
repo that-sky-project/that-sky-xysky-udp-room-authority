@@ -30,10 +30,10 @@ export interface ManagerConfig {
   moveStalePressureWeight: number;
   moveMergePressureThreshold: number;
   moveMinimumGain: number;
-  levelMigrationMinSourcePlayers: number;
-  levelMigrationMinTargetPlayers: number;
-  levelMigrationCooldownMs: number;
-  levelMigrationMaxPlayers: number;
+  levelIsolationMinLevelPlayers: number;
+  levelIsolationMaxPlayers: number;
+  levelIsolationSparseRoomThreshold: number;
+  levelIsolationLevelChangeCooldownMs: number;
   debugApiToken: string;
 }
 
@@ -86,12 +86,12 @@ const configSchema = z
         cluster_radius: floatFrom(12),
         isolation_pressure_weight: floatFrom(0.6),
         stale_pressure_weight: floatFrom(0.4),
-        merge_pressure_threshold: floatFrom(0.55),
-        minimum_gain: floatFrom(0.2),
-        level_migration_min_source_players: positiveInt(2),
-        level_migration_min_target_players: positiveInt(3),
-        level_migration_cooldown_ms: positiveInt(5_000),
-        level_migration_max_players: positiveInt(4)
+        merge_pressure_threshold: floatFrom(0.25),
+        minimum_gain: floatFrom(0.15),
+        level_isolation_min_level_players: positiveInt(1),
+        level_isolation_max_players: positiveInt(8),
+        level_isolation_sparse_room_threshold: positiveInt(2),
+        level_isolation_level_change_cooldown_ms: positiveInt(5000)
       })
       .default({}),
     debug: z
@@ -131,10 +131,10 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     moveStalePressureWeight: parsed.move.stale_pressure_weight,
     moveMergePressureThreshold: parsed.move.merge_pressure_threshold,
     moveMinimumGain: parsed.move.minimum_gain,
-    levelMigrationMinSourcePlayers: parsed.move.level_migration_min_source_players,
-    levelMigrationMinTargetPlayers: parsed.move.level_migration_min_target_players,
-    levelMigrationCooldownMs: parsed.move.level_migration_cooldown_ms,
-    levelMigrationMaxPlayers: parsed.move.level_migration_max_players,
+    levelIsolationMinLevelPlayers: parsed.move.level_isolation_min_level_players,
+    levelIsolationMaxPlayers: parsed.move.level_isolation_max_players,
+    levelIsolationSparseRoomThreshold: parsed.move.level_isolation_sparse_room_threshold,
+    levelIsolationLevelChangeCooldownMs: parsed.move.level_isolation_level_change_cooldown_ms,
     debugApiToken: parsed.debug.api_token
   };
 };

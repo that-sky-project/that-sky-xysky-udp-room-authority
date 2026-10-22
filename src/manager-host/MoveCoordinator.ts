@@ -1,17 +1,20 @@
-import type { NodeId, PlayerId, RoomId } from "../types/branded.js";
+import type { PlayerId, RoomId } from "../types/branded.js";
 import { asProtocolVersion, asUnixMs } from "../types/branded.js";
-import type { INodeEvent, RoomSnapshot } from "../types/contracts.js";
+import type { INodeEvent } from "../types/contracts.js";
 import { ErrorCode } from "../types/errors.js";
+import type { Logger } from "../infra/logger/logger.js";
 import type { CrossCoordinator } from "./CrossCoordinator.js";
 import type { NodeRegistry } from "./NodeRegistry.js";
 import type { PendingRequestMap } from "./PendingRequestMap.js";
 import type { RoomCache } from "./RoomCache.js";
 import { MovePlanner, type MovePlan, type MovePlannerOptions } from "./MovePlanner.js";
 import { TelemetryStore } from "./TelemetryStore.js";
-import { LevelMigrationPlanner, type LevelMigrationPlan, type LevelMigrationOptions } from "./LevelMigrationPlanner.js";
+import { LevelIsolationPlanner, type LevelIsolationPlan, type LevelIsolationOptions } from "./LevelIsolationPlanner.js";
 
 interface MoveTransaction extends MovePlan { moveId: string; status: "prepared" | "committed" | "completed" | "failed"; createdAt: number; joinedPlayers: string[]; leftPlayers: string[]; }
-type LevelMoveTransaction = Omit<MoveTransaction, keyof MovePlan> & LevelMigrationPlan;
+type LevelMoveTransaction = Omit<MoveTransaction, keyof MovePlan> & LevelIsolationPlan;
+
+const TRANSACTION_RETENTION_MS = 5 * 60_000;
 
 export interface MoveCoordinatorOptions {
   moveBudgetPerCycle?: number;
@@ -19,35 +22,37 @@ export interface MoveCoordinatorOptions {
   roomCooldownMs?: number;
   stateEmaHalfLifeMs?: number;
   planner?: Partial<MovePlannerOptions>;
-  levelMigration?: Partial<LevelMigrationOptions>;
+  levelIsolation?: Partial<LevelIsolationOptions>;
 }
 
 export class MoveCoordinator {
   public readonly telemetry: TelemetryStore;
   private readonly planner: MovePlanner;
-  private readonly levelMigrationPlanner: LevelMigrationPlanner;
+  private readonly levelIsolationPlanner: LevelIsolationPlanner;
   private readonly transactions = new Map<string, MoveTransaction | LevelMoveTransaction>();
   private readonly roomCooldownUntil = new Map<string, number>();
   private readonly pendingCancels = new Map<string, { roomId: RoomId; moveId: string; playerIds: string[] }>();
   private lastPlanAt = 0;
-  private readonly playerLevelChangeEvents = new Map<string, { levelId: number; timestamp: number }>();
+  private planning = false;
 
-  public constructor(private readonly rooms: RoomCache, private readonly nodes: NodeRegistry, private readonly pending: PendingRequestMap, private readonly cross: CrossCoordinator, private readonly options: MoveCoordinatorOptions = {}) {
+  public constructor(
+    private readonly rooms: RoomCache,
+    private readonly nodes: NodeRegistry,
+    private readonly pending: PendingRequestMap,
+    private readonly cross: CrossCoordinator,
+    private readonly options: MoveCoordinatorOptions = {},
+    private readonly log?: Logger
+  ) {
     this.telemetry = new TelemetryStore({ stateEmaHalfLifeMs: options.stateEmaHalfLifeMs ?? 3_000 });
     this.planner = new MovePlanner(options.planner ?? {});
-    this.levelMigrationPlanner = new LevelMigrationPlanner(options.levelMigration ?? {});
+    this.levelIsolationPlanner = new LevelIsolationPlanner(options.levelIsolation ?? {});
   }
 
   public ingest(event: INodeEvent): void {
     if (event.event === "room.telemetry" && event.data.roomId) {
       const telemetryPlayers = Array.isArray(event.data.players) ? event.data.players : [];
       for (const player of telemetryPlayers) {
-        const previous = this.telemetry.get(player.playerId);
         this.telemetry.upsert(event.data.roomId, player);
-
-        if (previous && previous.levelId !== undefined && player.levelId !== undefined && previous.levelId !== player.levelId) {
-          this.playerLevelChangeEvents.set(player.playerId, { levelId: player.levelId, timestamp: Date.now() });
-        }
       }
       const room = this.rooms.getRoom(event.data.roomId);
       if (room) {
@@ -89,48 +94,62 @@ export class MoveCoordinator {
 
   public async planAndExecute(signal?: AbortSignal, now = Date.now()): Promise<Array<MoveTransaction | LevelMoveTransaction>> {
     if (now - this.lastPlanAt < 2_000) return [...this.transactions.values()];
+    // Nodes push telemetry ~1/s per room, so several events can land while a
+    // cycle is still awaiting node acks. Without this guard the same rooms are
+    // planned twice and the second pass fights the first one's reservations.
+    if (this.planning) return [...this.transactions.values()];
+    this.planning = true;
     this.lastPlanAt = now;
-    this.drainPendingCancels();
-    for (const tx of this.transactions.values()) {
-      if ((tx.status === "prepared" || tx.status === "committed") && now - tx.createdAt > (this.options.moveTransactionTimeoutMs ?? 15_000)) {
-        tx.status = "failed";
-        this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
-        this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, tx.playerIds);
-      }
+    try {
+      return await this.runCycle(signal, now);
+    } finally {
+      this.planning = false;
     }
+  }
 
-    for (const [playerId, event] of this.playerLevelChangeEvents) {
-      if (now - event.timestamp > 60_000) {
-        this.playerLevelChangeEvents.delete(playerId);
-      }
-    }
+  private async runCycle(signal: AbortSignal | undefined, now: number): Promise<Array<MoveTransaction | LevelMoveTransaction>> {
+    this.drainPendingCancels();
+    this.expireTransactions(now);
 
     const rooms = this.rooms.listRooms();
     const byRoom = new Map(rooms.map((room) => [room.roomId as string, this.telemetry.listRoom(room.roomId, now)]));
     this.planner.calibrate(rooms, byRoom, now);
 
-    const levelPlans = this.planLevelMigrations(rooms, now);
+    // One level per room is the hard rule, so it runs before the activity-based
+    // planner and consumes the budget first.
+    const isolationPlans = this.levelIsolationPlanner.plan(rooms, this.telemetry, now, this.log);
 
     const plans = this.planner.plan(rooms, byRoom, now);
-    const usedSources = new Set<string>(); const usedTargets = new Set<string>(); let moveBudget = this.options.moveBudgetPerCycle ?? 8;
+    const usedTargets = new Set<string>(); let moveBudget = this.options.moveBudgetPerCycle ?? 8;
 
-    for (const levelPlan of levelPlans) {
-      if (moveBudget < levelPlan.playerIds.length || usedSources.has(levelPlan.sourceRoomId) || usedTargets.has(levelPlan.targetRoomId)) continue;
-      const executed = await this.executeLevelMigration(levelPlan, now, signal);
+    const usedIsolationRooms: string[] = [];
+    for (const isolationPlan of isolationPlans) {
+      // A room with three or more levels produces one plan per stray level, so
+      // the source room is allowed to repeat; only the destination must be
+      // unique, since one target room cannot absorb two concurrent moves.
+      if (moveBudget < isolationPlan.playerIds.length || usedTargets.has(isolationPlan.targetRoomId)) continue;
+      const executed = await this.executeLevelIsolation(isolationPlan, now, signal, usedIsolationRooms);
       if (executed) {
-        usedSources.add(levelPlan.sourceRoomId);
-        usedTargets.add(levelPlan.targetRoomId);
-        moveBudget -= levelPlan.playerIds.length;
+        usedTargets.add(isolationPlan.targetRoomId);
+        moveBudget -= isolationPlan.playerIds.length;
       }
+    }
+    if (usedIsolationRooms.length > 0) {
+      const cooldownUntil = now + (this.options.roomCooldownMs ?? 20_000);
+      for (const roomId of usedIsolationRooms) this.roomCooldownUntil.set(roomId, cooldownUntil);
     }
 
     for (const plan of plans) {
-      if (moveBudget < plan.playerIds.length || usedSources.has(plan.sourceRoomId) || usedTargets.has(plan.targetRoomId) || this.inCooldown(plan.sourceRoomId, now) || this.inCooldown(plan.targetRoomId, now)) continue;
+      if (moveBudget < plan.playerIds.length || usedTargets.has(plan.targetRoomId) || this.inCooldown(plan.sourceRoomId, now) || this.inCooldown(plan.targetRoomId, now)) continue;
+      if (isolationPlans.some((isolationPlan) => isolationPlan.sourceRoomId === plan.sourceRoomId)) continue;
       const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
       const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
       if (!source || !target || this.transactionsForPlayer(plan.playerIds).length > 0) continue;
       const moveId = `move-${now}-${plan.playerIds.join("-")}`;
-      if (!this.telemetry.tryReserve(target.roomId, moveId, plan.playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) continue;
+      if (!this.telemetry.tryReserve(target.roomId, moveId, plan.playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) {
+        this.log?.debug({ plan, targetPlayers: target.players, targetCapacity: target.capacity }, "move plan skipped: no capacity");
+        continue;
+      }
       const tx: MoveTransaction = { ...plan, moveId, status: "prepared", createdAt: now, joinedPlayers: [], leftPlayers: [] };
       this.transactions.set(moveId, tx);
       try {
@@ -143,57 +162,66 @@ export class MoveCoordinator {
         await this.cross.redirectPlayers({ playerIds: plan.playerIds.map((id) => id as PlayerId), moveId, playerId: first as PlayerId, fromRoomId: source.roomId, to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(now + 10_000) }, reason: plan.reason === "low_activity_merge" ? "merge" : "capacity-rebalance" }, signal);
         this.transactions.set(moveId, { ...tx, status: "committed" });
         this.telemetry.markMigrated(plan.playerIds.map((id) => id as PlayerId), now);
-        usedSources.add(plan.sourceRoomId); usedTargets.add(plan.targetRoomId); moveBudget -= plan.playerIds.length;
+        usedTargets.add(plan.targetRoomId); moveBudget -= plan.playerIds.length;
         const cooldownUntil = now + (this.options.roomCooldownMs ?? 20_000);
         this.roomCooldownUntil.set(plan.sourceRoomId, cooldownUntil); this.roomCooldownUntil.set(plan.targetRoomId, cooldownUntil);
-      } catch {
+        this.log?.info({ moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, reason: plan.reason, gain: plan.gain }, "move committed");
+      } catch (error) {
         this.queueCancel(target.roomId, moveId, plan.playerIds);
         this.telemetry.releaseReservation(target.roomId, moveId);
         this.transactions.set(moveId, { ...tx, status: "failed" });
+        this.log?.warn({ err: error, moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId }, "move failed");
       }
     }
     return [...this.transactions.values()];
   }
 
-  private planLevelMigrations(rooms: RoomSnapshot[], now: number): LevelMigrationPlan[] {
-    const plans: LevelMigrationPlan[] = [];
-    const processedPlayers = new Set<string>();
-
-    for (const [playerId, event] of this.playerLevelChangeEvents) {
-      if (processedPlayers.has(playerId)) continue;
-
-      if (!this.levelMigrationPlanner.onPlayerLevelChange(playerId, event.levelId, now)) {
+  private expireTransactions(now: number): void {
+    const timeoutMs = this.options.moveTransactionTimeoutMs ?? 15_000;
+    for (const [moveId, tx] of this.transactions) {
+      if (tx.status === "prepared") {
+        // Not yet sent to the client; safe to abandon and retry later.
+        if (now - tx.createdAt > timeoutMs) {
+          tx.status = "failed";
+          this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
+          this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, tx.playerIds);
+          this.log?.warn({ moveId, playerIds: tx.playerIds, sourceRoomId: tx.sourceRoomId, targetRoomId: tx.targetRoomId }, "prepared move timed out");
+        }
         continue;
       }
-
-      const plan = this.levelMigrationPlanner.planForPlayer(playerId, rooms, this.telemetry, now);
-      if (plan) {
-        plans.push(plan);
-        for (const pid of plan.playerIds) {
-          processedPlayers.add(pid);
+      if (tx.status === "committed") {
+        // move.commit was already sent; the client may be mid-migration. Do NOT
+        // mark this failed immediately: that would free the player for re-planning
+        // while the client is still between rooms. But if neither player.leave
+        // nor player.join resolves it within 2x the timeout, the client likely
+        // crashed mid-migration — release the player so they are not locked out.
+        if (now - tx.createdAt > timeoutMs * 2) {
+          tx.status = "failed";
+          this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
+          this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, tx.playerIds);
+          this.log?.warn({ moveId, playerIds: tx.playerIds, sourceRoomId: tx.sourceRoomId, targetRoomId: tx.targetRoomId }, "committed move never resolved (client lost mid-migration?)");
         }
+        continue;
       }
+      // Terminal transactions only feed /moves introspection; without eviction the
+      // map grows without bound on a long-running manager.
+      if (now - tx.createdAt > TRANSACTION_RETENTION_MS) this.transactions.delete(moveId);
     }
-
-    const batchPlans = this.levelMigrationPlanner.planBatch(rooms, this.telemetry, now);
-    for (const plan of batchPlans) {
-      const hasProcessed = plan.playerIds.some(pid => processedPlayers.has(pid));
-      if (!hasProcessed) {
-        plans.push(plan);
-      }
-    }
-
-    return plans;
   }
 
-  private async executeLevelMigration(plan: LevelMigrationPlan, now: number, signal?: AbortSignal): Promise<boolean> {
+  private async executeLevelIsolation(plan: LevelIsolationPlan, now: number, signal: AbortSignal | undefined, usedRooms: string[]): Promise<boolean> {
     const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
     const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
     if (!source || !target || this.transactionsForPlayer(plan.playerIds).length > 0) return false;
-    if (this.inCooldown(plan.sourceRoomId, now) || this.inCooldown(plan.targetRoomId, now)) return false;
+    // The source room may legitimately appear in several plans in one cycle when
+    // it holds three or more levels; only the destination has to be exclusive.
+    if (this.inCooldown(plan.targetRoomId, now)) return false;
 
-    const moveId = `level-move-${plan.levelId}-${now}-${plan.playerIds.join("-")}`;
-    if (!this.telemetry.tryReserve(target.roomId, moveId, plan.playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) return false;
+    const moveId = `level-isolation-${plan.levelId}-${now}-${plan.playerIds.join("-")}`;
+    if (!this.telemetry.tryReserve(target.roomId, moveId, plan.playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) {
+      this.log?.debug({ plan, targetPlayers: target.players, targetCapacity: target.capacity }, "level isolation skipped: no capacity");
+      return false;
+    }
 
     const tx: LevelMoveTransaction = {
       ...plan,
@@ -211,18 +239,20 @@ export class MoveCoordinator {
       const ack = await this.pending.send({ v: asProtocolVersion(1), cmd: "move.prepare", data: { moveId, roomId: target.roomId, playerIds: plan.playerIds, expectedVersion: target.version, ttlMs: 10_000 } }, (command) => targetTransport.send(command), signal);
       if (ack.code !== ErrorCode.OK) throw new Error(ack.message ?? "target rejected move");
       const first = plan.playerIds[0];
-      if (!first) throw new Error("empty level migration plan");
-      await this.cross.redirectPlayers({ playerIds: plan.playerIds.map((id) => id as PlayerId), moveId, playerId: first as PlayerId, fromRoomId: source.roomId, to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(now + 10_000) }, reason: "level-consolidation" }, signal);
+      if (!first) throw new Error("empty level isolation plan");
+      await this.cross.redirectPlayers({ playerIds: plan.playerIds.map((id) => id as PlayerId), moveId, playerId: first as PlayerId, fromRoomId: source.roomId, to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(now + 10_000) }, reason: plan.reason === "level_consolidation" ? "level-consolidation" : "level-isolation" }, signal);
       this.transactions.set(moveId, { ...tx, status: "committed" });
       this.telemetry.markMigrated(plan.playerIds.map((id) => id as PlayerId), now);
-      const cooldownUntil = now + (this.options.roomCooldownMs ?? 20_000);
-      this.roomCooldownUntil.set(plan.sourceRoomId, cooldownUntil);
-      this.roomCooldownUntil.set(plan.targetRoomId, cooldownUntil);
+      // Cooldowns are applied by the caller once the whole cycle is planned, so a
+      // room with several stray levels can be drained in one pass.
+      usedRooms.push(plan.sourceRoomId, plan.targetRoomId);
+      this.log?.info({ moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId, sourceLevelCount: plan.sourceLevelCount, targetLevelCount: plan.targetLevelCount }, "level isolation committed");
       return true;
-    } catch {
+    } catch (error) {
       this.queueCancel(target.roomId, moveId, plan.playerIds);
       this.telemetry.releaseReservation(target.roomId, moveId);
       this.transactions.set(moveId, { ...tx, status: "failed" });
+      this.log?.warn({ err: error, moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId }, "level isolation failed");
       return false;
     }
   }
@@ -300,9 +330,9 @@ export class MoveCoordinator {
     const room = this.rooms.getRoom(entry.roomId);
     const transport = room ? this.nodes.getTransport(room.nodeId) : undefined;
     if (!transport?.writable) return; // stays queued; retried by drainPendingCancels when the node is reachable
-    void this.pending.send({ v: asProtocolVersion(1), cmd: "move.cancel", data: { moveId: entry.moveId, playerIds: entry.playerIds } }, (command) => transport.send(command))
+    this.pending.send({ v: asProtocolVersion(1), cmd: "move.cancel", data: { moveId: entry.moveId, playerIds: entry.playerIds } }, (command) => transport.send(command))
       .then(() => { this.pendingCancels.delete(entry.moveId); })
-      .catch(() => undefined);
+      .catch((error) => { this.log?.debug({ err: error, moveId }, "move.cancel send failed (will retry)"); });
   }
 
   private drainPendingCancels(): void {

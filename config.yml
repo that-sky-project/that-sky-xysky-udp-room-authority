@@ -60,13 +60,19 @@ move:
   cluster_radius: 12          # same-level players within this distance form a move cluster
   isolation_pressure_weight: 0.6  # how much spatial isolation drives per-player migration pressure
   stale_pressure_weight: 0.4  # how much staleness drives per-player migration pressure
-  merge_pressure_threshold: 0.55  # a room becomes a move source above this
-  minimum_gain: 0.2           # a plan must exceed this gain to execute
-  # Level consolidation: migrate players to rooms with more same-level players
-  level_migration_min_source_players: 2  # source room must have <= this many same-level players
-  level_migration_min_target_players: 3  # target room must have >= this many same-level players
-  level_migration_cooldown_ms: 5000      # cooldown after a player changes level
-  level_migration_max_players: 4         # max players in a single level migration
+  # A live room's mergePressure tops out near 0.28 (freshness is ~1 for an online
+  # player), so a threshold above that only ever fires for genuinely stale rooms.
+  # 0.25 catches isolated rooms while leaving settled and full ones alone.
+  merge_pressure_threshold: 0.25  # a room becomes a move source above this
+  minimum_gain: 0.15          # a plan must exceed this gain to execute
+  # Level isolation: a room must only ever hold one level. When a second level
+  # shows up, the minority level is moved out, preferring a room that already
+  # runs that level and otherwise an empty room. Mixed rooms are never used as a
+  # target, so migrations converge.
+  level_isolation_min_level_players: 1  # a level group this small is still moved out
+  level_isolation_max_players: 8        # max players moved by a single plan
+  level_isolation_sparse_room_threshold: 2  # rooms with ≤ this many players are merged if same level
+  level_isolation_level_change_cooldown_ms: 5000  # wait this long after a level change before migrating
 
 # ---------------------------------------------------------------------------
 # Debug HTTP endpoints (/debug/allnode, /debug/move).
