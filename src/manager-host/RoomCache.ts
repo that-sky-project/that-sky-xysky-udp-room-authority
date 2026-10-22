@@ -9,6 +9,8 @@ export interface PlayerLocation {
   roomId: RoomId;
   updatedAt: UnixMs;
   level?: number | undefined;
+  /** Set when player.leave arrives but the player may be mid-migration. */
+  leavingAt?: number | undefined;
 }
 
 export interface RoomCacheOptions {
@@ -127,16 +129,34 @@ export class RoomCache {
       updatedAt: asUnixMs(Date.now()),
       // Keep a previously reported level if this update omits it (e.g. re-tracking without player payload).
       level: level ?? previous?.level
+      // leavingAt is intentionally omitted: joining a new room clears the mark.
     });
   }
 
   public untrackPlayer(playerId: PlayerId, roomId?: RoomId): void {
     const current = this.playerLocations.get(playerId);
-    if (!roomId || !current || current.roomId === roomId) this.playerLocations.delete(playerId);
+    if (!roomId || !current || current.roomId === roomId) {
+      // Mark as leaving instead of deleting immediately: during cross-room
+      // migration there is a gap between player.leave (old room) and
+      // player.join (new room). Keeping the location for a short grace period
+      // lets /players/:id/room still resolve the player mid-migration.
+      if (current) {
+        this.playerLocations.set(playerId, { ...current, leavingAt: Date.now() });
+      }
+    }
   }
 
   public getPlayerLocation(playerId: PlayerId): PlayerLocation | undefined {
-    return this.playerLocations.get(playerId);
+    const loc = this.playerLocations.get(playerId);
+    if (!loc) return undefined;
+    // Grace period: keep serving the old location for up to 5s after leave so
+    // that queries during the migration gap still resolve. trackPlayer() clears
+    // leavingAt when the player joins the new room.
+    if (loc.leavingAt && Date.now() - loc.leavingAt > 5_000) {
+      this.playerLocations.delete(playerId);
+      return undefined;
+    }
+    return loc;
   }
 
   public listPlayers(roomId: RoomId): PlayerLocation[] {

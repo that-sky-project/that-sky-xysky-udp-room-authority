@@ -53,6 +53,12 @@ export class MoveCoordinator {
       const telemetryPlayers = Array.isArray(event.data.players) ? event.data.players : [];
       for (const player of telemetryPlayers) {
         this.telemetry.upsert(event.data.roomId, player);
+        // Keep playerLocations.level in sync from telemetry. The initial
+        // player.join from some node versions omits level, which would leave
+        // levelsByRoom() empty and disable level-aware allocation entirely.
+        if (player.levelId !== undefined) {
+          this.rooms.trackPlayer(player.playerId, event.data.nodeId, event.data.roomId, player.levelId);
+        }
       }
       const room = this.rooms.getRoom(event.data.roomId);
       if (room) {
