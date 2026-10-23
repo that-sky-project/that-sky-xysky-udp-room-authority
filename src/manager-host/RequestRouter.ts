@@ -1,4 +1,5 @@
 import type { CrossCoordinator } from "./CrossCoordinator.js";
+import type { DebugEventInput, DebugEventLog } from "./DebugEventLog.js";
 import type { NodeRegistry } from "./NodeRegistry.js";
 import type { PolicyEngine } from "./PolicyEngine.js";
 import type { ReservationTracker } from "./ReservationTracker.js";
@@ -30,7 +31,9 @@ export class RequestRouter {
     // into the effective occupancy so allocation never fills slots an in-flight
     // move already claimed on the same target room.
     private readonly moveReserved: (roomId: RoomId) => number = () => 0,
-    private readonly log?: Logger
+    private readonly log?: Logger,
+    /** Structured operational history surfaced by GET /debug/logs. */
+    private readonly events?: DebugEventLog
   ) {}
 
   public async allocate(request: IAllocationRequest, signal?: AbortSignal): Promise<IAllocationReply> {
@@ -51,6 +54,14 @@ export class RequestRouter {
       const room = this.rooms.getRoom(knownLocation.roomId);
       if (room) {
         this.log?.info({ playerId, roomId: room.roomId, reason: "known_location", players: room.players }, "room allocated");
+        this.record({
+          category: "allocation",
+          event: "allocation.known",
+          message: `player ${playerId} already belongs to room ${room.roomId}`,
+          roomId: room.roomId,
+          playerIds: [playerId],
+          data: { reason: "known_location", players: room.players, capacity: room.capacity }
+        });
         return { code: ErrorCode.OK, data: this.assignmentFor(room, playerId) };
       }
     }
@@ -104,6 +115,22 @@ export class RequestRouter {
           level: context.level ?? null,
           candidates: candidates.length + 1
         }, "room allocated");
+        this.record({
+          category: "allocation",
+          event: "allocation.assigned",
+          message: `player ${playerId} -> room ${selection.room.roomId} (score ${Math.round(selection.score)})`,
+          roomId: selection.room.roomId,
+          nodeId: selection.room.nodeId,
+          playerIds: [playerId],
+          data: {
+            reason: "policy_score",
+            score: Math.round(selection.score),
+            players: selection.room.players,
+            capacity: selection.room.capacity,
+            level: context.level ?? null,
+            candidates: candidates.length + 1
+          }
+        });
         return { code: ErrorCode.OK, data: this.assignmentFor(selection.room, playerId) };
       } catch (error) {
         this.reservations.release(playerId);
@@ -113,7 +140,23 @@ export class RequestRouter {
     }
 
     this.log?.warn({ playerId, candidates: candidates.length, rooms: this.rooms.listRooms().length, level: request.level ?? null }, "allocation found no usable room");
+    this.record({
+      category: "allocation",
+      event: "allocation.none",
+      message: `no usable room for player ${playerId}`,
+      playerIds: [playerId],
+      data: {
+        level: context.level ?? null,
+        candidates: candidates.length,
+        rooms: this.rooms.listRooms().length,
+        reservations: this.reservations.size()
+      }
+    });
     throw new HermesError(ErrorCode.NO_CAPACITY, "no room capacity is currently available");
+  }
+
+  private record(event: DebugEventInput): void {
+    this.events?.record(event);
   }
 
   private assignmentFor(

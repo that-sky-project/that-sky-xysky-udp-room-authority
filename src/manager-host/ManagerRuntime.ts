@@ -1,4 +1,5 @@
 import { CrossCoordinator } from "./CrossCoordinator.js";
+import { DebugEventLog } from "./DebugEventLog.js";
 import { NodeRegistry } from "./NodeRegistry.js";
 import { PendingRequestMap } from "./PendingRequestMap.js";
 import { PolicyEngine } from "./PolicyEngine.js";
@@ -20,10 +21,14 @@ export interface ManagerRuntime {
   router: RequestRouter;
   moves: MoveCoordinator;
   metrics: MetricsRegistry;
+  events: DebugEventLog;
 }
 
 export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): ManagerRuntime => {
   const metrics = new MetricsRegistry();
+  // Operational history for GET /debug/logs. Ring-buffered, never used for
+  // planning decisions.
+  const events = new DebugEventLog(config.debugLogBufferSize);
   const nodes = new NodeRegistry({
     circuitOpenMs: config.nodeCircuitOpenMs,
     failureThreshold: config.nodeCircuitFailureThreshold,
@@ -68,13 +73,13 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
       sparseRoomThreshold: config.levelIsolationSparseRoomThreshold,
       levelChangeCooldownMs: config.levelChangeCooldownMs
     }
-  }, logger, (reason, status) => metrics.inc("qwd_move_total", [reason, status]), () => metrics.inc("qwd_telemetry_gap_total"));
+  }, logger, (reason, status) => metrics.inc("qwd_move_total", [reason, status]), () => metrics.inc("qwd_telemetry_gap_total"), events);
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {
     nodeStaleMs: config.nodeStaleMs,
     assignmentTtlMs: config.assignmentTtlMs,
     candidateRoomLimit: config.candidateRoomLimit,
     preferredFillTarget: config.preferredFillTarget
-  }, (roomId) => moves.telemetry.reserved(roomId), logger);
+  }, (roomId) => moves.telemetry.reserved(roomId), logger, events);
 
-  return { nodes, rooms, pending, policy, reservations, coordinator, router, moves, metrics };
+  return { nodes, rooms, pending, policy, reservations, coordinator, router, moves, metrics, events };
 };

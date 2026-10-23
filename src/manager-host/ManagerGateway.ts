@@ -24,6 +24,28 @@ interface NodeConnectionState {
 const isPlanningEvent = (event: INodeEvent): boolean =>
   event.event === "room.telemetry" || event.event === "player.join" || event.event === "player.leave";
 
+/** Compact, log-safe view of an outbound command's routing fields. */
+const summarizeCommand = (command: IManagerCommand): {
+  roomId?: string | undefined;
+  moveId?: string | undefined;
+  playerIds?: string[] | undefined;
+  expectedVersion?: number | undefined;
+} => {
+  const data = (command.data ?? {}) as Record<string, unknown>;
+  const text = (key: string): string | undefined => (typeof data[key] === "string" ? data[key] : undefined);
+  const playerIds = Array.isArray(data.playerIds)
+    ? data.playerIds.filter((id): id is string => typeof id === "string")
+    : typeof data.playerId === "string"
+      ? [data.playerId]
+      : undefined;
+  return {
+    roomId: text("roomId") ?? text("toRoomId"),
+    moveId: text("moveId"),
+    playerIds,
+    expectedVersion: typeof data.expectedVersion === "number" ? data.expectedVersion : undefined
+  };
+};
+
 export class ManagerGateway {
   private server: Server | undefined;
   private nodeServer: WebSocketServer | undefined;
@@ -34,6 +56,8 @@ export class ManagerGateway {
   private readonly telemetrySeq = new Map<string, number>();
   /** Rate limit for the sequence-regression warning, per room. */
   private readonly telemetryStaleWarnAt = new Map<string, number>();
+  /** In-flight outbound commands, so an ack can be logged with its command name. */
+  private readonly outbound = new Map<number, { cmd: string; at: number; roomId?: string | undefined; moveId?: string | undefined; playerIds?: string[] | undefined }>();
 
   public constructor(
     private readonly config: ManagerConfig,
@@ -146,8 +170,26 @@ export class ManagerGateway {
     // even when nobody reads the room in between.
     this.runtime.rooms.purgeDepartedPlayers();
     for (const { nodeId, rooms } of this.runtime.rooms.sweepSuspectedNodes()) {
+      // The rooms are gone for good; drop the coordinator's telemetry
+      // bookkeeping too so a future room id reuse starts clean.
+      for (const room of rooms) this.runtime.moves.forgetRoom(room.roomId as string);
       this.metrics.inc("qwd_node_reclaimed_total");
       this.log.warn({ nodeId, rooms: rooms.map((room) => room.roomId) }, "node grace window expired; rooms reclaimed");
+      this.runtime.events.record({
+        category: "node",
+        event: "node.reclaimed",
+        message: `node ${nodeId} reclaimed after the grace window (${rooms.length} room(s))`,
+        nodeId,
+        data: { rooms: rooms.map((room) => room.roomId) }
+      });
+    }
+  }
+
+  /** Bound the in-flight command map: acks normally delete entries, timeouts do not. */
+  private pruneOutbound(now: number): void {
+    if (this.outbound.size < 5000) return;
+    for (const [id, entry] of this.outbound) {
+      if (now - entry.at > 60_000) this.outbound.delete(id);
     }
   }
 
@@ -207,6 +249,20 @@ export class ManagerGateway {
         const moves = this.runtime.moves;
         const rooms = moves.activitySnapshot().map((activity) => ({ activity, players: moves.telemetry.listRoom(asRoomId(activity.roomId)) }));
         this.writeJson(res, 200, { rooms });
+        return;
+      }
+      if (method === "GET" && url.pathname === "/debug/logs") {
+        this.requireDebugToken(req);
+        const rawLimit = Number(url.searchParams.get("limit") ?? "");
+        const rawSince = Number(url.searchParams.get("since") ?? "");
+        const page = this.runtime.events.list({
+          limit: Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined,
+          since: Number.isFinite(rawSince) && rawSince > 0 ? rawSince : undefined,
+          category: url.searchParams.get("category") ?? undefined,
+          roomId: url.searchParams.get("roomId") ?? undefined,
+          playerId: url.searchParams.get("playerId") ?? undefined
+        });
+        this.writeJson(res, 200, { code: ErrorCode.OK, data: page });
         return;
       }
       if (method === "GET" && url.pathname === "/debug/allnode") {
@@ -332,6 +388,18 @@ export class ManagerGateway {
         if (before >= backpressureLimitBytes) {
           throw new HermesError(ErrorCode.NODE_UNAVAILABLE, "node socket is under backpressure", { nodeId: state.nodeId, bufferedBytes: before });
         }
+        const summary = summarizeCommand(command);
+        this.pruneOutbound(Date.now());
+        this.outbound.set(Number(command.id), { cmd: command.cmd, at: Date.now(), ...summary });
+        this.runtime.events.record({
+          category: "node",
+          event: "node.command",
+          message: `${command.cmd} -> node ${state.nodeId}`,
+          nodeId: state.nodeId,
+          roomId: summary.roomId,
+          playerIds: summary.playerIds,
+          data: { commandId: Number(command.id), cmd: command.cmd, ...summary }
+        });
         await new Promise<void>((resolve, reject) => {
           ws.send(jsonStringify({ ...command, v: command.v ?? asProtocolVersion(1) }), (error) => error ? reject(error) : resolve());
         });
@@ -347,10 +415,18 @@ export class ManagerGateway {
     this.heartbeat.track(state.nodeId, ws);
     // A reconnect (same public UDP endpoint) restores its rooms instead of
     // letting the grace sweep reap them.
-    if (this.runtime.rooms.restoreNode(state.nodeId)) {
+    const restored = this.runtime.rooms.restoreNode(state.nodeId);
+    if (restored) {
       this.log.info({ nodeId: state.nodeId }, "node reconnected within grace window; state restored");
     }
     this.log.info({ nodeId: state.nodeId, protocolVersion: state.protocolVersion }, "node connected");
+    this.runtime.events.record({
+      category: "node",
+      event: "node.connected",
+      message: `node ${state.nodeId} connected${restored ? " (state restored)" : ""}`,
+      nodeId: state.nodeId,
+      data: { protocolVersion: state.protocolVersion, remoteAddress: state.remoteAddress, restored }
+    });
     ws.on("message", (message, isBinary) => this.handleNodeMessage(ws, state, message, isBinary).catch((error) => this.log.error({ err: error }, "node message handler error")));
     ws.on("close", () => {
       closed = true;
@@ -382,9 +458,19 @@ export class ManagerGateway {
     this.runtime.rooms.markNodeSuspected(nodeId);
     for (const roomId of this.telemetrySeq.keys()) {
       const room = this.runtime.rooms.getRoom(asRoomId(roomId));
-      if (!room || room.nodeId === nodeId) this.telemetrySeq.delete(roomId);
+      if (!room || room.nodeId === nodeId) {
+        this.telemetrySeq.delete(roomId);
+        this.telemetryStaleWarnAt.delete(roomId);
+      }
     }
     this.log.warn({ nodeId, graceMs: this.config.nodeGraceMs }, "node disconnected; state retained for grace window");
+    this.runtime.events.record({
+      category: "node",
+      event: "node.disconnected",
+      message: `node ${nodeId} disconnected; rooms retained for the grace window`,
+      nodeId,
+      data: { graceMs: this.config.nodeGraceMs }
+    });
   }
 
   private async handleNodeMessage(ws: WebSocket, state: NodeConnectionState, message: RawData, isBinary: boolean): Promise<void> {
@@ -401,6 +487,25 @@ export class ManagerGateway {
       if (ack.success) {
         this.runtime.pending.resolve(ack.data);
         this.runtime.nodes.onAck(ack.data);
+        const sent = this.outbound.get(Number(ack.data.id));
+        if (sent) {
+          this.outbound.delete(Number(ack.data.id));
+          this.runtime.events.record({
+            category: "node",
+            event: "node.ack",
+            message: `${sent.cmd} acked by node ${state.nodeId} (code ${ack.data.code})`,
+            nodeId: state.nodeId,
+            roomId: sent.roomId,
+            playerIds: sent.playerIds,
+            data: {
+              commandId: Number(ack.data.id),
+              cmd: sent.cmd,
+              code: ack.data.code,
+              latencyMs: Date.now() - sent.at,
+              moveId: sent.moveId
+            }
+          });
+        }
         return;
       }
 
@@ -438,6 +543,19 @@ export class ManagerGateway {
       { roomId: event.data.roomId, existingUdpHost: existing.udpHost, existingUdpPort: existing.udpPort, udpHost: event.data.udpHost, udpPort: event.data.port },
       "room id conflict rejected"
     );
+    this.runtime.events.record({
+      category: "room",
+      event: "room.id_conflict",
+      message: `room id ${event.data.roomId} already belongs to another endpoint`,
+      roomId: event.data.roomId as string,
+      nodeId: event.data.nodeId,
+      data: {
+        existingUdpHost: existing.udpHost,
+        existingUdpPort: existing.udpPort,
+        udpHost: event.data.udpHost,
+        udpPort: event.data.port
+      }
+    });
     return true;
   }
 
@@ -462,6 +580,14 @@ export class ManagerGateway {
           { roomId: event.data.roomId, previousNodeId: existing.nodeId, nodeId: event.data.nodeId },
           "room id reused by a new node incarnation; telemetry sequence reset"
         );
+        this.runtime.events.record({
+          category: "telemetry",
+          event: "telemetry.incarnation_reset",
+          message: `room ${event.data.roomId} moved to a new node incarnation; sequence reset`,
+          roomId: event.data.roomId as string,
+          nodeId: event.data.nodeId,
+          data: { previousNodeId: existing.nodeId }
+        });
       }
     }
     if (event.event === "room.destroyed" && event.data.roomId) {
@@ -477,6 +603,14 @@ export class ManagerGateway {
       if (last !== undefined && event.data.seq <= last) {
         this.metrics.inc("qwd_telemetry_stale_total");
         const at = Date.now();
+        this.runtime.events.record({
+          category: "telemetry",
+          event: "telemetry.seq_regressed",
+          message: `telemetry seq ${event.data.seq} <= last ${last}; frame dropped`,
+          roomId: roomKey,
+          nodeId: event.data.nodeId,
+          data: { seq: event.data.seq, lastSeq: last, kind: event.data.kind ?? "full", baseSeq: event.data.baseSeq }
+        });
         if (at - (this.telemetryStaleWarnAt.get(roomKey) ?? 0) >= 30_000) {
           this.telemetryStaleWarnAt.set(roomKey, at);
           this.log.warn(
@@ -502,7 +636,45 @@ export class ManagerGateway {
     if (event.data.player?.playerId && (event.event === "player.join" || event.event === "player.leave")) {
       this.runtime.reservations.confirm(event.data.player.playerId);
     }
+    this.recordAppliedEvent(event);
     return true;
+  }
+
+  /** Room/player lifecycle entries for GET /debug/logs. */
+  private recordAppliedEvent(event: INodeEvent): void {
+    const roomId = event.data.roomId as string | undefined;
+    if (!roomId) return;
+
+    if (event.event === "player.join" || event.event === "player.leave") {
+      const playerId = event.data.player?.playerId as string | undefined;
+      if (!playerId) return;
+      this.runtime.events.record({
+        category: "player",
+        event: event.event,
+        message: `${event.event === "player.join" ? "joined" : "left"} room ${roomId}`,
+        roomId,
+        nodeId: event.data.nodeId,
+        playerIds: [playerId],
+        data: { level: event.data.player?.level }
+      });
+      return;
+    }
+
+    if (event.event === "room.created" || event.event === "room.destroyed") {
+      this.runtime.events.record({
+        category: "room",
+        event: event.event,
+        message: `${event.event === "room.created" ? "room created" : "room destroyed"}: ${roomId}`,
+        roomId,
+        nodeId: event.data.nodeId,
+        data: {
+          udpHost: event.data.udpHost,
+          udpPort: event.data.port,
+          players: typeof event.data.players === "number" ? event.data.players : undefined,
+          version: event.data.version
+        }
+      });
+    }
   }
 
   private async handleAllocationBody(res: ServerResponse, body: string): Promise<void> {

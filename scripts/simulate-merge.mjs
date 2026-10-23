@@ -17,6 +17,7 @@
  * Requires `npm run build` first: it imports from dist/, not src/.
  */
 import { RoomCache } from "../dist/manager-host/RoomCache.js";
+import { DebugEventLog } from "../dist/manager-host/DebugEventLog.js";
 import { MoveCoordinator } from "../dist/manager-host/MoveCoordinator.js";
 
 // Numeric level ids as the UDP nodes report them. Only equality matters.
@@ -103,7 +104,8 @@ const pending = { send: async (command) => ({ v: 1, id: command.id, code: 0, dat
 const cross = { redirectPlayers: async () => ({ v: 1, id: 0, code: 0, data: {} }) };
 
 const silence = { info() {}, warn() {}, error() {}, debug() {}, trace() {}, fatal() {} };
-const moves = new MoveCoordinator(cache, nodes, pending, cross, {}, silence);
+const events = new DebugEventLog(500);
+const moves = new MoveCoordinator(cache, nodes, pending, cross, {}, silence, undefined, undefined, events);
 
 const seq = new Map();
 function publishTelemetry(room) {
@@ -207,4 +209,11 @@ for (const [level, counts] of byLevel) {
 const unreachable = occupied.filter((room) => room.offline);
 if (unreachable.length > 0) {
   console.log(`unreachable node: ${unreachable.map(describe).join("  ")}`);
+}
+
+// The same structured history GET /debug/logs exposes.
+const recorded = events.list({ limit: 20 }).entries;
+if (recorded.length > 0) {
+  console.log("debug events:");
+  for (const entry of recorded) console.log(`  ${entry.category}/${entry.event}  ${entry.message}`);
 }

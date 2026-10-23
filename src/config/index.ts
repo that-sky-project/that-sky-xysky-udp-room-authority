@@ -40,6 +40,7 @@ export interface ManagerConfig {
   levelIsolationSparseRoomThreshold: number;
   levelChangeCooldownMs: number;
   debugApiToken: string;
+  debugLogBufferSize: number;
 }
 
 const positiveInt = (fallback: number) => z.coerce.number().int().positive().default(fallback);
@@ -114,7 +115,12 @@ const configSchema = z
       })
       .default({}),
     debug: z
-      .object({ api_token: z.string().default("") })
+      .object({
+        api_token: z.string().default(""),
+        // Ring buffer behind GET /debug/logs (moves, allocations, node traffic,
+        // telemetry gaps). In-memory only; lost on restart.
+        log_buffer_size: positiveInt(2000)
+      })
       .default({})
   })
   .strict();
@@ -159,6 +165,7 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     levelIsolationMaxPlayers: parsed.move.level_isolation_max_players,
     levelIsolationSparseRoomThreshold: parsed.move.level_isolation_sparse_room_threshold,
     levelChangeCooldownMs: parsed.move.level_change_cooldown_ms,
-    debugApiToken: parsed.debug.api_token
+    debugApiToken: parsed.debug.api_token,
+    debugLogBufferSize: parsed.debug.log_buffer_size
   };
 };

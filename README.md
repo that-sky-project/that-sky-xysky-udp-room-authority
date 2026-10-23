@@ -116,6 +116,7 @@ move:
 
 debug:
   api_token: ""
+  log_buffer_size: 2000
 ```
 
 | Key | Default | Description |
@@ -138,13 +139,35 @@ debug:
 | `move.budget_per_cycle` | `8` | Max moves started per planning cycle |
 | `move.transaction_timeout_ms` | `15000` | Abort a stalled move transaction after this |
 | `move.level_change_cooldown_ms` | `6000` | Settling window after a level change; no migration path moves players out of the room during it |
-| `debug.api_token` | `""` | Token for `/debug/*`; empty keeps them locked |
+| `debug.api_token` | `""` | Token for `/debug/*`; empty disables the check |
+| `debug.log_buffer_size` | `2000` | In-memory event history behind `GET /debug/logs` |
 
 ### Debug endpoints
 
-`GET /debug/allnode` and `POST /debug/move` require `debug.api_token`. When set, send it as the
-`x-debug-token` header or an `Authorization: Bearer <token>` header. Leaving it empty keeps the
-endpoints inaccessible.
+`GET /debug/logs`, `GET /debug/allnode` and `POST /debug/move` accept an optional
+`debug.api_token`. When a token is configured, send it as the `x-debug-token` header or an
+`Authorization: Bearer <token>` header; when it is empty the check is disabled.
+
+`GET /debug/logs` returns the recent structured event history (in-memory ring buffer, lost on
+restart): room moves/merges/splits, level isolation and consolidation, allocations, room and
+player lifecycle, outbound node commands with their acks, and telemetry desync events.
+
+Query parameters:
+
+- `limit` — newest N entries (default 200, max 1000)
+- `since` — only entries with `id` greater than this; poll with the returned `nextSince`
+- `category` — `move`, `level`, `room`, `player`, `node`, `telemetry`, `allocation`
+- `roomId` / `playerId` — filter by room or by player
+
+```bash
+curl -s localhost:1131/debug/logs | jq -r '.data.entries[] | "\(.at) \(.event) \(.message)"'
+curl -s 'localhost:1131/debug/logs?category=move&limit=50'
+curl -s 'localhost:1131/debug/logs?roomId=10000001'
+```
+
+The response is `{ code, data: { entries, nextSince, oldestId, newestId, buffered, capacity,
+truncated } }`. `truncated: true` means `since` predates the buffer, so part of the requested
+window is already gone.
 
 ## Connecting XYSky and nodes
 

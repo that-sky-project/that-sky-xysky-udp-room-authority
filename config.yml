@@ -98,3 +98,7 @@ move:
 # ---------------------------------------------------------------------------
 debug:
   api_token: ""
+  # In-memory ring buffer behind GET /debug/logs: moves, level migrations,
+  # allocations, room lifecycle, player join/leave, node commands/acks and
+  # telemetry desync events. Purely operational, lost on restart.
+  log_buffer_size: 2000

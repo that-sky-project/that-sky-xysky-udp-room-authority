@@ -111,6 +111,7 @@ move:
 
 debug:
   api_token: ""
+  log_buffer_size: 2000
 ```
 
 | 配置项 | 默认值 | 说明 |
@@ -133,12 +134,32 @@ debug:
 | `move.budget_per_cycle` | `8` | 每轮规划最多启动的迁移数 |
 | `move.transaction_timeout_ms` | `15000` | 迁移事务停滞多久后中止 |
 | `move.level_change_cooldown_ms` | `6000` | 切图后的沉降窗口；窗口内任何迁移路径都不会把玩家移出该房间 |
-| `debug.api_token` | `""` | `/debug/*` 的 token；为空则保持关闭 |
+| `debug.api_token` | `""` | `/debug/*` 的 token；留空则不校验 |
+| `debug.log_buffer_size` | `2000` | `GET /debug/logs` 使用的内存事件环形缓冲区大小 |
 
 ### 调试接口
 
-`GET /debug/allnode` 和 `POST /debug/move` 需要 `debug.api_token`。设置后，通过 `x-debug-token`
-请求头或 `Authorization: Bearer <token>` 请求头传入。留空则这些接口不可访问。
+`GET /debug/logs`、`GET /debug/allnode` 和 `POST /debug/move` 支持可选的 `debug.api_token`。
+配置了 token 时，通过 `x-debug-token` 请求头或 `Authorization: Bearer <token>` 传入；留空则不校验。
+
+`GET /debug/logs` 返回最近的结构化事件历史（内存环形缓冲区，重启即清空）：房间移动/合并/拆分、
+level 隔离与整理、分配结果、房间与玩家生命周期、发往节点的命令及其 ack、telemetry 失步事件。
+
+查询参数：
+
+- `limit` — 取最新 N 条（默认 200，最大 1000）
+- `since` — 只返回 `id` 大于该值的事件；配合返回的 `nextSince` 轮询
+- `category` — `move`、`level`、`room`、`player`、`node`、`telemetry`、`allocation`
+- `roomId` / `playerId` — 按房间或玩家过滤
+
+```bash
+curl -s localhost:1131/debug/logs | jq -r '.data.entries[] | "\(.at) \(.event) \(.message)"'
+curl -s 'localhost:1131/debug/logs?category=move&limit=50'
+curl -s 'localhost:1131/debug/logs?roomId=10000001'
+```
+
+返回结构为 `{ code, data: { entries, nextSince, oldestId, newestId, buffered, capacity, truncated } }`。
+`truncated: true` 表示 `since` 早于缓冲区最旧记录，部分事件已经被覆盖。
 
 ## 连接 XYSky 与节点
 

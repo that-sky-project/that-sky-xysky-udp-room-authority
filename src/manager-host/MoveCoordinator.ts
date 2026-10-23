@@ -3,6 +3,7 @@ import { asProtocolVersion } from "../types/branded.js";
 import type { INodeEvent, PlayerTelemetry, RoomSnapshot } from "../types/contracts.js";
 import type { Logger } from "../infra/logger/logger.js";
 import type { CrossCoordinator } from "./CrossCoordinator.js";
+import type { DebugEventInput, DebugEventLog } from "./DebugEventLog.js";
 import type { NodeRegistry } from "./NodeRegistry.js";
 import type { PendingRequestMap } from "./PendingRequestMap.js";
 import type { RoomCache } from "./RoomCache.js";
@@ -54,7 +55,9 @@ export class MoveCoordinator {
     /** Optional counter sink so the gateway can expose move outcomes as metrics. */
     private readonly onMoveOutcome?: (reason: string, status: "committed" | "failed") => void,
     /** Counts delta frames dropped because the manager does not know their base. */
-    private readonly onTelemetryGap?: () => void
+    private readonly onTelemetryGap?: () => void,
+    /** Structured operational history surfaced by GET /debug/logs. */
+    private readonly events?: DebugEventLog
   ) {
     this.telemetry = new TelemetryStore({ stateEmaHalfLifeMs: options.stateEmaHalfLifeMs ?? 3_000 });
     this.planner = new MovePlanner(options.planner ?? {});
@@ -71,11 +74,7 @@ export class MoveCoordinator {
     if (event.event === "room.destroyed" && event.data.roomId) {
       // A later room may reuse this id; a leftover roster would make every
       // delta look like a base mismatch.
-      const key = event.data.roomId as string;
-      this.roomRoster.delete(key);
-      this.telemetryGap.delete(key);
-      this.telemetryGapWarnAt.delete(key);
-      this.telemetryVersionWarnAt.delete(key);
+      this.forgetRoom(event.data.roomId as string);
     }
     if (event.event === "room.telemetry" && event.data.roomId) {
       const roomId = event.data.roomId;
@@ -107,6 +106,16 @@ export class MoveCoordinator {
             gapMs: at - gap.since,
             players: incoming.length
           };
+          if (gap.dropped === 1) {
+            this.record({
+              category: "telemetry",
+              event: "telemetry.gap",
+              message: "delta telemetry out of sync; room state frozen until the next full snapshot",
+              roomId,
+              nodeId: event.data.nodeId,
+              data: { seq: event.data.seq, baseSeq: event.data.baseSeq, haveSeq: roster?.seq, players: incoming.length }
+            });
+          }
           if (at - (this.telemetryGapWarnAt.get(roomId) ?? 0) >= 30_000) {
             this.telemetryGapWarnAt.set(roomId, at);
             this.log?.warn(fields, "telemetry delta gap; awaiting full snapshot");
@@ -138,18 +147,24 @@ export class MoveCoordinator {
         if (gap) {
           this.telemetryGap.delete(roomId);
           this.telemetryGapWarnAt.delete(roomId);
-          this.log?.warn(
-            {
-              roomId,
-              nodeId: event.data.nodeId,
-              gapMs: Date.now() - gap.since,
-              droppedFrames: gap.dropped,
-              fromSeq: gap.haveSeq,
-              toSeq: event.data.seq,
-              players: incoming.length
-            },
-            "telemetry resynchronized after gap"
-          );
+          const fields = {
+            roomId,
+            nodeId: event.data.nodeId,
+            gapMs: Date.now() - gap.since,
+            droppedFrames: gap.dropped,
+            fromSeq: gap.haveSeq,
+            toSeq: event.data.seq,
+            players: incoming.length
+          };
+          this.log?.warn(fields, "telemetry resynchronized after gap");
+          this.record({
+            category: "telemetry",
+            event: "telemetry.resynced",
+            message: "full snapshot restored the room roster after a delta gap",
+            roomId,
+            nodeId: event.data.nodeId,
+            data: fields
+          });
         }
       }
 
@@ -182,6 +197,14 @@ export class MoveCoordinator {
               { roomId, nodeId: event.data.nodeId, seq: version, cachedVersion: room.version, kind: event.data.kind ?? "full" },
               "telemetry version regression rejected"
             );
+            this.record({
+              category: "telemetry",
+              event: "telemetry.version_rejected",
+              message: "telemetry frame older than the cached room snapshot was ignored",
+              roomId,
+              nodeId: event.data.nodeId,
+              data: { seq: version, cachedVersion: room.version, kind: event.data.kind ?? "full" }
+            });
           }
         }
       }
@@ -222,6 +245,14 @@ export class MoveCoordinator {
         this.telemetry.releaseReservationSlots(tx.targetRoomId as RoomId, tx.moveId, failedIds.length);
         if (tx.playerIds.length === 0) tx.status = "failed";
         if (failedIds.length) this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, failedIds);
+        this.record({
+          category: "move",
+          event: "move.clients_rejected",
+          message: `clients rejected part of ${tx.moveId} (${failedIds.length} player(s))`,
+          roomId: tx.targetRoomId,
+          playerIds: failedIds,
+          data: { moveId: tx.moveId, failedPlayerIds: failedIds, reason: event.data.reason }
+        });
       }
     }
     // The destination node dropped a reservation we are tracking (its TTL ran
@@ -234,6 +265,14 @@ export class MoveCoordinator {
         this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
         this.onMoveOutcome?.(tx.reason, "failed");
         this.log?.warn({ moveId: tx.moveId, playerIds: tx.playerIds }, "target reservation expired before players arrived");
+        this.record({
+          category: "move",
+          event: "move.reservation_expired",
+          message: `target reservation expired for ${tx.moveId}`,
+          roomId: tx.targetRoomId,
+          playerIds: tx.playerIds,
+          data: { moveId: tx.moveId, reason: tx.reason }
+        });
       }
     }
     // Positive completion signal from the destination node: the entire group
@@ -248,6 +287,14 @@ export class MoveCoordinator {
           { moveId: tx.moveId, playerIds: tx.playerIds, targetRoomId: tx.targetRoomId },
           "move completed (node confirmation)"
         );
+        this.record({
+          category: "move",
+          event: "move.completed",
+          message: `${tx.reason}: ${tx.sourceRoomId} -> ${tx.targetRoomId} completed`,
+          roomId: tx.targetRoomId,
+          playerIds: tx.playerIds,
+          data: { moveId: tx.moveId, reason: tx.reason, sourceRoomId: tx.sourceRoomId, targetRoomId: tx.targetRoomId }
+        });
       }
     }
   }
@@ -330,14 +377,51 @@ export class MoveCoordinator {
         this.applyCooldown([plan.sourceRoomId, plan.targetRoomId], now);
         this.onMoveOutcome?.(plan.reason, "committed");
         this.log?.info({ moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, reason: plan.reason, gain: plan.gain }, "move committed");
+        this.record({
+          category: "move",
+          event: "move.committed",
+          message: `${plan.reason}: ${plan.sourceRoomId} -> ${plan.targetRoomId} (${plan.playerIds.length} player(s))`,
+          roomId: plan.targetRoomId,
+          playerIds: plan.playerIds,
+          data: { moveId, reason: plan.reason, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, gain: plan.gain }
+        });
       } else if (outcome.reason === "failed") {
         this.queueCancel(target.roomId, moveId, plan.playerIds);
         this.transactions.set(moveId, { ...tx, status: "failed" });
         this.onMoveOutcome?.(plan.reason, "failed");
+        this.record({
+          category: "move",
+          event: "move.failed",
+          message: `${plan.reason}: ${plan.sourceRoomId} -> ${plan.targetRoomId} failed`,
+          roomId: plan.targetRoomId,
+          playerIds: plan.playerIds,
+          data: {
+            moveId,
+            reason: plan.reason,
+            sourceRoomId: plan.sourceRoomId,
+            targetRoomId: plan.targetRoomId,
+            error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error ?? "")
+          }
+        });
       } else {
         // no_capacity / stale_plan / no_players: the executor already released
         // the reservation. Drop the record so it does not look in-flight.
         this.transactions.delete(moveId);
+        this.record({
+          category: "move",
+          event: "move.rejected",
+          message: `${plan.reason}: ${plan.sourceRoomId} -> ${plan.targetRoomId} rejected (${outcome.reason})`,
+          roomId: plan.targetRoomId,
+          playerIds: plan.playerIds,
+          data: {
+            moveId,
+            reason: plan.reason,
+            outcome: outcome.reason,
+            sourceRoomId: plan.sourceRoomId,
+            targetRoomId: plan.targetRoomId,
+            gain: plan.gain
+          }
+        });
       }
     }
     return [...this.transactions.values()];
@@ -365,6 +449,7 @@ export class MoveCoordinator {
           this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
           this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, tx.playerIds);
           this.log?.warn({ moveId, playerIds: tx.playerIds, sourceRoomId: tx.sourceRoomId, targetRoomId: tx.targetRoomId }, "prepared move timed out");
+          this.recordMoveExpired(tx, "prepared");
         }
         continue;
       }
@@ -379,6 +464,7 @@ export class MoveCoordinator {
           this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
           this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, tx.playerIds);
           this.log?.warn({ moveId, playerIds: tx.playerIds, sourceRoomId: tx.sourceRoomId, targetRoomId: tx.targetRoomId }, "committed move never resolved (client lost mid-migration?)");
+          this.recordMoveExpired(tx, "committed");
         }
         continue;
       }
@@ -393,16 +479,19 @@ export class MoveCoordinator {
     const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
     if (!source || !target) {
       this.log?.warn({ sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: room no longer cached");
+      this.recordSkippedLevelPlan(plan, "room_missing");
       return false;
     }
     if (this.transactionsForPlayer(plan.playerIds).length > 0) {
       this.log?.debug({ playerIds: plan.playerIds }, "level isolation skipped: player already has a pending move");
+      this.recordSkippedLevelPlan(plan, "player_pending");
       return false;
     }
     // The source room may legitimately appear in several plans in one cycle when
     // it holds three or more levels; only the destination has to be exclusive.
     if (this.inCooldown(plan.targetRoomId, now)) {
       this.log?.debug({ targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: target room in cooldown");
+      this.recordSkippedLevelPlan(plan, "target_cooldown");
       return false;
     }
 
@@ -427,6 +516,22 @@ export class MoveCoordinator {
       usedRooms.push(plan.sourceRoomId, plan.targetRoomId);
       this.onMoveOutcome?.(plan.reason, "committed");
       this.log?.info({ moveId, reason: plan.reason, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId, sourceLevelCount: plan.sourceLevelCount, targetLevelCount: plan.targetLevelCount }, "level isolation committed");
+      this.record({
+        category: "level",
+        event: plan.reason === "level_consolidation" ? "level.consolidated" : "level.isolated",
+        message: `${plan.reason}: ${plan.sourceRoomId} -> ${plan.targetRoomId} (level ${plan.levelId}, ${plan.playerIds.length} player(s))`,
+        roomId: plan.targetRoomId,
+        playerIds: plan.playerIds,
+        data: {
+          moveId,
+          reason: plan.reason,
+          sourceRoomId: plan.sourceRoomId,
+          targetRoomId: plan.targetRoomId,
+          levelId: plan.levelId,
+          sourceLevelCount: plan.sourceLevelCount,
+          targetLevelCount: plan.targetLevelCount
+        }
+      });
       return true;
     }
 
@@ -434,13 +539,77 @@ export class MoveCoordinator {
       this.queueCancel(target.roomId, moveId, plan.playerIds);
       this.transactions.set(moveId, { ...tx, status: "failed" });
       this.onMoveOutcome?.(plan.reason, "failed");
+      this.record({
+        category: "level",
+        event: "level.migration_failed",
+        message: `${plan.reason}: ${plan.sourceRoomId} -> ${plan.targetRoomId} failed`,
+        roomId: plan.targetRoomId,
+        playerIds: plan.playerIds,
+        data: { moveId, reason: plan.reason, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId }
+      });
     } else {
       // no_capacity / stale_plan / no_players never reach the warn path in the
       // executor, so a rejected merge used to disappear without a trace.
       this.log?.info({ moveId, reason: outcome.reason, planReason: plan.reason, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation not executed");
       this.transactions.delete(moveId);
+      this.record({
+        category: "level",
+        event: "level.migration_rejected",
+        message: `${plan.reason}: ${plan.sourceRoomId} -> ${plan.targetRoomId} rejected (${outcome.reason})`,
+        roomId: plan.targetRoomId,
+        playerIds: plan.playerIds,
+        data: {
+          moveId,
+          reason: plan.reason,
+          outcome: outcome.reason,
+          sourceRoomId: plan.sourceRoomId,
+          targetRoomId: plan.targetRoomId,
+          levelId: plan.levelId
+        }
+      });
     }
     return false;
+  }
+
+  /** Drop every per-room telemetry bookkeeping entry (room gone for good). */
+  public forgetRoom(roomId: string): void {
+    this.roomRoster.delete(roomId);
+    this.telemetryGap.delete(roomId);
+    this.telemetryGapWarnAt.delete(roomId);
+    this.telemetryVersionWarnAt.delete(roomId);
+  }
+
+  /** Record a structured event for GET /debug/logs (no-op without a sink). */
+  private record(event: DebugEventInput): void {
+    this.events?.record(event);
+  }
+
+  private recordSkippedLevelPlan(plan: LevelIsolationPlan, reason: string): void {
+    this.record({
+      category: "level",
+      event: "level.migration_skipped",
+      message: `${plan.reason}: ${plan.sourceRoomId} -> ${plan.targetRoomId} skipped (${reason})`,
+      roomId: plan.targetRoomId,
+      playerIds: plan.playerIds,
+      data: {
+        reason: plan.reason,
+        outcome: reason,
+        sourceRoomId: plan.sourceRoomId,
+        targetRoomId: plan.targetRoomId,
+        levelId: plan.levelId
+      }
+    });
+  }
+
+  private recordMoveExpired(tx: MoveTransaction | LevelMoveTransaction, status: "prepared" | "committed"): void {
+    this.record({
+      category: "move",
+      event: "move.expired",
+      message: `${tx.reason}: ${tx.sourceRoomId} -> ${tx.targetRoomId} expired (${status})`,
+      roomId: tx.targetRoomId,
+      playerIds: tx.playerIds,
+      data: { moveId: tx.moveId, reason: tx.reason, status, sourceRoomId: tx.sourceRoomId, targetRoomId: tx.targetRoomId }
+    });
   }
 
   public list(): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()]; }
