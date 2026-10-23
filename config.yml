@@ -24,6 +24,12 @@ rooms:
   candidate_room_limit: 256  # max rooms scanned per allocation request
   stale_room_ms: 120000      # drop a room snapshot after this long without updates
   max_players_per_room: 8    # hard per-room cap (Sky rooms are 8 players)
+  # Allocation target fill. Higher = pile same-level players into an existing
+  # room; lower = scatter them into empty rooms that are only merged later.
+  preferred_fill_target: 6
+  # Node load penalty. One node hosts one room here, so load is already counted
+  # as room fill; keep this small or it outweighs the same-level bonus.
+  load_penalty_weight: 10
 
 # ---------------------------------------------------------------------------
 # Node health
@@ -81,7 +87,7 @@ move:
   level_isolation_min_level_players: 1  # a level group this small is still moved out
   level_isolation_max_players: 8        # max players moved by a single plan
   level_isolation_sparse_room_threshold: 2  # rooms with ≤ this many players are merged if same level
-  level_isolation_level_change_cooldown_ms: 5000  # wait this long after a level change before migrating
+  level_isolation_level_change_cooldown_ms: 6000  # wait this long after a level change before migrating
 
 # ---------------------------------------------------------------------------
 # Debug HTTP endpoints (/debug/allnode, /debug/move).

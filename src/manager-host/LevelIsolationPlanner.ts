@@ -37,7 +37,7 @@ const DEFAULT_OPTIONS: LevelIsolationOptions = {
   minLevelPlayers: 1,
   maxPlayersPerMove: 8,
   sparseRoomThreshold: 2,
-  levelChangeCooldownMs: 5_000
+  levelChangeCooldownMs: 6_000
 };
 
 /**
@@ -379,11 +379,17 @@ export class LevelIsolationPlanner {
    * changed level most recently, which is the group the player action created.
    */
   private pickSourceGroup(groups: RoomLevelGroup[]): RoomLevelGroup | undefined {
-    const majority = groups[0];
-    if (!majority) return undefined;
-    const minority = groups[groups.length - 1];
-    if (!minority || minority.levelId === majority.levelId) return undefined;
-    return minority;
+    if (groups.length < 2) return undefined;
+    const last = groups[groups.length - 1];
+    if (!last) return undefined;
+    const smallest = last.players.length;
+    if (smallest === 0) return undefined;
+    // `groups` is sorted by size desc, then newestAt desc, so the first group
+    // of the smallest size is also the one that changed level most recently —
+    // that is the group this player action just created. Picking the last
+    // element instead (as before) moved the players who stayed put whenever
+    // both sides had the same size.
+    return groups.find((group) => group.players.length === smallest);
   }
 
   /**

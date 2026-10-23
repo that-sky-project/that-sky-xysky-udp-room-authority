@@ -17,6 +17,8 @@ export interface ManagerConfig {
   commandTimeoutMs: number;
   maxPendingCommands: number;
   maxPlayersPerRoom: number;
+  preferredFillTarget: number;
+  loadPenaltyWeight: number;
   nodeBackpressureLimitBytes: number;
   nodeCircuitOpenMs: number;
   nodeCircuitFailureThreshold: number;
@@ -56,7 +58,15 @@ const configSchema = z
         max_rooms: positiveInt(100_000),
         candidate_room_limit: positiveInt(256),
         stale_room_ms: positiveInt(120_000),
-        max_players_per_room: positiveInt(8)
+        max_players_per_room: positiveInt(8),
+        // Room fill level the allocator aims for. High values keep piling
+        // same-level players into an existing room; low values scatter them
+        // into empty rooms that only get merged later.
+        preferred_fill_target: positiveInt(6),
+        // Weight of the node load penalty. One node hosts one room here, so
+        // load already shows up as room fill; keep this small or it cancels
+        // the level bonus and pushes joins into empty rooms.
+        load_penalty_weight: floatFrom(10)
       })
       .default({}),
     nodes: z
@@ -97,7 +107,7 @@ const configSchema = z
         level_isolation_min_level_players: positiveInt(1),
         level_isolation_max_players: positiveInt(8),
         level_isolation_sparse_room_threshold: positiveInt(2),
-        level_isolation_level_change_cooldown_ms: positiveInt(5000)
+        level_isolation_level_change_cooldown_ms: positiveInt(6000)
       })
       .default({}),
     debug: z
@@ -119,6 +129,8 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     candidateRoomLimit: parsed.rooms.candidate_room_limit,
     staleRoomMs: parsed.rooms.stale_room_ms,
     maxPlayersPerRoom: parsed.rooms.max_players_per_room,
+    preferredFillTarget: parsed.rooms.preferred_fill_target,
+    loadPenaltyWeight: parsed.rooms.load_penalty_weight,
     nodeStaleMs: parsed.nodes.stale_ms,
     nodeBackpressureLimitBytes: parsed.nodes.backpressure_limit_bytes,
     nodeCircuitOpenMs: parsed.nodes.circuit_open_ms,

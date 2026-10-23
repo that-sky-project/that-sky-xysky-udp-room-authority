@@ -35,12 +35,13 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
   const policy = new PolicyEngine({
     maxPlayersPerRoom: config.maxPlayersPerRoom,
     staleNodePenalty: 30,
-    loadPenaltyWeight: 40,
+    loadPenaltyWeight: config.loadPenaltyWeight,
     sameRegionBonus: 12,
-    // 7 means "fill rooms to 7 before opening a new one", which concentrates
-    // every player into a single room and defeats level isolation. 2 spreads
-    // players across rooms so the level-aware score can separate them.
-    preferredFillTarget: 2,
+    // Fill existing rooms before opening new ones: players on the same level
+    // belong together, and the level-aware score below already keeps different
+    // levels apart. A low target scattered every join into its own empty room
+    // that only the consolidation pass merged later.
+    preferredFillTarget: config.preferredFillTarget,
     // A wrong-level room must lose to any same-level or empty room that has
     // capacity, so the penalty exceeds the widest possible fill bonus (8*7=56).
     sameLevelBonus: 20,
@@ -71,7 +72,7 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
     nodeStaleMs: config.nodeStaleMs,
     assignmentTtlMs: config.assignmentTtlMs,
     candidateRoomLimit: config.candidateRoomLimit
-  }, (roomId) => moves.telemetry.reserved(roomId));
+  }, (roomId) => moves.telemetry.reserved(roomId), logger);
 
   return { nodes, rooms, pending, policy, reservations, coordinator, router, moves, metrics };
 };

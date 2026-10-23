@@ -3,6 +3,7 @@ import type { NodeRegistry } from "./NodeRegistry.js";
 import type { PolicyEngine } from "./PolicyEngine.js";
 import type { ReservationTracker } from "./ReservationTracker.js";
 import type { RoomCache } from "./RoomCache.js";
+import type { Logger } from "../infra/logger/logger.js";
 import { asUnixMs, type PlayerId, type RoomId } from "../types/branded.js";
 import type { IAllocationReply, IAllocationRequest, RoomAssignment } from "../types/contracts.js";
 import { ErrorCode, HermesError, isHermesError } from "../types/errors.js";
@@ -26,7 +27,8 @@ export class RequestRouter {
     // Move reservations live in the MoveCoordinator's TelemetryStore; fold them
     // into the effective occupancy so allocation never fills slots an in-flight
     // move already claimed on the same target room.
-    private readonly moveReserved: (roomId: RoomId) => number = () => 0
+    private readonly moveReserved: (roomId: RoomId) => number = () => 0,
+    private readonly log?: Logger
   ) {}
 
   public async allocate(request: IAllocationRequest, signal?: AbortSignal): Promise<IAllocationReply> {
@@ -45,14 +47,19 @@ export class RequestRouter {
     const knownLocation = this.rooms.getPlayerLocation(playerId);
     if (knownLocation) {
       const room = this.rooms.getRoom(knownLocation.roomId);
-      if (room) return { code: ErrorCode.OK, data: this.assignmentFor(room, playerId) };
+      if (room) {
+        this.log?.info({ playerId, roomId: room.roomId, reason: "known_location", players: room.players }, "room allocated");
+        return { code: ErrorCode.OK, data: this.assignmentFor(room, playerId) };
+      }
     }
 
     const nodeHealth = new Map(this.nodes.listHealthy(this.options.nodeStaleMs).map((node) => [node.nodeId as string, node]));
     const context = {
       playerId,
       region: request.region,
-      level: request.level,
+      // 0 is not a real level id. Treat it as "unknown" so a room holding a
+      // real level is not scored as a wrong-level room.
+      level: request.level !== undefined && request.level > 0 ? request.level : undefined,
       preferences: request.preferences
     };
 
@@ -85,6 +92,16 @@ export class RequestRouter {
           throw new HermesError(ack.code, ack.message ?? "node rejected room reservation", ack.data);
         }
 
+        this.log?.info({
+          playerId,
+          roomId: selection.room.roomId,
+          reason: "policy_score",
+          score: Math.round(selection.score),
+          players: selection.room.players,
+          capacity: selection.room.capacity,
+          level: context.level ?? null,
+          candidates: candidates.length + 1
+        }, "room allocated");
         return { code: ErrorCode.OK, data: this.assignmentFor(selection.room, playerId) };
       } catch (error) {
         this.reservations.release(playerId);
@@ -93,6 +110,7 @@ export class RequestRouter {
       }
     }
 
+    this.log?.warn({ playerId, candidates: candidates.length, rooms: this.rooms.listRooms().length, level: request.level ?? null }, "allocation found no usable room");
     throw new HermesError(ErrorCode.NO_CAPACITY, "no room capacity is currently available");
   }
 
