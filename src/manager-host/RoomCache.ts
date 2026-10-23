@@ -210,8 +210,9 @@ export class RoomCache {
       nodeId,
       roomId,
       updatedAt: asUnixMs(Date.now()),
-      // Keep a previously reported level if this update omits it (e.g. re-tracking without player payload).
-      level: level ?? previous?.level
+      // Keep a previously reported level when this update omits it, and treat
+      // 0 as "not reported" (the node's JoinGame level sentinel).
+      level: level !== undefined && level > 0 ? level : previous?.level
       // leavingAt is intentionally omitted: joining a new room clears the mark.
     });
   }

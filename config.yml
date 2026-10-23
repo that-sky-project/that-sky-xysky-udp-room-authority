@@ -9,7 +9,7 @@
 #   - the WebSocket control channel that UDP room nodes connect to (path "/")
 #   - the HTTP JSON API, including POST {allocate_path} used by XYSky/matchmakers
 host: 0.0.0.0
-port: 1131
+port: 1132
 allocate_path: /allocate
 
 logging:
@@ -20,10 +20,10 @@ logging:
 # Room cache
 # ---------------------------------------------------------------------------
 rooms:
-  max_rooms: 100000          # LRU capacity for the room snapshot cache
-  candidate_room_limit: 256  # max rooms scanned per allocation request
-  stale_room_ms: 120000      # drop a room snapshot after this long without updates
-  max_players_per_room: 8    # hard per-room cap (Sky rooms are 8 players)
+  max_rooms: 100000 # LRU capacity for the room snapshot cache
+  candidate_room_limit: 256 # max rooms scanned per allocation request
+  stale_room_ms: 120000 # drop a room snapshot after this long without updates
+  max_players_per_room: 8 # hard per-room cap (Sky rooms are 8 players)
   # Allocation target fill. Higher = pile same-level players into an existing
   # room; lower = scatter them into empty rooms that are only merged later.
   preferred_fill_target: 6
@@ -35,10 +35,10 @@ rooms:
 # Node health
 # ---------------------------------------------------------------------------
 nodes:
-  stale_ms: 10000                 # a node is unhealthy after this long without events
-  backpressure_limit_bytes: 8388608  # stop sending if a node's WS send buffer exceeds this
-  circuit_open_ms: 5000           # how long a node's circuit stays open after tripping
-  circuit_failure_threshold: 5    # consecutive command failures that trip the circuit
+  stale_ms: 10000 # a node is unhealthy after this long without events
+  backpressure_limit_bytes: 8388608 # stop sending if a node's WS send buffer exceeds this
+  circuit_open_ms: 5000 # how long a node's circuit stays open after tripping
+  circuit_failure_threshold: 5 # consecutive command failures that trip the circuit
   # Application-level heartbeat. TCP alone cannot detect half-open sockets
   # (NAT expiry, silent partition); the manager pings every interval and
   # terminates a node that has not answered within the timeout.
@@ -53,43 +53,52 @@ nodes:
 # Allocation / reservations
 # ---------------------------------------------------------------------------
 assignment:
-  ttl_ms: 30000                   # lifetime of a RoomAssignment returned to a caller
-  reservation_shadow_ttl_ms: 10000  # lifetime of a local shadow hold before the node confirms
+  ttl_ms: 30000 # lifetime of a RoomAssignment returned to a caller
+  reservation_shadow_ttl_ms: 10000 # lifetime of a local shadow hold before the node confirms
 
 # ---------------------------------------------------------------------------
 # Node command channel
 # ---------------------------------------------------------------------------
 commands:
-  timeout_ms: 3000      # wait this long for a node ack before failing a command
-  max_pending: 100000   # cap on outstanding (unacked) commands
+  timeout_ms: 3000 # wait this long for a node ack before failing a command
+  max_pending: 100000 # cap on outstanding (unacked) commands
 
 # ---------------------------------------------------------------------------
 # Cross-room moves (merge / rebalance)
 # ---------------------------------------------------------------------------
 move:
-  budget_per_cycle: 8         # max moves started per planning cycle
-  transaction_timeout_ms: 15000  # abort a move transaction that does not complete in time
-  room_cooldown_ms: 20000     # hysteresis: skip a room as move source/target for this long after a move
-  state_ema_half_life_ms: 3000  # smoothing half-life for velocity-derived signals (anti-thrash)
-  distance_radius: 30         # length scale for proximity = exp(-dist/radius); GAME UNITS, calibrate
-  cluster_radius: 12          # same-level players within this distance form a move cluster
-  isolation_pressure_weight: 0.6  # how much spatial isolation drives per-player migration pressure
-  stale_pressure_weight: 0.4  # how much staleness drives per-player migration pressure
+  budget_per_cycle: 8 # max moves started per planning cycle
+  # A room must keep the same roster/level signature for this many consecutive
+  # planning cycles before it may be a move source or target. Transients are
+  # filtered by observation instead of a wall-clock room cooldown.
+  confirmation_cycles: 2
+  # Extra gain penalty per spatial-cluster mate a partial migration leaves
+  # behind; higher values make the planner move whole clusters.
+  cluster_split_penalty: 0.05
+  transaction_timeout_ms: 15000 # abort a move transaction that does not complete in time
+  state_ema_half_life_ms: 3000 # smoothing half-life for velocity-derived signals (anti-thrash)
+  distance_radius: 30 # length scale for proximity = exp(-dist/radius); GAME UNITS, calibrate
+  cluster_radius: 12 # same-level players within this distance form a move cluster
+  isolation_pressure_weight: 0.6 # how much spatial isolation drives per-player migration pressure
+  stale_pressure_weight: 0.4 # how much staleness drives per-player migration pressure
   # A live room's mergePressure tops out near 0.28 (freshness is ~1 for an online
   # player), so a threshold above that only ever fires for genuinely stale rooms.
   # 0.25 catches isolated rooms while leaving settled and full ones alone.
-  merge_pressure_threshold: 0.25  # a room becomes a move source above this
-  minimum_gain: 0.15          # a plan must exceed this gain to execute
+  merge_pressure_threshold: 0.25 # a room becomes a move source above this
+  minimum_gain: 0.15 # a plan must exceed this gain to execute
   # Level isolation: a room must only ever hold one level. When a second level
   # shows up, the minority level is moved out, preferring a room that already
   # runs that level and otherwise an empty room. Mixed rooms are never used as a
   # target, so migrations converge.
-  level_isolation_min_level_players: 1  # a level group this small is still moved out
-  level_isolation_max_players: 8        # max players moved by a single plan
-  level_isolation_sparse_room_threshold: 2  # rooms with ≤ this many players are merged if same level
-  # Shared settling window for every migration path: after any player in a room
-  # changes level, nobody is moved out of that room for this long.
+  level_isolation_min_level_players: 1 # a level group this small is still moved out
+  level_isolation_max_players: 8 # max players moved by a single plan
+  level_isolation_sparse_room_threshold: 2 # rooms with ≤ this many players are merged if same level
+  # Per-player settling windows. A player who just changed level, or just
+  # joined a room (in-game "join friend" teleport / cross-room move), is still
+  # loading and is excluded from level grouping and migration decisions until
+  # the window passes. The room itself stays usable for its other players.
   level_change_cooldown_ms: 6000
+  join_settle_ms: 4000
 
 # ---------------------------------------------------------------------------
 # Debug HTTP endpoints (/debug/allnode, /debug/move).

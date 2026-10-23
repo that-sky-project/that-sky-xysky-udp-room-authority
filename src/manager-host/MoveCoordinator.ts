@@ -20,8 +20,14 @@ const TRANSACTION_RETENTION_MS = 5 * 60_000;
 export interface MoveCoordinatorOptions {
   moveBudgetPerCycle?: number;
   moveTransactionTimeoutMs?: number;
-  roomCooldownMs?: number;
   stateEmaHalfLifeMs?: number;
+  /**
+   * How many consecutive planning cycles a room's roster/level signature must
+   * stay unchanged before it may be used as a migration source or target.
+   * This is the state-based hysteresis: transients are filtered by "the
+   * condition was observed twice", not by a wall-clock cooldown.
+   */
+  confirmationCycles?: number;
   planner?: Partial<MovePlannerOptions>;
   levelIsolation?: Partial<LevelIsolationOptions>;
 }
@@ -32,7 +38,8 @@ export class MoveCoordinator {
   private readonly levelIsolationPlanner: LevelIsolationPlanner;
   private readonly executor: MoveExecutor;
   private readonly transactions = new Map<string, MoveTransaction | LevelMoveTransaction>();
-  private readonly roomCooldownUntil = new Map<string, number>();
+  /** roomId -> last observed roster signature and how many cycles it repeated. */
+  private readonly roomStability = new Map<string, { signature: string; cycles: number }>();
   private readonly pendingCancels = new Map<string, { roomId: RoomId; moveId: string; playerIds: string[] }>();
   private lastPlanAt = 0;
   private planning = false;
@@ -170,12 +177,10 @@ export class MoveCoordinator {
 
       for (const player of incoming) {
         this.telemetry.upsert(roomId, player);
-        // Keep playerLocations.level in sync from telemetry. The initial
-        // player.join from some node versions omits level, which would leave
-        // levelsByRoom() empty and disable level-aware allocation entirely.
-        if (player.levelId !== undefined) {
-          this.rooms.trackPlayer(player.playerId, event.data.nodeId, roomId, player.levelId);
-        }
+        // Track every player, not only those with a known level: the location
+        // is also restored from telemetry after a manager restart now that
+        // reconnects no longer replay one player.join per player.
+        this.rooms.trackPlayer(player.playerId, event.data.nodeId, roomId, player.levelId);
       }
       const room = this.rooms.getRoom(roomId);
       if (room) {
@@ -323,8 +328,20 @@ export class MoveCoordinator {
     // planned against. A room on a dead or circuit-open node is not a real
     // target: the executor would fail the move, and because the plan picks the
     // first candidate that fits, it could shadow a live room for the cycle.
-    const rooms = this.rooms.listRooms().filter((room) => this.isRoomPlannable(room));
-    const byRoom = new Map(rooms.map((room) => [room.roomId as string, this.telemetry.listRoom(room.roomId, now)]));
+    const plannableRooms = this.rooms.listRooms().filter((room) => this.isRoomPlannable(room));
+    const allRosters = new Map(
+      plannableRooms.map((room) => [room.roomId as string, this.telemetry.listRoom(room.roomId, now)])
+    );
+    // Only act on rooms whose roster and level set have been identical for the
+    // configured number of cycles. A single snapshot is not evidence: a
+    // friend-join, a slow map load or an out-of-order frame all look like a
+    // "mixed room" for a moment.
+    const rooms = plannableRooms.filter((room) =>
+      this.isRoomStable(room.roomId as string, allRosters.get(room.roomId as string) ?? [])
+    );
+    const byRoom = new Map(
+      rooms.map((room) => [room.roomId as string, allRosters.get(room.roomId as string) ?? []])
+    );
     this.planner.calibrate(rooms, byRoom, now);
 
     // One level per room is the hard rule, so it runs before the activity-based
@@ -334,25 +351,25 @@ export class MoveCoordinator {
     const plans = this.planner.plan(rooms, byRoom, now);
     const usedTargets = new Set<string>(); let moveBudget = this.options.moveBudgetPerCycle ?? 8;
 
-    const usedIsolationRooms: string[] = [];
     for (const isolationPlan of isolationPlans) {
       // A room with three or more levels produces one plan per stray level, so
       // the source room is allowed to repeat; only the destination must be
       // unique, since one target room cannot absorb two concurrent moves.
       if (moveBudget < isolationPlan.playerIds.length || usedTargets.has(isolationPlan.targetRoomId)) continue;
-      const executed = await this.executeLevelIsolation(isolationPlan, now, signal, usedIsolationRooms);
+      if (this.roomHasActiveMove(isolationPlan.targetRoomId)) continue;
+      const executed = await this.executeLevelIsolation(isolationPlan, now, signal);
       if (executed) {
         usedTargets.add(isolationPlan.targetRoomId);
         moveBudget -= isolationPlan.playerIds.length;
       }
     }
-    if (usedIsolationRooms.length > 0) {
-      const cooldownUntil = now + (this.options.roomCooldownMs ?? 20_000);
-      for (const roomId of usedIsolationRooms) this.roomCooldownUntil.set(roomId, cooldownUntil);
-    }
 
     for (const plan of plans) {
-      if (moveBudget < plan.playerIds.length || usedTargets.has(plan.targetRoomId) || this.inCooldown(plan.sourceRoomId, now) || this.inCooldown(plan.targetRoomId, now)) continue;
+      if (moveBudget < plan.playerIds.length || usedTargets.has(plan.targetRoomId)) continue;
+      // A target with a prepared/committed transaction is being written to
+      // right now; a source with one only has those players blocked, which
+      // transactionsForPlayer() below covers.
+      if (this.roomHasActiveMove(plan.targetRoomId)) continue;
       if (isolationPlans.some((isolationPlan) => isolationPlan.sourceRoomId === plan.sourceRoomId)) continue;
       const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
       const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
@@ -374,7 +391,6 @@ export class MoveCoordinator {
       if (outcome.ok) {
         this.transactions.set(moveId, { ...tx, status: "committed" });
         usedTargets.add(plan.targetRoomId); moveBudget -= plan.playerIds.length;
-        this.applyCooldown([plan.sourceRoomId, plan.targetRoomId], now);
         this.onMoveOutcome?.(plan.reason, "committed");
         this.log?.info({ moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, reason: plan.reason, gain: plan.gain }, "move committed");
         this.record({
@@ -474,7 +490,7 @@ export class MoveCoordinator {
     }
   }
 
-  private async executeLevelIsolation(plan: LevelIsolationPlan, now: number, signal: AbortSignal | undefined, usedRooms: string[]): Promise<boolean> {
+  private async executeLevelIsolation(plan: LevelIsolationPlan, now: number, signal: AbortSignal | undefined): Promise<boolean> {
     const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
     const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
     if (!source || !target) {
@@ -489,9 +505,9 @@ export class MoveCoordinator {
     }
     // The source room may legitimately appear in several plans in one cycle when
     // it holds three or more levels; only the destination has to be exclusive.
-    if (this.inCooldown(plan.targetRoomId, now)) {
-      this.log?.debug({ targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: target room in cooldown");
-      this.recordSkippedLevelPlan(plan, "target_cooldown");
+    if (this.roomHasActiveMove(plan.targetRoomId)) {
+      this.log?.debug({ targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: target already has an in-flight move");
+      this.recordSkippedLevelPlan(plan, "target_busy");
       return false;
     }
 
@@ -511,9 +527,6 @@ export class MoveCoordinator {
 
     if (outcome.ok) {
       this.transactions.set(moveId, { ...tx, status: "committed" });
-      // Cooldowns are applied by the caller once the whole cycle is planned, so a
-      // room with several stray levels can be drained in one pass.
-      usedRooms.push(plan.sourceRoomId, plan.targetRoomId);
       this.onMoveOutcome?.(plan.reason, "committed");
       this.log?.info({ moveId, reason: plan.reason, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId, sourceLevelCount: plan.sourceLevelCount, targetLevelCount: plan.targetLevelCount }, "level isolation committed");
       this.record({
@@ -574,6 +587,7 @@ export class MoveCoordinator {
   /** Drop every per-room telemetry bookkeeping entry (room gone for good). */
   public forgetRoom(roomId: string): void {
     this.roomRoster.delete(roomId);
+    this.roomStability.delete(roomId);
     this.telemetryGap.delete(roomId);
     this.telemetryGapWarnAt.delete(roomId);
     this.telemetryVersionWarnAt.delete(roomId);
@@ -675,16 +689,30 @@ export class MoveCoordinator {
   }
   private transactionsForPlayer(playerIds: string[]): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()].filter((tx) => tx.status === "prepared" || tx.status === "committed").filter((tx) => tx.playerIds.some((id) => playerIds.includes(id))); }
 
-  private applyCooldown(roomIds: string[], now: number): void {
-    const until = now + (this.options.roomCooldownMs ?? 20_000);
-    for (const roomId of roomIds) this.roomCooldownUntil.set(roomId, until);
+  /** A target room with a prepared/committed transaction is being written to. */
+  private roomHasActiveMove(roomId: string): boolean {
+    for (const tx of this.transactions.values()) {
+      if (tx.status !== "prepared" && tx.status !== "committed") continue;
+      if (tx.targetRoomId === roomId) return true;
+    }
+    return false;
   }
 
-  private inCooldown(roomId: string, now: number): boolean {
-    const until = this.roomCooldownUntil.get(roomId);
-    if (until === undefined) return false;
-    if (until <= now) { this.roomCooldownUntil.delete(roomId); return false; }
-    return true;
+  /**
+   * True once the room's roster signature (playerId:levelId set) has been
+   * identical for `confirmationCycles` consecutive planning cycles. Joins,
+   * leaves and level changes all alter the signature and restart the count —
+   * this is what replaces the old wall-clock room cooldown.
+   */
+  private isRoomStable(roomId: string, players: PlayerTelemetry[]): boolean {
+    const signature = players
+      .map((player) => `${player.playerId}:${player.levelId ?? "?"}`)
+      .sort()
+      .join(",");
+    const previous = this.roomStability.get(roomId);
+    const cycles = previous?.signature === signature ? previous.cycles + 1 : 1;
+    this.roomStability.set(roomId, { signature, cycles });
+    return cycles >= (this.options.confirmationCycles ?? 2);
   }
 
   private queueCancel(roomId: RoomId, moveId: string, playerIds: string[]): void {

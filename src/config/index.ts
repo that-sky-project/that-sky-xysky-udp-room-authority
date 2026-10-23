@@ -26,8 +26,9 @@ export interface ManagerConfig {
   nodeHeartbeatTimeoutMs: number;
   nodeGraceMs: number;
   moveBudgetPerCycle: number;
+  moveConfirmationCycles: number;
+  moveClusterSplitPenalty: number;
   moveTransactionTimeoutMs: number;
-  moveRoomCooldownMs: number;
   moveStateEmaHalfLifeMs: number;
   moveDistanceRadius: number;
   moveClusterRadius: number;
@@ -39,6 +40,7 @@ export interface ManagerConfig {
   levelIsolationMaxPlayers: number;
   levelIsolationSparseRoomThreshold: number;
   levelChangeCooldownMs: number;
+  joinSettleMs: number;
   debugApiToken: string;
   debugLogBufferSize: number;
 }
@@ -96,8 +98,14 @@ const configSchema = z
     move: z
       .object({
         budget_per_cycle: positiveInt(8),
+        // A room must keep the same roster/level signature for this many
+        // planning cycles before it may be used as a move source or target.
+        // State-based hysteresis; replaces the old wall-clock room cooldown.
+        confirmation_cycles: positiveInt(2),
+        // Extra gain penalty per spatial-cluster mate a partial migration
+        // leaves behind. Higher values prefer moving whole clusters.
+        cluster_split_penalty: floatFrom(0.05),
         transaction_timeout_ms: positiveInt(15_000),
-        room_cooldown_ms: positiveInt(20_000),
         state_ema_half_life_ms: positiveInt(3_000),
         distance_radius: floatFrom(30),
         cluster_radius: floatFrom(12),
@@ -111,7 +119,11 @@ const configSchema = z
         // Shared settling window for every migration path (isolation,
         // same-level consolidation and activity merge): after anyone in a room
         // changes level, nobody is moved out of it for this long.
-        level_change_cooldown_ms: positiveInt(6000)
+        level_change_cooldown_ms: positiveInt(6000),
+        // A player who just joined a room (friend-join teleport / cross-room
+        // move) is still loading the destination map and may briefly report
+        // the previous level. Do not isolate the room until this settles.
+        join_settle_ms: positiveInt(4000)
       })
       .default({}),
     debug: z
@@ -152,8 +164,9 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     commandTimeoutMs: parsed.commands.timeout_ms,
     maxPendingCommands: parsed.commands.max_pending,
     moveBudgetPerCycle: parsed.move.budget_per_cycle,
+    moveConfirmationCycles: parsed.move.confirmation_cycles,
+    moveClusterSplitPenalty: parsed.move.cluster_split_penalty,
     moveTransactionTimeoutMs: parsed.move.transaction_timeout_ms,
-    moveRoomCooldownMs: parsed.move.room_cooldown_ms,
     moveStateEmaHalfLifeMs: parsed.move.state_ema_half_life_ms,
     moveDistanceRadius: parsed.move.distance_radius,
     moveClusterRadius: parsed.move.cluster_radius,
@@ -165,6 +178,7 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     levelIsolationMaxPlayers: parsed.move.level_isolation_max_players,
     levelIsolationSparseRoomThreshold: parsed.move.level_isolation_sparse_room_threshold,
     levelChangeCooldownMs: parsed.move.level_change_cooldown_ms,
+    joinSettleMs: parsed.move.join_settle_ms,
     debugApiToken: parsed.debug.api_token,
     debugLogBufferSize: parsed.debug.log_buffer_size
   };

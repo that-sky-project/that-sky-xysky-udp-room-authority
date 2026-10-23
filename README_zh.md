@@ -106,8 +106,10 @@ commands:
 
 move:
   budget_per_cycle: 8
+  confirmation_cycles: 2
   transaction_timeout_ms: 15000
   level_change_cooldown_ms: 6000
+  join_settle_ms: 4000
 
 debug:
   api_token: ""
@@ -132,8 +134,11 @@ debug:
 | `commands.timeout_ms` | `3000` | 节点命令 ack 超时 |
 | `commands.max_pending` | `100000` | 最大未完成命令数 |
 | `move.budget_per_cycle` | `8` | 每轮规划最多启动的迁移数 |
+| `move.confirmation_cycles` | `2` | 房间名单/level 签名需连续保持不变的规划轮数，之后才可作为迁移源或目标 |
+| `move.cluster_split_penalty` | `0.05` | 部分迁移每留下一个空间聚类同伴的额外收益惩罚 |
 | `move.transaction_timeout_ms` | `15000` | 迁移事务停滞多久后中止 |
-| `move.level_change_cooldown_ms` | `6000` | 切图后的沉降窗口；窗口内任何迁移路径都不会把玩家移出该房间 |
+| `move.level_change_cooldown_ms` | `6000` | 玩家切图后的沉降窗口；窗口内该玩家不计入 level 分组、也不参与迁移决策 |
+| `move.join_settle_ms` | `4000` | 玩家刚加入房间（好友传送、跨房迁移）后的沉降窗口 |
 | `debug.api_token` | `""` | `/debug/*` 的 token；留空则不校验 |
 | `debug.log_buffer_size` | `2000` | `GET /debug/logs` 使用的内存事件环形缓冲区大小 |
 

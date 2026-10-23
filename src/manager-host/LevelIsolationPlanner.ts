@@ -25,6 +25,10 @@ export interface LevelIsolationOptions {
    *  that exists while two hand-holding players switch maps at slightly
    *  different times. */
   levelChangeCooldownMs: number;
+  /** A player who just joined a room (friend-join teleport, cross-room move)
+   *  is still loading the destination map and may briefly report the previous
+   *  level. Leave the room alone for this long before isolating anyone. */
+  joinSettleMs: number;
 }
 
 interface RoomLevelGroup {
@@ -37,7 +41,8 @@ const DEFAULT_OPTIONS: LevelIsolationOptions = {
   minLevelPlayers: 1,
   maxPlayersPerMove: 8,
   sparseRoomThreshold: 2,
-  levelChangeCooldownMs: 6_000
+  levelChangeCooldownMs: 6_000,
+  joinSettleMs: 4_000
 };
 
 /**
@@ -66,8 +71,8 @@ export class LevelIsolationPlanner {
     const plans: LevelIsolationPlan[] = [];
     const claimedPlayers = new Set<string>();
     const usedTargets = new Set<string>();
-    // roomCooldownMs is per room; maxPlayersPerMove caps a single plan. The cycle
-    // budget is therefore "one plan's worth of players per room in the cluster".
+    // maxPlayersPerMove caps a single plan; the cycle budget is "one plan's
+    // worth of players per room in the cluster".
     let budget = this.options.maxPlayersPerMove * Math.max(1, rooms.length);
 
     // Snapshot occupancy per room once; planned moves update it locally so two
@@ -81,7 +86,11 @@ export class LevelIsolationPlanner {
     }
     const levelsByRoom = new Map<string, Set<number>>();
     for (const [roomId, players] of byRoom) {
-      levelsByRoom.set(roomId, new Set(players.map((p) => p.levelId).filter((l): l is number => l !== undefined)));
+      // Only settled levels count: a player who just joined or just switched
+      // maps is still loading and must not turn the room into a "mixed" one.
+      levelsByRoom.set(roomId, new Set(
+        players.filter((p) => this.isSettled(p, now)).map((p) => p.levelId).filter((l): l is number => l !== undefined)
+      ));
     }
 
     for (const room of rooms) {
@@ -89,13 +98,9 @@ export class LevelIsolationPlanner {
 
       let players = byRoom.get(room.roomId) ?? [];
 
-      // If anyone in this room just changed level, wait out the cooldown before
-      // migrating anyone. Two hand-holding players switching maps produce a
-      // brief "false mixed" window between their two telemetry updates; acting
-      // on it would split them apart.
-      if (this.hasRecentLevelChange(players, now)) continue;
-
-      let groups = this.groupByLevel(players);
+      // Unsettled players are excluded from the groups below, but the room
+      // itself stays usable for its settled occupants.
+      let groups = this.groupByLevel(players, now);
       // A room may hold three or more levels. Keep draining its minority levels
       // in the same cycle until one is left, so a single mixed room does not
       // need one cooldown window per stray level.
@@ -158,7 +163,7 @@ export class LevelIsolationPlanner {
         if (!players.some((p) => p.levelId === source.levelId)) {
           levelsByRoom.get(room.roomId)?.delete(source.levelId);
         }
-        groups = this.groupByLevel(players);
+        groups = this.groupByLevel(players, now);
       }
     }
 
@@ -198,11 +203,12 @@ export class LevelIsolationPlanner {
       if (occ === 0) continue;
       const levelId = [...levels][0];
       if (levelId === undefined) continue;
-      // A room in its level-change settling window is neither a merge source
-      // nor a target: it may still be loading the new map, and pulling players
-      // into (or out of) it during that window is exactly the churn the shared
-      // cooldown exists to prevent.
-      if (this.hasRecentLevelChange(byRoom.get(room.roomId) ?? [], now)) continue;
+      const unsettled = this.hasUnsettled(byRoom.get(room.roomId) ?? [], now);
+      // A room with a player who has not settled yet is "expecting" them
+      // (friend-join / cross-room arrival). Do not drain it or fill it until
+      // the arrival is resolved; moving the resident out is exactly what
+      // breaks an in-game join-friend attempt.
+      if (unsettled) continue;
 
       const entry = { roomId: room.roomId, occ, cap: room.capacity };
       if (occ <= threshold) {
@@ -236,7 +242,7 @@ export class LevelIsolationPlanner {
         if (!target) continue;
 
         const rawCandidates = (byRoom.get(source.roomId) ?? [])
-          .filter((p) => p.levelId === levelId && !claimedPlayers.has(p.playerId as string));
+          .filter((p) => p.levelId === levelId && !claimedPlayers.has(p.playerId as string) && this.isSettled(p, now));
         const sourcePlayers = this.filterByAffinity(rawCandidates, byRoom.get(source.roomId) ?? [], claimedPlayers);
         if (sourcePlayers.length === 0) continue;
 
@@ -329,10 +335,13 @@ export class LevelIsolationPlanner {
     return selected;
   }
 
-  private groupByLevel(players: StoredTelemetry[]): RoomLevelGroup[] {
+  private groupByLevel(players: StoredTelemetry[], now: number): RoomLevelGroup[] {
     const byLevel = new Map<number, StoredTelemetry[]>();
     for (const player of players) {
       if (player.levelId === undefined) continue;
+      // A player who just joined / just switched maps still reports the old
+      // level; counting it would make a perfectly normal room look mixed.
+      if (!this.isSettled(player, now)) continue;
       const group = byLevel.get(player.levelId) ?? [];
       group.push(player);
       byLevel.set(player.levelId, group);
@@ -378,16 +387,30 @@ export class LevelIsolationPlanner {
   private newestChangeAt(players: StoredTelemetry[]): number {
     let newest = 0;
     for (const player of players) {
-      const at = player.levelChangedAt ?? 0;
+      // A fresh arrival counts as "new" too: when two level groups tie, the
+      // player who just joined (friend-join, cross-room move) is the one whose
+      // state is least settled, so the newcomer moves — never the resident
+      // whose room is being joined.
+      const at = Math.max(player.levelChangedAt ?? 0, player.roomJoinedAt ?? 0);
       if (at > newest) newest = at;
     }
     return newest;
   }
 
-  /** True if any player in the room changed level within the cooldown window. */
-  private hasRecentLevelChange(players: StoredTelemetry[], now: number): boolean {
-    const cutoff = now - this.options.levelChangeCooldownMs;
-    return players.some((p) => (p.levelChangedAt ?? 0) > cutoff);
+  /**
+   * A player's level is settled once they have been in the room for a moment
+   * and have not just switched level. While unsettled, their reported level is
+   * the previous map and must not be treated as a real level group.
+   */
+  private isSettled(player: StoredTelemetry, now: number): boolean {
+    const levelCutoff = now - this.options.levelChangeCooldownMs;
+    const joinCutoff = now - this.options.joinSettleMs;
+    return (player.levelChangedAt ?? 0) <= levelCutoff && (player.roomJoinedAt ?? 0) <= joinCutoff;
+  }
+
+  /** True while any occupant of the room is still settling. */
+  private hasUnsettled(players: StoredTelemetry[], now: number): boolean {
+    return players.some((player) => !this.isSettled(player, now));
   }
 
   /**
@@ -429,9 +452,8 @@ export class LevelIsolationPlanner {
     const isUsable = (room: RoomSnapshot): boolean => {
       if (room.roomId === sourceRoomId || room.draining) return false;
       if ((occupancy.get(room.roomId) ?? 0) >= room.capacity) return false;
-      // Do not pull players into a room that is still settling after a level
-      // change; the destination is in flux for the same reason the source is.
-      return !this.hasRecentLevelChange(byRoom.get(room.roomId) ?? [], now);
+      // Never pull players into a room that still has an unsettled player.
+      return !this.hasUnsettled(byRoom.get(room.roomId) ?? [], now);
     };
 
     const byProximity = (a: RoomSnapshot, b: RoomSnapshot): number => {

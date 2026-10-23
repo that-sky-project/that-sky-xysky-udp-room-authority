@@ -8,6 +8,8 @@ export interface StoredTelemetry extends PlayerTelemetry {
   lastMigratedAt?: number | undefined;
   /** When this player was last observed switching level; 0 if never seen to. */
   levelChangedAt?: number | undefined;
+  /** When this player last appeared in a different room (join / cross-room move). */
+  roomJoinedAt?: number | undefined;
 }
 
 export interface TelemetryStoreOptions {
@@ -23,15 +25,26 @@ export class TelemetryStore {
   public upsert(roomId: RoomId, input: PlayerTelemetry, now = Date.now()): StoredTelemetry {
     const previous = this.players.get(input.playerId);
     const rawVelocity = input.velocity ?? previous?.velocity ?? 0;
+    // 0 is the node's "no level reported" sentinel (JoinGame without levelId).
+    // Treat it as unknown here so it never becomes a phantom level group that
+    // makes a room look mixed; a later frame with a real level fills it in.
+    const hasLevel = input.levelId !== undefined;
+    const incomingLevel = input.levelId === 0 ? undefined : input.levelId;
     const levelChanged =
-      previous?.levelId !== undefined && input.levelId !== undefined && previous.levelId !== input.levelId;
+      hasLevel && previous?.levelId !== undefined && incomingLevel !== undefined && previous.levelId !== incomingLevel;
+    const roomChanged = previous !== undefined && previous.roomId !== roomId;
     const next: StoredTelemetry = {
       ...previous,
       ...input,
+      ...(hasLevel ? { levelId: incomingLevel } : {}),
       roomId,
       receivedAt: now,
       emaVelocity: this.smooth(previous?.emaVelocity, rawVelocity, previous?.receivedAt, now),
-      levelChangedAt: levelChanged ? now : previous?.levelChangedAt
+      levelChangedAt: levelChanged ? now : previous?.levelChangedAt,
+      // A friend-join teleport enters the UDP room while still on the previous
+      // map, so the room is briefly "mixed" through no fault of the players.
+      // Planners use this to hold off until the newcomer has loaded in.
+      roomJoinedAt: roomChanged || previous === undefined ? now : previous.roomJoinedAt ?? now
     };
     this.players.set(input.playerId, next);
     return next;

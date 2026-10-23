@@ -61,17 +61,21 @@ export class MoveExecutor {
 
     if (playerIds.length === 0) return { ok: false, moveId, reason: "no_players" };
 
+    // Use the same roster the planner used (TelemetryStore) instead of the
+    // RoomCache counter, which can lag behind join/leave events. The target
+    // node still enforces its own authoritative capacity.
+    const occupied = this.telemetry.listRoom(target.roomId, now).length;
     if (!this.telemetry.tryReserve(
       target.roomId,
       moveId,
       playerIds.length,
       target.capacity,
-      target.players,
+      occupied,
       this.options.reservationTtlMs,
       now
     )) {
       this.log?.debug(
-        { moveId, targetRoomId: target.roomId, targetPlayers: target.players, targetCapacity: target.capacity },
+        { moveId, targetRoomId: target.roomId, targetPlayers: occupied, targetCapacity: target.capacity },
         "move skipped: target has no capacity"
       );
       return { ok: false, moveId, reason: "no_capacity" };

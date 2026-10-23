@@ -56,7 +56,7 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
   const moves = new MoveCoordinator(rooms, nodes, pending, coordinator, {
     moveBudgetPerCycle: config.moveBudgetPerCycle,
     moveTransactionTimeoutMs: config.moveTransactionTimeoutMs,
-    roomCooldownMs: config.moveRoomCooldownMs,
+    confirmationCycles: config.moveConfirmationCycles,
     stateEmaHalfLifeMs: config.moveStateEmaHalfLifeMs,
     planner: {
       distanceRadius: config.moveDistanceRadius,
@@ -65,13 +65,16 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
       stalePressureWeight: config.moveStalePressureWeight,
       mergePressureThreshold: config.moveMergePressureThreshold,
       minimumGain: config.moveMinimumGain,
-      levelChangeCooldownMs: config.levelChangeCooldownMs
+      levelChangeCooldownMs: config.levelChangeCooldownMs,
+      joinSettleMs: config.joinSettleMs,
+      clusterSplitPenalty: config.moveClusterSplitPenalty
     },
     levelIsolation: {
       minLevelPlayers: config.levelIsolationMinLevelPlayers,
       maxPlayersPerMove: config.levelIsolationMaxPlayers,
       sparseRoomThreshold: config.levelIsolationSparseRoomThreshold,
-      levelChangeCooldownMs: config.levelChangeCooldownMs
+      levelChangeCooldownMs: config.levelChangeCooldownMs,
+      joinSettleMs: config.joinSettleMs
     }
   }, logger, (reason, status) => metrics.inc("qwd_move_total", [reason, status]), () => metrics.inc("qwd_telemetry_gap_total"), events);
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {

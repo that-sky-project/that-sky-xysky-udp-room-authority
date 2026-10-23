@@ -111,8 +111,10 @@ commands:
 
 move:
   budget_per_cycle: 8
+  confirmation_cycles: 2
   transaction_timeout_ms: 15000
   level_change_cooldown_ms: 6000
+  join_settle_ms: 4000
 
 debug:
   api_token: ""
@@ -137,8 +139,11 @@ debug:
 | `commands.timeout_ms` | `3000` | Node command ack timeout |
 | `commands.max_pending` | `100000` | Max outstanding commands |
 | `move.budget_per_cycle` | `8` | Max moves started per planning cycle |
+| `move.confirmation_cycles` | `2` | Consecutive cycles a room's roster/level signature must stay unchanged before it may be a move source or target |
+| `move.cluster_split_penalty` | `0.05` | Extra gain penalty per spatial-cluster mate a partial migration leaves behind |
 | `move.transaction_timeout_ms` | `15000` | Abort a stalled move transaction after this |
-| `move.level_change_cooldown_ms` | `6000` | Settling window after a level change; no migration path moves players out of the room during it |
+| `move.level_change_cooldown_ms` | `6000` | Per-player settling window after a level change; the player is excluded from level grouping and migration decisions during it |
+| `move.join_settle_ms` | `4000` | Per-player settling window after joining a room (friend-join teleport, cross-room move) |
 | `debug.api_token` | `""` | Token for `/debug/*`; empty disables the check |
 | `debug.log_buffer_size` | `2000` | In-memory event history behind `GET /debug/logs` |
 

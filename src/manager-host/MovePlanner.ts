@@ -34,7 +34,12 @@ export interface MovePlannerOptions {
    *  new map (and hand-holding friends cross at slightly different times), so
    *  a migration started inside this window looks like the level change itself
    *  also changed rooms. */
+  /** Extra penalty per spatial-cluster mate left behind by a partial move. */
+  clusterSplitPenalty: number;
   levelChangeCooldownMs: number;
+  /** A player who just joined the room may still be loading the destination
+   *  map (friend-join teleport); do not migrate anyone until it settles. */
+  joinSettleMs: number;
 }
 
 const clamp = (value: number): number => Math.max(0, Math.min(1, value));
@@ -52,7 +57,9 @@ const DEFAULT_OPTIONS: MovePlannerOptions = {
   mergePressureThreshold: 0.25,
   isolationPressureWeight: 0.6,
   stalePressureWeight: 0.4,
-  levelChangeCooldownMs: 6_000
+  clusterSplitPenalty: 0.05,
+  levelChangeCooldownMs: 6_000,
+  joinSettleMs: 4_000
 };
 
 export class MovePlanner {
@@ -106,12 +113,16 @@ export class MovePlanner {
       const sourceRoom = rooms.find((room) => room.roomId === source.roomId);
       const roomPlayers = byRoom.get(source.roomId) ?? [];
       if (!sourceRoom) continue;
-      // Level changes settle for a moment before anyone is migrated out of the
-      // room. Without this the activity planner bypasses the isolation
-      // planner's cooldown and a map load turns into a room change.
-      if (this.recentlyChangedLevel(roomPlayers, now)) continue;
+      // A room that is expecting an unsettled arrival (friend-join, cross-room
+      // move) must not be drained: the resident is usually the person being
+      // joined, and moving them breaks the join.
+      if (roomPlayers.some((player) => !this.isSettled(player, now))) continue;
 
-      const sourcePlayers = roomPlayers.filter((p) => !p.lastMigratedAt || now - p.lastMigratedAt >= this.options.moveCooldownMs);
+      // Only settled players may move: a player who just joined or just
+      // switched maps is still loading and is not a valid migration candidate.
+      const sourcePlayers = roomPlayers.filter((p) =>
+        this.isSettled(p, now) && (!p.lastMigratedAt || now - p.lastMigratedAt >= this.options.moveCooldownMs)
+      );
       if (sourcePlayers.length === 0) continue;
 
       // Plan one level at a time. A group must be single-level and the target
@@ -119,15 +130,16 @@ export class MovePlanner {
       // create the mixed rooms the isolation pass exists to remove.
       let best: MovePlan | undefined;
       for (const [levelId, levelPlayers] of this.groupByLevel(sourcePlayers)) {
-        const target = this.findTarget(activities, rooms, byRoom, source, levelId);
+        const target = this.findTarget(activities, rooms, byRoom, source, levelId, now);
         if (!target) continue;
         const targetPlayers = byRoom.get(target.roomId) ?? [];
         const capacity = Math.max(0, target.capacity - Math.max(target.players, targetPlayers.length));
         if (capacity <= 0) continue;
         const targetActivity = this.activity(target, targetPlayers, now).activity;
         const groups = this.candidateGroups(levelPlayers, Math.min(levelPlayers.length, capacity), now);
+        const clusterMembers = this.clusterMembers(levelPlayers, now);
         for (const group of groups) {
-          const gain = this.moveGain(group, sourcePlayers, source.activity, targetActivity, now);
+          const gain = this.moveGain(group, sourcePlayers, source.activity, targetActivity, now, this.splitCount(group, clusterMembers));
           if (gain > (best?.gain ?? this.options.minimumGain)) {
             best = {
               playerIds: group.map((p) => p.playerId),
@@ -155,7 +167,8 @@ export class MovePlanner {
     rooms: RoomSnapshot[],
     byRoom: Map<string, StoredTelemetry[]>,
     source: RoomActivity,
-    levelId: number
+    levelId: number,
+    now: number
   ): RoomSnapshot | undefined {
     return activities
       .filter((candidate) => candidate.roomId !== source.roomId && candidate.activity > source.activity + 0.05)
@@ -163,11 +176,14 @@ export class MovePlanner {
       .map((candidate) => rooms.find((room) => room.roomId === candidate.roomId))
       .find((room) => {
         if (!room || room.capacity - room.players <= 0) return false;
+        const targetPlayers = byRoom.get(room.roomId) ?? [];
+        // Never move anyone into a room whose occupants are still settling.
+        if (targetPlayers.some((player) => !this.isSettled(player, now))) return false;
         // Empty room, or every occupant already on the requested level. A
         // player whose level is not known yet counts as occupying an unknown
         // level and blocks the target until the next telemetry frame — cheaper
         // than moving a group into a room the isolation pass must split again.
-        return (byRoom.get(room.roomId) ?? []).every((player) => player.levelId === levelId);
+        return targetPlayers.every((player) => player.levelId === levelId);
       });
   }
 
@@ -183,10 +199,15 @@ export class MovePlanner {
     return groups;
   }
 
-  /** True while any player in the room has just switched level. */
-  private recentlyChangedLevel(players: StoredTelemetry[], now: number): boolean {
-    const cutoff = now - this.options.levelChangeCooldownMs;
-    return players.some((player) => (player.levelChangedAt ?? 0) > cutoff);
+  /**
+   * A player's level is settled once they have been in the room for a moment
+   * and have not just switched level. While unsettled, their reported level is
+   * the previous map and must not drive migration decisions.
+   */
+  private isSettled(player: StoredTelemetry, now: number): boolean {
+    const levelCutoff = now - this.options.levelChangeCooldownMs;
+    const joinCutoff = now - this.options.joinSettleMs;
+    return (player.levelChangedAt ?? 0) <= levelCutoff && (player.roomJoinedAt ?? 0) <= joinCutoff;
   }
 
   private velocityOf(p: StoredTelemetry): number { return p.emaVelocity ?? p.velocity ?? 0; }
@@ -262,7 +283,7 @@ export class MovePlanner {
     return clamp(this.options.isolationPressureWeight * iso + this.options.stalePressureWeight * stale);
   }
 
-  private moveGain(group: StoredTelemetry[], source: StoredTelemetry[], sourceActivity: number, targetActivity: number, now: number): number {
+  private moveGain(group: StoredTelemetry[], source: StoredTelemetry[], sourceActivity: number, targetActivity: number, now: number, splitCount = 0): number {
     const before = this.averageCohesion(source, now);
     const afterSource = source.filter((player) => !group.includes(player));
     const after = this.averageCohesion(afterSource, now);
@@ -270,7 +291,33 @@ export class MovePlanner {
     const pressure = group.length ? group.reduce((sum, player) => sum + this.effectivePressure(player, source, now), 0) / group.length : 0;
     const sourceFreshness = source.length === 0 ? 0 : source.reduce((sum, player) => sum + this.freshnessOf(player, now), 0) / source.length;
     const staleCleanupBonus = 1 - sourceFreshness;
-    return (targetActivity - sourceActivity) * 0.45 + staleCleanupBonus * 0.35 + pressure * 0.2 - separationLoss * 0.35 - 0.06 * group.length;
+    // Moving part of a spatially coherent cluster disperses it; charge for
+    // every member left behind so whole clusters win ties against fragments.
+    return (targetActivity - sourceActivity) * 0.45 + staleCleanupBonus * 0.35 + pressure * 0.2
+      - separationLoss * 0.35 - 0.06 * group.length - splitCount * this.options.clusterSplitPenalty;
+  }
+
+  /** playerId -> ids of the spatial cluster it belongs to (fresh positions only). */
+  private clusterMembers(players: StoredTelemetry[], now: number): Map<string, string[]> {
+    const result = new Map<string, string[]>();
+    const fresh = players.filter((player) => this.freshPosition(player, now));
+    for (const cluster of this.clusterByDistance(fresh, now)) {
+      const ids = cluster.map((player) => player.playerId as string);
+      for (const id of ids) result.set(id, ids);
+    }
+    return result;
+  }
+
+  /** How many spatial cluster mates a partial group would leave behind. */
+  private splitCount(group: StoredTelemetry[], clusterById: Map<string, string[]>): number {
+    const moving = new Set(group.map((player) => player.playerId as string));
+    const leftBehind = new Set<string>();
+    for (const player of group) {
+      for (const mate of clusterById.get(player.playerId as string) ?? []) {
+        if (!moving.has(mate)) leftBehind.add(mate);
+      }
+    }
+    return leftBehind.size;
   }
 
   private candidateGroups(players: StoredTelemetry[], maxSize: number, now: number): StoredTelemetry[][] {
