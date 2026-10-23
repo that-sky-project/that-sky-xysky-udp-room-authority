@@ -33,6 +33,15 @@ nodes:
   backpressure_limit_bytes: 8388608  # stop sending if a node's WS send buffer exceeds this
   circuit_open_ms: 5000           # how long a node's circuit stays open after tripping
   circuit_failure_threshold: 5    # consecutive command failures that trip the circuit
+  # Application-level heartbeat. TCP alone cannot detect half-open sockets
+  # (NAT expiry, silent partition); the manager pings every interval and
+  # terminates a node that has not answered within the timeout.
+  heartbeat_interval_ms: 5000
+  heartbeat_timeout_ms: 15000
+  # After a node's socket drops, keep its rooms and player locations this long
+  # before reclaiming them, so a brief blip does not 404 live players. During
+  # the window the node is excluded from allocation and migration.
+  grace_ms: 10000
 
 # ---------------------------------------------------------------------------
 # Allocation / reservations

@@ -6,6 +6,8 @@ export enum ErrorCode {
   NOT_FOUND = 4004,
   CONFLICT = 4009,
   NO_CAPACITY = 4029,
+  /** The node's state advanced past the plan's expectedVersion; refresh and retry. */
+  STALE_PLAN = 4090,
   NODE_UNAVAILABLE = 5001,
   NODE_TIMEOUT = 5002,
   PROTOCOL_ERROR = 5003,

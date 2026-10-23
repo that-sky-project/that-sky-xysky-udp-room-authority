@@ -8,6 +8,9 @@ declare module "ws" {
     constructor(address: string | URL);
     send(data: string, callback?: (error?: Error) => void): void;
     close(code?: number, reason?: string): void;
+    ping(data?: Buffer, mask?: boolean, cb?: (error?: Error) => void): void;
+    pong(data?: Buffer, mask?: boolean, cb?: (error?: Error) => void): void;
+    terminate(): void;
   }
   export class WebSocketServer extends EventEmitter {
     readonly clients: Set<WebSocket>;

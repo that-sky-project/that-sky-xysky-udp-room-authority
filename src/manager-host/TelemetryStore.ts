@@ -4,8 +4,6 @@ import type { PlayerTelemetry } from "../types/contracts.js";
 export interface StoredTelemetry extends PlayerTelemetry {
   roomId: RoomId;
   receivedAt: number;
-  stableDissatisfaction: number;
-  migrationPressure: number;
   emaVelocity?: number | undefined;
   lastMigratedAt?: number | undefined;
   /** When this player was last observed switching level; 0 if never seen to. */
@@ -32,8 +30,6 @@ export class TelemetryStore {
       ...input,
       roomId,
       receivedAt: now,
-      stableDissatisfaction: previous?.stableDissatisfaction ?? 0.5,
-      migrationPressure: previous?.migrationPressure ?? 0,
       emaVelocity: this.smooth(previous?.emaVelocity, rawVelocity, previous?.receivedAt, now),
       levelChangedAt: levelChanged ? now : previous?.levelChangedAt
     };
@@ -62,7 +58,7 @@ export class TelemetryStore {
   public markMigrated(playerIds: PlayerId[], now = Date.now()): void {
     for (const playerId of playerIds) {
       const player = this.players.get(playerId);
-      if (player) this.players.set(playerId, { ...player, lastMigratedAt: now, migrationPressure: 0 });
+      if (player) this.players.set(playerId, { ...player, lastMigratedAt: now });
     }
   }
 

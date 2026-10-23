@@ -83,7 +83,7 @@ export interface IAllocationReply {
 export const NodeEventSchema = z
   .object({
     v: protocolVersion.default(asProtocolVersion(1)),
-    event: z.enum(["player.join", "player.leave", "room.created", "room.updated", "room.destroyed", "heartbeat", "node.ready", "node.draining", "room.telemetry", "move.result"]),
+    event: z.enum(["player.join", "player.leave", "room.created", "room.updated", "room.destroyed", "heartbeat", "node.ready", "node.draining", "room.telemetry", "move.result", "move.completed", "reservation.expired"]),
     data: z
       .object({
         nodeId: stringId.transform(asNodeId).optional(),
@@ -91,7 +91,9 @@ export const NodeEventSchema = z
         port: port.optional(),
         udpHost: z.string().min(1).max(255).transform(asUdpHost).optional(),
         player: PlayerSchema.optional(),
-        // Room lifecycle events use this field as an occupancy count; telemetry events use an array.
+        // Room lifecycle events use this field as an occupancy count; telemetry
+        // events send an array. A delta frame carries only the players whose
+        // state changed since `baseSeq`; `removedPlayers` lists departed ids.
         players: z.union([
           z.number().int().min(0).max(8),
           z.array(z.object({
@@ -104,8 +106,13 @@ export const NodeEventSchema = z
             lastMoveAt: unixMs.optional()
           }).strict()).max(8)
         ]).optional(),
+        /** Telemetry framing: `full` (default) or `delta` against `baseSeq`. */
+        kind: z.enum(["full", "delta"]).optional(),
+        baseSeq: z.number().int().nonnegative().optional(),
+        removedPlayers: z.array(stringId).max(8).optional(),
         seq: z.number().int().nonnegative().optional(),
         moveId: stringId.optional(),
+        playerIds: z.array(stringId).max(8).optional(),
         accepted: z.boolean().optional(),
         movedPlayerIds: z.array(stringId).max(8).optional(),
         failedPlayerIds: z.array(stringId).max(8).optional(),
@@ -123,7 +130,7 @@ export const NodeEventSchema = z
 
 export interface INodeEvent {
   v?: ProtocolVersion | undefined;
-  event: "player.join" | "player.leave" | "room.created" | "room.updated" | "room.destroyed" | "heartbeat" | "node.ready" | "node.draining" | "room.telemetry" | "move.result";
+  event: "player.join" | "player.leave" | "room.created" | "room.updated" | "room.destroyed" | "heartbeat" | "node.ready" | "node.draining" | "room.telemetry" | "move.result" | "move.completed" | "reservation.expired";
   data: {
     nodeId: NodeId;
     roomId?: RoomId | undefined;
@@ -131,8 +138,12 @@ export interface INodeEvent {
     udpHost?: UdpHost | undefined;
     player?: PlayerInfo | undefined;
     players?: PlayerTelemetry[] | number | undefined;
+    kind?: "full" | "delta" | undefined;
+    baseSeq?: number | undefined;
+    removedPlayers?: string[] | undefined;
     seq?: number | undefined;
     moveId?: string | undefined;
+    playerIds?: string[] | undefined;
     accepted?: boolean | undefined;
     movedPlayerIds?: string[] | undefined;
     failedPlayerIds?: string[] | undefined;

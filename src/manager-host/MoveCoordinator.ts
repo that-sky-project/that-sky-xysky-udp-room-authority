@@ -1,7 +1,6 @@
 import type { PlayerId, RoomId } from "../types/branded.js";
-import { asProtocolVersion, asUnixMs } from "../types/branded.js";
-import type { INodeEvent } from "../types/contracts.js";
-import { ErrorCode } from "../types/errors.js";
+import { asProtocolVersion } from "../types/branded.js";
+import type { INodeEvent, PlayerTelemetry } from "../types/contracts.js";
 import type { Logger } from "../infra/logger/logger.js";
 import type { CrossCoordinator } from "./CrossCoordinator.js";
 import type { NodeRegistry } from "./NodeRegistry.js";
@@ -10,6 +9,7 @@ import type { RoomCache } from "./RoomCache.js";
 import { MovePlanner, type MovePlan, type MovePlannerOptions } from "./MovePlanner.js";
 import { TelemetryStore } from "./TelemetryStore.js";
 import { LevelIsolationPlanner, type LevelIsolationPlan, type LevelIsolationOptions } from "./LevelIsolationPlanner.js";
+import { MoveExecutor } from "./MoveExecutor.js";
 
 interface MoveTransaction extends MovePlan { moveId: string; status: "prepared" | "committed" | "completed" | "failed"; createdAt: number; joinedPlayers: string[]; leftPlayers: string[]; }
 type LevelMoveTransaction = Omit<MoveTransaction, keyof MovePlan> & LevelIsolationPlan;
@@ -29,11 +29,14 @@ export class MoveCoordinator {
   public readonly telemetry: TelemetryStore;
   private readonly planner: MovePlanner;
   private readonly levelIsolationPlanner: LevelIsolationPlanner;
+  private readonly executor: MoveExecutor;
   private readonly transactions = new Map<string, MoveTransaction | LevelMoveTransaction>();
   private readonly roomCooldownUntil = new Map<string, number>();
   private readonly pendingCancels = new Map<string, { roomId: RoomId; moveId: string; playerIds: string[] }>();
   private lastPlanAt = 0;
   private planning = false;
+  /** Latest full roster per room, used to apply delta telemetry frames. */
+  private readonly roomRoster = new Map<string, { seq: number; players: Map<string, PlayerTelemetry> }>();
 
   public constructor(
     private readonly rooms: RoomCache,
@@ -41,32 +44,77 @@ export class MoveCoordinator {
     private readonly pending: PendingRequestMap,
     private readonly cross: CrossCoordinator,
     private readonly options: MoveCoordinatorOptions = {},
-    private readonly log?: Logger
+    private readonly log?: Logger,
+    /** Optional counter sink so the gateway can expose move outcomes as metrics. */
+    private readonly onMoveOutcome?: (reason: string, status: "committed" | "failed") => void
   ) {
     this.telemetry = new TelemetryStore({ stateEmaHalfLifeMs: options.stateEmaHalfLifeMs ?? 3_000 });
     this.planner = new MovePlanner(options.planner ?? {});
     this.levelIsolationPlanner = new LevelIsolationPlanner(options.levelIsolation ?? {});
+    const transactionTimeoutMs = options.moveTransactionTimeoutMs ?? 15_000;
+    this.executor = new MoveExecutor(nodes, pending, cross, this.telemetry, {
+      reservationTtlMs: transactionTimeoutMs,
+      prepareTtlMs: 10_000,
+      redirectTtlMs: 10_000
+    }, log);
   }
 
   public ingest(event: INodeEvent): void {
     if (event.event === "room.telemetry" && event.data.roomId) {
-      const telemetryPlayers = Array.isArray(event.data.players) ? event.data.players : [];
-      for (const player of telemetryPlayers) {
-        this.telemetry.upsert(event.data.roomId, player);
+      const roomId = event.data.roomId;
+      const incoming = Array.isArray(event.data.players) ? event.data.players : [];
+
+      // Delta frames only carry players whose state changed. Apply them onto the
+      // roster we already hold for the room so occupancy and level grouping stay
+      // correct; a delta whose baseSeq we do not recognise is treated as a full
+      // snapshot by the sender, so we simply replace the roster.
+      let roster = this.roomRoster.get(roomId as string);
+      if (event.data.kind === "delta") {
+        const baseOk = roster !== undefined && roster.seq === event.data.baseSeq;
+        if (!baseOk) {
+          this.log?.debug({ roomId, baseSeq: event.data.baseSeq, haveSeq: roster?.seq }, "delta telemetry without matching base; awaiting full snapshot");
+          return;
+        }
+        for (const playerId of event.data.removedPlayers ?? []) {
+          roster!.players.delete(playerId as string);
+        }
+        for (const player of incoming) roster!.players.set(player.playerId as string, player);
+        roster!.seq = typeof event.data.seq === "number" ? event.data.seq : roster!.seq + 1;
+      } else {
+        const players = new Map<string, (typeof incoming)[number]>();
+        for (const player of incoming) players.set(player.playerId as string, player);
+        roster = { seq: typeof event.data.seq === "number" ? event.data.seq : 0, players };
+        this.roomRoster.set(roomId as string, roster);
+      }
+
+      for (const player of incoming) {
+        this.telemetry.upsert(roomId, player);
         // Keep playerLocations.level in sync from telemetry. The initial
         // player.join from some node versions omits level, which would leave
         // levelsByRoom() empty and disable level-aware allocation entirely.
         if (player.levelId !== undefined) {
-          this.rooms.trackPlayer(player.playerId, event.data.nodeId, event.data.roomId, player.levelId);
+          this.rooms.trackPlayer(player.playerId, event.data.nodeId, roomId, player.levelId);
         }
       }
-      const room = this.rooms.getRoom(event.data.roomId);
+      const room = this.rooms.getRoom(roomId);
       if (room) {
-        const count = Array.isArray(event.data.players) ? event.data.players.length : typeof event.data.players === "number" ? event.data.players : room.players;
-        this.rooms.upsertRoom({ ...room, players: Math.min(room.capacity, count), version: room.version });
+        const count = roster ? roster.players.size : incoming.length;
+        // Track the node's telemetry sequence as the room version so a move plan
+        // can carry expectedVersion and the node can reject a plan built from a
+        // snapshot that has already moved on.
+        const version = typeof event.data.seq === "number" ? event.data.seq : room.version;
+        this.rooms.upsertRoom({ ...room, players: Math.min(room.capacity, count), version });
       }
     }
     if ((event.event === "player.join" || event.event === "player.leave") && event.data.player?.playerId) {
+      // Keep the delta roster in step with join/leave so the next delta frame
+      // can be applied even before the next full snapshot arrives.
+      if (event.data.roomId) {
+        const roster = this.roomRoster.get(event.data.roomId as string);
+        if (roster && event.event === "player.leave") {
+          roster.players.delete(event.data.player.playerId as string);
+        }
+      }
       if (event.event === "player.leave") {
         for (const tx of this.transactions.values()) {
           if (tx.status === "committed" && tx.sourceRoomId === event.data.roomId && tx.playerIds.includes(event.data.player.playerId as string)) {
@@ -94,6 +142,32 @@ export class MoveCoordinator {
         this.telemetry.releaseReservationSlots(tx.targetRoomId as RoomId, tx.moveId, failedIds.length);
         if (tx.playerIds.length === 0) tx.status = "failed";
         if (failedIds.length) this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, failedIds);
+      }
+    }
+    // The destination node dropped a reservation we are tracking (its TTL ran
+    // out before the players arrived). Settle the transaction now instead of
+    // waiting for our own timeout.
+    if (event.event === "reservation.expired" && event.data.moveId) {
+      const tx = this.transactions.get(event.data.moveId);
+      if (tx && (tx.status === "prepared" || tx.status === "committed")) {
+        tx.status = "failed";
+        this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
+        this.onMoveOutcome?.(tx.reason, "failed");
+        this.log?.warn({ moveId: tx.moveId, playerIds: tx.playerIds }, "target reservation expired before players arrived");
+      }
+    }
+    // Positive completion signal from the destination node: the entire group
+    // landed. This is stronger than inferring completion from join/leave pairs
+    // and lets a transaction settle even if a leave event was lost.
+    if (event.event === "move.completed" && event.data.moveId) {
+      const tx = this.transactions.get(event.data.moveId);
+      if (tx && (tx.status === "committed" || tx.status === "prepared")) {
+        tx.status = "completed";
+        this.telemetry.releaseReservation(tx.targetRoomId as RoomId, tx.moveId);
+        this.log?.info(
+          { moveId: tx.moveId, playerIds: tx.playerIds, targetRoomId: tx.targetRoomId },
+          "move completed (node confirmation)"
+        );
       }
     }
   }
@@ -152,31 +226,33 @@ export class MoveCoordinator {
       const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
       if (!source || !target || this.transactionsForPlayer(plan.playerIds).length > 0) continue;
       const moveId = `move-${now}-${plan.playerIds.join("-")}`;
-      if (!this.telemetry.tryReserve(target.roomId, moveId, plan.playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) {
-        this.log?.debug({ plan, targetPlayers: target.players, targetCapacity: target.capacity }, "move plan skipped: no capacity");
-        continue;
-      }
       const tx: MoveTransaction = { ...plan, moveId, status: "prepared", createdAt: now, joinedPlayers: [], leftPlayers: [] };
       this.transactions.set(moveId, tx);
-      try {
-        const targetTransport = this.nodes.getTransport(target.nodeId);
-        if (!targetTransport || !this.nodes.isAvailableForCommand(target.nodeId)) throw new Error("target node unavailable");
-        const ack = await this.pending.send({ v: asProtocolVersion(1), cmd: "move.prepare", data: { moveId, roomId: target.roomId, playerIds: plan.playerIds, expectedVersion: target.version, ttlMs: 10_000 } }, (command) => targetTransport.send(command), signal);
-        if (ack.code !== ErrorCode.OK) throw new Error(ack.message ?? "target rejected move");
-        const first = plan.playerIds[0];
-        if (!first) throw new Error("empty move plan");
-        await this.cross.redirectPlayers({ playerIds: plan.playerIds.map((id) => id as PlayerId), moveId, playerId: first as PlayerId, fromRoomId: source.roomId, to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(now + 10_000) }, reason: plan.reason === "low_activity_merge" ? "merge" : "capacity-rebalance" }, signal);
+
+      const outcome = await this.executor.execute({
+        moveId,
+        playerIds: plan.playerIds,
+        source,
+        target,
+        reason: plan.reason === "low_activity_merge" ? "merge" : "capacity-rebalance",
+        now,
+        signal
+      });
+
+      if (outcome.ok) {
         this.transactions.set(moveId, { ...tx, status: "committed" });
-        this.telemetry.markMigrated(plan.playerIds.map((id) => id as PlayerId), now);
         usedTargets.add(plan.targetRoomId); moveBudget -= plan.playerIds.length;
-        const cooldownUntil = now + (this.options.roomCooldownMs ?? 20_000);
-        this.roomCooldownUntil.set(plan.sourceRoomId, cooldownUntil); this.roomCooldownUntil.set(plan.targetRoomId, cooldownUntil);
+        this.applyCooldown([plan.sourceRoomId, plan.targetRoomId], now);
+        this.onMoveOutcome?.(plan.reason, "committed");
         this.log?.info({ moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, reason: plan.reason, gain: plan.gain }, "move committed");
-      } catch (error) {
+      } else if (outcome.reason === "failed") {
         this.queueCancel(target.roomId, moveId, plan.playerIds);
-        this.telemetry.releaseReservation(target.roomId, moveId);
         this.transactions.set(moveId, { ...tx, status: "failed" });
-        this.log?.warn({ err: error, moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId }, "move failed");
+        this.onMoveOutcome?.(plan.reason, "failed");
+      } else {
+        // no_capacity / stale_plan / no_players: the executor already released
+        // the reservation. Drop the record so it does not look in-flight.
+        this.transactions.delete(moveId);
       }
     }
     return [...this.transactions.values()];
@@ -224,43 +300,37 @@ export class MoveCoordinator {
     if (this.inCooldown(plan.targetRoomId, now)) return false;
 
     const moveId = `level-isolation-${plan.levelId}-${now}-${plan.playerIds.join("-")}`;
-    if (!this.telemetry.tryReserve(target.roomId, moveId, plan.playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) {
-      this.log?.debug({ plan, targetPlayers: target.players, targetCapacity: target.capacity }, "level isolation skipped: no capacity");
-      return false;
-    }
-
-    const tx: LevelMoveTransaction = {
-      ...plan,
-      moveId,
-      status: "prepared",
-      createdAt: now,
-      joinedPlayers: [],
-      leftPlayers: []
-    };
+    const tx: LevelMoveTransaction = { ...plan, moveId, status: "prepared", createdAt: now, joinedPlayers: [], leftPlayers: [] };
     this.transactions.set(moveId, tx);
 
-    try {
-      const targetTransport = this.nodes.getTransport(target.nodeId);
-      if (!targetTransport || !this.nodes.isAvailableForCommand(target.nodeId)) throw new Error("target node unavailable");
-      const ack = await this.pending.send({ v: asProtocolVersion(1), cmd: "move.prepare", data: { moveId, roomId: target.roomId, playerIds: plan.playerIds, expectedVersion: target.version, ttlMs: 10_000 } }, (command) => targetTransport.send(command), signal);
-      if (ack.code !== ErrorCode.OK) throw new Error(ack.message ?? "target rejected move");
-      const first = plan.playerIds[0];
-      if (!first) throw new Error("empty level isolation plan");
-      await this.cross.redirectPlayers({ playerIds: plan.playerIds.map((id) => id as PlayerId), moveId, playerId: first as PlayerId, fromRoomId: source.roomId, to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(now + 10_000) }, reason: plan.reason === "level_consolidation" ? "level-consolidation" : "level-isolation" }, signal);
+    const outcome = await this.executor.execute({
+      moveId,
+      playerIds: plan.playerIds,
+      source,
+      target,
+      reason: plan.reason === "level_consolidation" ? "level-consolidation" : "level-isolation",
+      now,
+      signal
+    });
+
+    if (outcome.ok) {
       this.transactions.set(moveId, { ...tx, status: "committed" });
-      this.telemetry.markMigrated(plan.playerIds.map((id) => id as PlayerId), now);
       // Cooldowns are applied by the caller once the whole cycle is planned, so a
       // room with several stray levels can be drained in one pass.
       usedRooms.push(plan.sourceRoomId, plan.targetRoomId);
+      this.onMoveOutcome?.(plan.reason, "committed");
       this.log?.info({ moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId, sourceLevelCount: plan.sourceLevelCount, targetLevelCount: plan.targetLevelCount }, "level isolation committed");
       return true;
-    } catch (error) {
-      this.queueCancel(target.roomId, moveId, plan.playerIds);
-      this.telemetry.releaseReservation(target.roomId, moveId);
-      this.transactions.set(moveId, { ...tx, status: "failed" });
-      this.log?.warn({ err: error, moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId }, "level isolation failed");
-      return false;
     }
+
+    if (outcome.reason === "failed") {
+      this.queueCancel(target.roomId, moveId, plan.playerIds);
+      this.transactions.set(moveId, { ...tx, status: "failed" });
+      this.onMoveOutcome?.(plan.reason, "failed");
+    } else {
+      this.transactions.delete(moveId);
+    }
+    return false;
   }
 
   public list(): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()]; }
@@ -275,9 +345,7 @@ export class MoveCoordinator {
     if (!source || !target) throw new Error("source or target room not found");
     const locations = playerIds.map((id) => this.rooms.getPlayerLocation(id as PlayerId));
     if (locations.some((location) => !location || location.roomId !== source.roomId)) throw new Error("one or more players are not in the source room");
-    if (!this.telemetry.tryReserve(target.roomId, `debug-${now}-${playerIds.join("-")}`, playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) {
-      throw new Error("target room has insufficient capacity");
-    }
+
     const moveId = `debug-move-${now}-${playerIds.join("-")}`;
     const tx: MoveTransaction = {
       playerIds,
@@ -291,32 +359,45 @@ export class MoveCoordinator {
       joinedPlayers: [],
       leftPlayers: []
     };
-    this.telemetry.releaseReservation(target.roomId, `debug-${now}-${playerIds.join("-")}`);
-    if (!this.telemetry.tryReserve(target.roomId, moveId, playerIds.length, target.capacity, target.players, this.options.moveTransactionTimeoutMs ?? 15_000, now)) throw new Error("target room reservation race");
     this.transactions.set(moveId, tx);
-    try {
-      const targetTransport = this.nodes.getTransport(target.nodeId);
-      if (!targetTransport || !this.nodes.isAvailableForCommand(target.nodeId)) throw new Error("target node unavailable");
-      const ack = await this.pending.send({ v: asProtocolVersion(1), cmd: "move.prepare", data: { moveId, roomId: target.roomId, playerIds, expectedVersion: target.version, ttlMs: this.options.moveTransactionTimeoutMs ?? 15_000 } }, (command) => targetTransport.send(command), signal);
-      if (ack.code !== ErrorCode.OK) throw new Error(ack.message ?? "target rejected move");
-      const first = playerIds[0];
-      if (!first) throw new Error("empty debug move");
-      await this.cross.redirectPlayers({ playerIds: playerIds.map((id) => id as PlayerId), moveId, playerId: first as PlayerId, fromRoomId: source.roomId, to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(now + (this.options.moveTransactionTimeoutMs ?? 15_000)) }, reason: tx.reason === "low_activity_merge" ? "merge" : "capacity-rebalance" }, signal);
-      const committed = { ...tx, status: "committed" as const };
-      this.transactions.set(moveId, committed);
-      this.telemetry.markMigrated(playerIds.map((id) => id as PlayerId), now);
-      return committed;
-    } catch (error) {
-      this.telemetry.releaseReservation(target.roomId, moveId);
-      this.transactions.set(moveId, { ...tx, status: "failed" });
-      this.queueCancel(target.roomId, moveId, playerIds);
-      throw error;
+
+    const outcome = await this.executor.execute({
+      moveId,
+      playerIds,
+      source,
+      target,
+      reason: tx.reason === "low_activity_merge" ? "merge" : "capacity-rebalance",
+      now,
+      signal
+    });
+
+    if (!outcome.ok) {
+      if (outcome.reason === "failed") {
+        this.queueCancel(target.roomId, moveId, playerIds);
+        this.transactions.set(moveId, { ...tx, status: "failed" });
+        throw outcome.error ?? new Error("move failed");
+      }
+      this.transactions.delete(moveId);
+      throw new Error(
+        outcome.reason === "no_capacity" ? "target room has insufficient capacity"
+          : outcome.reason === "stale_plan" ? "target room state changed; retry"
+          : "move could not be executed"
+      );
     }
+
+    const committed = { ...tx, status: "committed" as const };
+    this.transactions.set(moveId, committed);
+    return committed;
   }
   public activitySnapshot(now = Date.now()): Array<ReturnType<MovePlanner["activity"]>> {
     return this.rooms.listRooms().map((room) => this.planner.activity(room, this.telemetry.listRoom(room.roomId, now), now));
   }
   private transactionsForPlayer(playerIds: string[]): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()].filter((tx) => tx.status === "prepared" || tx.status === "committed").filter((tx) => tx.playerIds.some((id) => playerIds.includes(id))); }
+
+  private applyCooldown(roomIds: string[], now: number): void {
+    const until = now + (this.options.roomCooldownMs ?? 20_000);
+    for (const roomId of roomIds) this.roomCooldownUntil.set(roomId, until);
+  }
 
   private inCooldown(roomId: string, now: number): boolean {
     const until = this.roomCooldownUntil.get(roomId);

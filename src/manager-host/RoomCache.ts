@@ -16,6 +16,13 @@ export interface PlayerLocation {
 export interface RoomCacheOptions {
   maxRooms: number;
   staleRoomMs: number;
+  /**
+   * After a node disconnects its rooms and player locations are kept this long
+   * before being reclaimed, so a brief socket blip does not make /players/:id/room
+   * return 404 mid-session. During the window the data is marked suspected and
+   * excluded from allocation and migration planning.
+   */
+  nodeGraceMs?: number;
 }
 
 export interface CandidateRoomQuery {
@@ -26,14 +33,24 @@ export interface CandidateRoomQuery {
 
 export class RoomCache {
   private static readonly ALL_REGIONS = "__all__";
+  /**
+   * How long a location survives `player.leave`. It covers only the gap
+   * between leave and join during a cross-room move; anything older is a
+   * player that really is gone and must stop counting towards the room.
+   */
+  private static readonly PLAYER_LEAVE_GRACE_MS = 5_000;
 
   private readonly rooms: LRUCache<RoomId, RoomSnapshot>;
   private readonly roomsByNode = new Map<NodeId, Set<RoomId>>();
   private readonly playerLocations = new Map<PlayerId, PlayerLocation>();
   private readonly candidateBuckets = new Map<string, Array<Set<RoomId>>>();
   private readonly candidateIndex = new Map<RoomId, Array<{ key: string; bucket: number }>>();
+  /** nodeId -> 时刻，表示该节点的连接已断开但仍处于宽限期。 */
+  private readonly suspectNodes = new Map<NodeId, number>();
+  private readonly nodeGraceMs: number;
 
   public constructor(options: RoomCacheOptions) {
+    this.nodeGraceMs = options.nodeGraceMs ?? 10_000;
     this.rooms = new LRUCache<RoomId, RoomSnapshot>({
       max: options.maxRooms,
       ttl: options.staleRoomMs,
@@ -93,6 +110,59 @@ export class RoomCache {
     }
   }
 
+  /**
+   * A node's socket dropped. Keep its rooms and player locations for a grace
+   * window so a reconnect or a transient network blip does not erase live
+   * sessions. While suspected the node is excluded from allocation and from
+   * migration targets/sources.
+   */
+  public markNodeSuspected(nodeId: NodeId, now = Date.now()): void {
+    this.suspectNodes.set(nodeId, now);
+    for (const roomId of this.roomsByNode.get(nodeId) ?? []) {
+      this.removeCandidateIndex(roomId);
+    }
+  }
+
+  /**
+   * The node reconnected (or a duplicate connection took over). Clear the
+   * suspect mark and re-index its rooms for allocation.
+   */
+  public restoreNode(nodeId: NodeId): boolean {
+    const wasSuspected = this.suspectNodes.delete(nodeId);
+    if (wasSuspected) {
+      for (const roomId of this.roomsByNode.get(nodeId) ?? []) {
+        const room = this.rooms.get(roomId);
+        if (room) this.indexCandidate(room);
+      }
+    }
+    return wasSuspected;
+  }
+
+  public isNodeSuspected(nodeId: NodeId): boolean {
+    return this.suspectNodes.has(nodeId);
+  }
+
+  /**
+   * Reclaim every node whose grace window elapsed. Returns the rooms that were
+   * dropped so the caller can log/count them.
+   */
+  public sweepSuspectedNodes(now = Date.now()): Array<{ nodeId: NodeId; rooms: RoomSnapshot[] }> {
+    const expired: Array<{ nodeId: NodeId; rooms: RoomSnapshot[] }> = [];
+    for (const [nodeId, suspectedAt] of this.suspectNodes) {
+      if (now - suspectedAt < this.nodeGraceMs) continue;
+      this.suspectNodes.delete(nodeId);
+      const rooms = this.deleteRoomsByNode(nodeId);
+      this.removePlayersByNode(nodeId);
+      expired.push({ nodeId, rooms });
+    }
+    return expired;
+  }
+
+  /** Room ids belonging to nodes that are currently suspected. */
+  public suspectedNodeIds(): NodeId[] {
+    return [...this.suspectNodes.keys()];
+  }
+
   public listCandidateRooms(query: CandidateRoomQuery): RoomSnapshot[] {
     const results: RoomSnapshot[] = [];
     const seen = new Set<RoomId>();
@@ -111,6 +181,9 @@ export class RoomCache {
           if (seen.has(roomId)) continue;
           const room = this.rooms.get(roomId);
           if (!room || room.draining || room.players >= room.capacity) continue;
+          // Never allocate into a room whose node just dropped; it may still be
+          // gone, and the player would get an unreachable UDP endpoint.
+          if (this.suspectNodes.has(room.nodeId)) continue;
           seen.add(roomId);
           results.push(room);
           if (results.length >= query.limit) return results;
@@ -149,18 +222,45 @@ export class RoomCache {
   public getPlayerLocation(playerId: PlayerId): PlayerLocation | undefined {
     const loc = this.playerLocations.get(playerId);
     if (!loc) return undefined;
-    // Grace period: keep serving the old location for up to 5s after leave so
-    // that queries during the migration gap still resolve. trackPlayer() clears
-    // leavingAt when the player joins the new room.
-    if (loc.leavingAt && Date.now() - loc.leavingAt > 5_000) {
+    if (this.isDeparted(loc)) {
       this.playerLocations.delete(playerId);
       return undefined;
     }
     return loc;
   }
 
-  public listPlayers(roomId: RoomId): PlayerLocation[] {
-    return [...this.playerLocations.values()].filter((player) => player.roomId === roomId);
+  /**
+   * Drop locations whose leave grace window has elapsed.
+   *
+   * `untrackPlayer` only marks a location as leaving; without a sweep the
+   * entry would live forever, so an offline player kept showing up in the
+   * room's player list (and kept voting on its level).
+   */
+  public purgeDepartedPlayers(now = Date.now()): number {
+    let removed = 0;
+    for (const [playerId, location] of this.playerLocations) {
+      if (!this.isDeparted(location, now)) continue;
+      this.playerLocations.delete(playerId);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  private isDeparted(location: PlayerLocation, now = Date.now()): boolean {
+    return location.leavingAt !== undefined && now - location.leavingAt > RoomCache.PLAYER_LEAVE_GRACE_MS;
+  }
+
+  public listPlayers(roomId: RoomId, now = Date.now()): PlayerLocation[] {
+    const players: PlayerLocation[] = [];
+    for (const [playerId, location] of this.playerLocations) {
+      if (location.roomId !== roomId) continue;
+      if (this.isDeparted(location, now)) {
+        this.playerLocations.delete(playerId);
+        continue;
+      }
+      players.push(location);
+    }
+    return players;
   }
 
   /**
@@ -168,10 +268,11 @@ export class RoomCache {
    * A room with an empty set has no level signal (no player reported one), which
    * allocation treats as "usable by any level" rather than "wrong level".
    */
-  public levelsByRoom(): Map<RoomId, Set<number>> {
+  public levelsByRoom(now = Date.now()): Map<RoomId, Set<number>> {
     const result = new Map<RoomId, Set<number>>();
     for (const location of this.playerLocations.values()) {
       if (location.level === undefined) continue;
+      if (this.isDeparted(location, now)) continue;
       const levels = result.get(location.roomId) ?? new Set<number>();
       levels.add(location.level);
       result.set(location.roomId, levels);

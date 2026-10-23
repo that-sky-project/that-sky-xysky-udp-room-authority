@@ -6,6 +6,7 @@ import { ReservationTracker } from "./ReservationTracker.js";
 import { RequestRouter } from "./RequestRouter.js";
 import { RoomCache } from "./RoomCache.js";
 import { MoveCoordinator } from "./MoveCoordinator.js";
+import { MetricsRegistry } from "./MetricsRegistry.js";
 import type { ManagerConfig } from "../config/index.js";
 import type { Logger } from "../infra/logger/logger.js";
 
@@ -18,15 +19,17 @@ export interface ManagerRuntime {
   coordinator: CrossCoordinator;
   router: RequestRouter;
   moves: MoveCoordinator;
+  metrics: MetricsRegistry;
 }
 
 export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): ManagerRuntime => {
+  const metrics = new MetricsRegistry();
   const nodes = new NodeRegistry({
     circuitOpenMs: config.nodeCircuitOpenMs,
     failureThreshold: config.nodeCircuitFailureThreshold,
     backpressureLimitBytes: config.nodeBackpressureLimitBytes
   });
-  const rooms = new RoomCache({ maxRooms: config.maxRooms, staleRoomMs: config.staleRoomMs });
+  const rooms = new RoomCache({ maxRooms: config.maxRooms, staleRoomMs: config.staleRoomMs, nodeGraceMs: config.nodeGraceMs });
   const reservations = new ReservationTracker({ ttlMs: config.reservationShadowTtlMs });
   const pending = new PendingRequestMap({ timeoutMs: config.commandTimeoutMs, maxPending: config.maxPendingCommands });
   const policy = new PolicyEngine({
@@ -63,12 +66,12 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
       sparseRoomThreshold: config.levelIsolationSparseRoomThreshold,
       levelChangeCooldownMs: config.levelIsolationLevelChangeCooldownMs
     }
-  }, logger);
+  }, logger, (reason, status) => metrics.inc("qwd_move_total", [reason, status]));
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {
     nodeStaleMs: config.nodeStaleMs,
     assignmentTtlMs: config.assignmentTtlMs,
     candidateRoomLimit: config.candidateRoomLimit
   }, (roomId) => moves.telemetry.reserved(roomId));
 
-  return { nodes, rooms, pending, policy, reservations, coordinator, router, moves };
+  return { nodes, rooms, pending, policy, reservations, coordinator, router, moves, metrics };
 };

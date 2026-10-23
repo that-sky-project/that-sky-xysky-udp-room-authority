@@ -20,6 +20,9 @@ export interface ManagerConfig {
   nodeBackpressureLimitBytes: number;
   nodeCircuitOpenMs: number;
   nodeCircuitFailureThreshold: number;
+  nodeHeartbeatIntervalMs: number;
+  nodeHeartbeatTimeoutMs: number;
+  nodeGraceMs: number;
   moveBudgetPerCycle: number;
   moveTransactionTimeoutMs: number;
   moveRoomCooldownMs: number;
@@ -61,7 +64,10 @@ const configSchema = z
         stale_ms: positiveInt(10_000),
         backpressure_limit_bytes: positiveInt(8 * 1024 * 1024),
         circuit_open_ms: positiveInt(5_000),
-        circuit_failure_threshold: positiveInt(5)
+        circuit_failure_threshold: positiveInt(5),
+        heartbeat_interval_ms: positiveInt(5_000),
+        heartbeat_timeout_ms: positiveInt(15_000),
+        grace_ms: positiveInt(10_000)
       })
       .default({}),
     assignment: z
@@ -117,6 +123,9 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     nodeBackpressureLimitBytes: parsed.nodes.backpressure_limit_bytes,
     nodeCircuitOpenMs: parsed.nodes.circuit_open_ms,
     nodeCircuitFailureThreshold: parsed.nodes.circuit_failure_threshold,
+    nodeHeartbeatIntervalMs: parsed.nodes.heartbeat_interval_ms,
+    nodeHeartbeatTimeoutMs: parsed.nodes.heartbeat_timeout_ms,
+    nodeGraceMs: parsed.nodes.grace_ms,
     assignmentTtlMs: parsed.assignment.ttl_ms,
     reservationShadowTtlMs: parsed.assignment.reservation_shadow_ttl_ms,
     commandTimeoutMs: parsed.commands.timeout_ms,

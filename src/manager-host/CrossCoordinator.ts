@@ -10,11 +10,13 @@ export interface CrossCoordinatorOptions {
   commandTimeoutMs: number;
 }
 
+export type RedirectReason = "merge" | "split" | "manual" | "capacity-rebalance" | "level-isolation" | "level-consolidation";
+
 export interface RedirectPlan {
   playerId: PlayerId;
   fromRoomId: RoomId;
   to: RoomAssignment;
-  reason: "merge" | "split" | "manual" | "capacity-rebalance" | "level-isolation" | "level-consolidation";
+  reason: RedirectReason;
 }
 
 export class CrossCoordinator {
