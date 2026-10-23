@@ -109,7 +109,7 @@ export class LevelIsolationPlanner {
         // Try candidate targets in priority order; use the first one that can
         // fit the whole bonded group (hand-holding friends travel together).
         let picked: { target: RoomSnapshot; selected: StoredTelemetry[] } | undefined;
-        for (const candidate of this.targetCandidates(source.levelId, room.roomId, rooms, levelsByRoom, occupancy, byRoom, movable)) {
+        for (const candidate of this.targetCandidates(source.levelId, room.roomId, rooms, levelsByRoom, occupancy, byRoom, movable, now)) {
           const cap = Math.max(0, candidate.capacity - (occupancy.get(candidate.roomId) ?? 0));
           const sel = this.selectBondedGroups(movable, cap, Math.min(this.options.maxPlayersPerMove, budget));
           if (sel.length > 0) { picked = { target: candidate, selected: sel }; break; }
@@ -150,6 +150,14 @@ export class LevelIsolationPlanner {
         budget -= selected.length;
 
         players = players.filter((p) => !movedIds.has(p.playerId as string));
+        // Keep the per-room roster and level set in step with the planned move.
+        // Without this a source room that just lost its only player on this
+        // level still looked mixed, which hides it from the consolidation pass
+        // for the rest of the cycle.
+        byRoom.set(room.roomId, players);
+        if (!players.some((p) => p.levelId === source.levelId)) {
+          levelsByRoom.get(room.roomId)?.delete(source.levelId);
+        }
         groups = this.groupByLevel(players);
       }
     }
@@ -190,6 +198,11 @@ export class LevelIsolationPlanner {
       if (occ === 0) continue;
       const levelId = [...levels][0];
       if (levelId === undefined) continue;
+      // A room in its level-change settling window is neither a merge source
+      // nor a target: it may still be loading the new map, and pulling players
+      // into (or out of) it during that window is exactly the churn the shared
+      // cooldown exists to prevent.
+      if (this.hasRecentLevelChange(byRoom.get(room.roomId) ?? [], now)) continue;
 
       const entry = { roomId: room.roomId, occ, cap: room.capacity };
       if (occ <= threshold) {
@@ -227,8 +240,11 @@ export class LevelIsolationPlanner {
         const sourcePlayers = this.filterByAffinity(rawCandidates, byRoom.get(source.roomId) ?? [], claimedPlayers);
         if (sourcePlayers.length === 0) continue;
 
-        const capacity = target.cap - target.occ;
-        const selected = sourcePlayers.slice(0, Math.min(sourcePlayers.length, capacity, this.options.maxPlayersPerMove, budget));
+        // Pick whole bonded groups only. Taking a slice of the candidate list
+        // split a hand-holding pair whenever the target had a single free slot;
+        // a group that does not fit is skipped instead.
+        const capacity = Math.min(target.cap - target.occ, this.options.maxPlayersPerMove, budget);
+        const selected = this.selectBondedGroups(sourcePlayers, capacity, capacity);
         if (selected.length === 0) continue;
 
         plans.push({
@@ -407,11 +423,15 @@ export class LevelIsolationPlanner {
     levelsByRoom: Map<string, Set<number>>,
     occupancy: Map<string, number>,
     byRoom: Map<string, StoredTelemetry[]>,
-    sourcePlayers: StoredTelemetry[]
+    sourcePlayers: StoredTelemetry[],
+    now: number
   ): RoomSnapshot[] {
     const isUsable = (room: RoomSnapshot): boolean => {
       if (room.roomId === sourceRoomId || room.draining) return false;
-      return (occupancy.get(room.roomId) ?? 0) < room.capacity;
+      if ((occupancy.get(room.roomId) ?? 0) >= room.capacity) return false;
+      // Do not pull players into a room that is still settling after a level
+      // change; the destination is in flux for the same reason the source is.
+      return !this.hasRecentLevelChange(byRoom.get(room.roomId) ?? [], now);
     };
 
     const byProximity = (a: RoomSnapshot, b: RoomSnapshot): number => {

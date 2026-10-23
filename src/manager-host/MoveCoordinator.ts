@@ -1,6 +1,6 @@
 import type { PlayerId, RoomId } from "../types/branded.js";
 import { asProtocolVersion } from "../types/branded.js";
-import type { INodeEvent, PlayerTelemetry } from "../types/contracts.js";
+import type { INodeEvent, PlayerTelemetry, RoomSnapshot } from "../types/contracts.js";
 import type { Logger } from "../infra/logger/logger.js";
 import type { CrossCoordinator } from "./CrossCoordinator.js";
 import type { NodeRegistry } from "./NodeRegistry.js";
@@ -37,6 +37,12 @@ export class MoveCoordinator {
   private planning = false;
   /** Latest full roster per room, used to apply delta telemetry frames. */
   private readonly roomRoster = new Map<string, { seq: number; players: Map<string, PlayerTelemetry> }>();
+  /** Rooms whose delta stream is currently out of sync with our roster. */
+  private readonly telemetryGap = new Map<string, { since: number; dropped: number; haveSeq?: number | undefined }>();
+  /** Rate limit for the delta-gap warning, per room. */
+  private readonly telemetryGapWarnAt = new Map<string, number>();
+  /** Rate limit for the version-regression warning, per room. */
+  private readonly telemetryVersionWarnAt = new Map<string, number>();
 
   public constructor(
     private readonly rooms: RoomCache,
@@ -46,7 +52,9 @@ export class MoveCoordinator {
     private readonly options: MoveCoordinatorOptions = {},
     private readonly log?: Logger,
     /** Optional counter sink so the gateway can expose move outcomes as metrics. */
-    private readonly onMoveOutcome?: (reason: string, status: "committed" | "failed") => void
+    private readonly onMoveOutcome?: (reason: string, status: "committed" | "failed") => void,
+    /** Counts delta frames dropped because the manager does not know their base. */
+    private readonly onTelemetryGap?: () => void
   ) {
     this.telemetry = new TelemetryStore({ stateEmaHalfLifeMs: options.stateEmaHalfLifeMs ?? 3_000 });
     this.planner = new MovePlanner(options.planner ?? {});
@@ -60,6 +68,15 @@ export class MoveCoordinator {
   }
 
   public ingest(event: INodeEvent): void {
+    if (event.event === "room.destroyed" && event.data.roomId) {
+      // A later room may reuse this id; a leftover roster would make every
+      // delta look like a base mismatch.
+      const key = event.data.roomId as string;
+      this.roomRoster.delete(key);
+      this.telemetryGap.delete(key);
+      this.telemetryGapWarnAt.delete(key);
+      this.telemetryVersionWarnAt.delete(key);
+    }
     if (event.event === "room.telemetry" && event.data.roomId) {
       const roomId = event.data.roomId;
       const incoming = Array.isArray(event.data.players) ? event.data.players : [];
@@ -72,7 +89,30 @@ export class MoveCoordinator {
       if (event.data.kind === "delta") {
         const baseOk = roster !== undefined && roster.seq === event.data.baseSeq;
         if (!baseOk) {
-          this.log?.debug({ roomId, baseSeq: event.data.baseSeq, haveSeq: roster?.seq }, "delta telemetry without matching base; awaiting full snapshot");
+          // The next full resync repairs this, but until then the room's version
+          // and roster are frozen. Track the gap and surface it: without these
+          // logs a lost baseSeq silently freezes a room's state.
+          this.onTelemetryGap?.();
+          const at = Date.now();
+          const gap = this.telemetryGap.get(roomId) ?? { since: at, dropped: 0, haveSeq: roster?.seq };
+          gap.dropped += 1;
+          this.telemetryGap.set(roomId, gap);
+          const fields = {
+            roomId,
+            nodeId: event.data.nodeId,
+            seq: event.data.seq,
+            baseSeq: event.data.baseSeq,
+            haveSeq: roster?.seq,
+            droppedFrames: gap.dropped,
+            gapMs: at - gap.since,
+            players: incoming.length
+          };
+          if (at - (this.telemetryGapWarnAt.get(roomId) ?? 0) >= 30_000) {
+            this.telemetryGapWarnAt.set(roomId, at);
+            this.log?.warn(fields, "telemetry delta gap; awaiting full snapshot");
+          } else {
+            this.log?.debug(fields, "telemetry delta gap; awaiting full snapshot");
+          }
           return;
         }
         for (const playerId of event.data.removedPlayers ?? []) {
@@ -85,6 +125,32 @@ export class MoveCoordinator {
         for (const player of incoming) players.set(player.playerId as string, player);
         roster = { seq: typeof event.data.seq === "number" ? event.data.seq : 0, players };
         this.roomRoster.set(roomId as string, roster);
+
+        // A full frame is authoritative for membership. Drop tracked players it
+        // no longer contains: a player.leave lost while the control connection
+        // was down would otherwise stay in the telemetry store for the whole
+        // five-minute retention window and keep voting in the planner.
+        for (const tracked of this.telemetry.listRoom(roomId)) {
+          if (!players.has(tracked.playerId as string)) this.telemetry.remove(tracked.playerId);
+        }
+
+        const gap = this.telemetryGap.get(roomId);
+        if (gap) {
+          this.telemetryGap.delete(roomId);
+          this.telemetryGapWarnAt.delete(roomId);
+          this.log?.warn(
+            {
+              roomId,
+              nodeId: event.data.nodeId,
+              gapMs: Date.now() - gap.since,
+              droppedFrames: gap.dropped,
+              fromSeq: gap.haveSeq,
+              toSeq: event.data.seq,
+              players: incoming.length
+            },
+            "telemetry resynchronized after gap"
+          );
+        }
       }
 
       for (const player of incoming) {
@@ -103,7 +169,21 @@ export class MoveCoordinator {
         // can carry expectedVersion and the node can reject a plan built from a
         // snapshot that has already moved on.
         const version = typeof event.data.seq === "number" ? event.data.seq : room.version;
-        this.rooms.upsertRoom({ ...room, players: Math.min(room.capacity, count), version });
+        const applied = this.rooms.upsertRoom({ ...room, players: Math.min(room.capacity, count), version });
+        if (!applied) {
+          // The frame passed the gateway but is older than the cached snapshot
+          // (same node). That should not happen with a monotonic sequence, so
+          // treat it as a desync and report it.
+          this.onTelemetryGap?.();
+          const at = Date.now();
+          if (at - (this.telemetryVersionWarnAt.get(roomId) ?? 0) >= 30_000) {
+            this.telemetryVersionWarnAt.set(roomId, at);
+            this.log?.warn(
+              { roomId, nodeId: event.data.nodeId, seq: version, cachedVersion: room.version, kind: event.data.kind ?? "full" },
+              "telemetry version regression rejected"
+            );
+          }
+        }
       }
     }
     if ((event.event === "player.join" || event.event === "player.leave") && event.data.player?.playerId) {
@@ -191,7 +271,12 @@ export class MoveCoordinator {
     this.drainPendingCancels();
     this.expireTransactions(now);
 
-    const rooms = this.rooms.listRooms();
+    // Rooms kept for a disconnected node's grace window stay in the cache so
+    // allocation and /players can still resolve them, but they must never be
+    // planned against. A room on a dead or circuit-open node is not a real
+    // target: the executor would fail the move, and because the plan picks the
+    // first candidate that fits, it could shadow a live room for the cycle.
+    const rooms = this.rooms.listRooms().filter((room) => this.isRoomPlannable(room));
     const byRoom = new Map(rooms.map((room) => [room.roomId as string, this.telemetry.listRoom(room.roomId, now)]));
     this.planner.calibrate(rooms, byRoom, now);
 
@@ -256,6 +341,18 @@ export class MoveCoordinator {
       }
     }
     return [...this.transactions.values()];
+  }
+
+  /**
+   * A move source or target must live on a node the manager can actually talk
+   * to. Rooms of a disconnected (grace-window), draining or circuit-open node
+   * are excluded from planning; they remain in the cache for allocation and
+   * player lookup, which have their own availability checks.
+   */
+  private isRoomPlannable(room: RoomSnapshot): boolean {
+    if (room.draining) return false;
+    if (this.rooms.isNodeSuspected(room.nodeId)) return false;
+    return this.nodes.isAvailableForCommand(room.nodeId);
   }
 
   private expireTransactions(now: number): void {
@@ -329,7 +426,7 @@ export class MoveCoordinator {
       // room with several stray levels can be drained in one pass.
       usedRooms.push(plan.sourceRoomId, plan.targetRoomId);
       this.onMoveOutcome?.(plan.reason, "committed");
-      this.log?.info({ moveId, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId, sourceLevelCount: plan.sourceLevelCount, targetLevelCount: plan.targetLevelCount }, "level isolation committed");
+      this.log?.info({ moveId, reason: plan.reason, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId, sourceLevelCount: plan.sourceLevelCount, targetLevelCount: plan.targetLevelCount }, "level isolation committed");
       return true;
     }
 
@@ -340,13 +437,15 @@ export class MoveCoordinator {
     } else {
       // no_capacity / stale_plan / no_players never reach the warn path in the
       // executor, so a rejected merge used to disappear without a trace.
-      this.log?.info({ moveId, reason: outcome.reason, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation not executed");
+      this.log?.info({ moveId, reason: outcome.reason, planReason: plan.reason, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation not executed");
       this.transactions.delete(moveId);
     }
     return false;
   }
 
   public list(): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()]; }
+  /** Number of rooms whose delta telemetry is currently out of sync. */
+  public telemetryGapCount(): number { return this.telemetryGap.size; }
   public async manualMove(input: { sourceRoomId: string; targetRoomId: string; playerIds: string[]; reason?: string }, signal?: AbortSignal, now = Date.now()): Promise<MoveTransaction | LevelMoveTransaction> {
     const playerIds = [...new Set(input.playerIds.map(String).filter(Boolean))];
     if (!input.sourceRoomId || !input.targetRoomId || input.sourceRoomId === input.targetRoomId || playerIds.length === 0 || playerIds.length > 7) {

@@ -38,7 +38,7 @@ export interface ManagerConfig {
   levelIsolationMinLevelPlayers: number;
   levelIsolationMaxPlayers: number;
   levelIsolationSparseRoomThreshold: number;
-  levelIsolationLevelChangeCooldownMs: number;
+  levelChangeCooldownMs: number;
   debugApiToken: string;
 }
 
@@ -107,7 +107,10 @@ const configSchema = z
         level_isolation_min_level_players: positiveInt(1),
         level_isolation_max_players: positiveInt(8),
         level_isolation_sparse_room_threshold: positiveInt(2),
-        level_isolation_level_change_cooldown_ms: positiveInt(6000)
+        // Shared settling window for every migration path (isolation,
+        // same-level consolidation and activity merge): after anyone in a room
+        // changes level, nobody is moved out of it for this long.
+        level_change_cooldown_ms: positiveInt(6000)
       })
       .default({}),
     debug: z
@@ -155,7 +158,7 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     levelIsolationMinLevelPlayers: parsed.move.level_isolation_min_level_players,
     levelIsolationMaxPlayers: parsed.move.level_isolation_max_players,
     levelIsolationSparseRoomThreshold: parsed.move.level_isolation_sparse_room_threshold,
-    levelIsolationLevelChangeCooldownMs: parsed.move.level_isolation_level_change_cooldown_ms,
+    levelChangeCooldownMs: parsed.move.level_change_cooldown_ms,
     debugApiToken: parsed.debug.api_token
   };
 };

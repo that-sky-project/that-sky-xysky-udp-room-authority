@@ -29,6 +29,12 @@ export interface MovePlannerOptions {
   mergePressureThreshold: number;
   isolationPressureWeight: number;
   stalePressureWeight: number;
+  /** After any player in a room changes level, wait this long before moving
+   *  anyone out of it. The room is briefly in flux while the client loads the
+   *  new map (and hand-holding friends cross at slightly different times), so
+   *  a migration started inside this window looks like the level change itself
+   *  also changed rooms. */
+  levelChangeCooldownMs: number;
 }
 
 const clamp = (value: number): number => Math.max(0, Math.min(1, value));
@@ -45,7 +51,8 @@ const DEFAULT_OPTIONS: MovePlannerOptions = {
   minimumGain: 0.15,
   mergePressureThreshold: 0.25,
   isolationPressureWeight: 0.6,
-  stalePressureWeight: 0.4
+  stalePressureWeight: 0.4,
+  levelChangeCooldownMs: 6_000
 };
 
 export class MovePlanner {
@@ -97,32 +104,89 @@ export class MovePlanner {
     const plans: MovePlan[] = [];
     for (const source of activities.filter((a) => a.mergePressure >= this.options.mergePressureThreshold)) {
       const sourceRoom = rooms.find((room) => room.roomId === source.roomId);
-      const sourcePlayers = (byRoom.get(source.roomId) ?? []).filter((p) => !p.lastMigratedAt || now - p.lastMigratedAt >= this.options.moveCooldownMs);
-      if (!sourceRoom || sourcePlayers.length === 0) continue;
-      const sourceLevels = new Set(sourcePlayers.map((p) => p.levelId).filter((l): l is number => l !== undefined));
-      const target = activities
-        .filter((t) => t.roomId !== source.roomId && t.activity > source.activity + 0.05)
-        .sort((a, b) => b.activity - a.activity)
-        .map((candidate) => rooms.find((room) => room.roomId === candidate.roomId))
-        .find((room) => {
-          if (!room || room.capacity - room.players <= 0) return false;
-          const tp = byRoom.get(room.roomId) ?? [];
-          if (tp.length === 0 || sourceLevels.size === 0) return true;
-          return tp.some((p) => p.levelId !== undefined && sourceLevels.has(p.levelId));
-        });
-      if (!target) continue;
-      const targetPlayers = byRoom.get(target.roomId) ?? [];
-      const capacity = Math.max(0, target.capacity - Math.max(target.players, targetPlayers.length));
-      const targetActivity = this.activity(target, targetPlayers, now).activity;
-      const groups = this.candidateGroups(sourcePlayers, Math.min(sourcePlayers.length, capacity), now);
+      const roomPlayers = byRoom.get(source.roomId) ?? [];
+      if (!sourceRoom) continue;
+      // Level changes settle for a moment before anyone is migrated out of the
+      // room. Without this the activity planner bypasses the isolation
+      // planner's cooldown and a map load turns into a room change.
+      if (this.recentlyChangedLevel(roomPlayers, now)) continue;
+
+      const sourcePlayers = roomPlayers.filter((p) => !p.lastMigratedAt || now - p.lastMigratedAt >= this.options.moveCooldownMs);
+      if (sourcePlayers.length === 0) continue;
+
+      // Plan one level at a time. A group must be single-level and the target
+      // must be empty or hold exactly that level, otherwise this pass would
+      // create the mixed rooms the isolation pass exists to remove.
       let best: MovePlan | undefined;
-      for (const group of groups) {
-        const gain = this.moveGain(group, sourcePlayers, source.activity, targetActivity, now);
-        if (gain > (best?.gain ?? this.options.minimumGain)) best = { playerIds: group.map((p) => p.playerId), sourceRoomId: source.roomId, targetRoomId: target.roomId, gain, reason: group.length > 1 ? "low_activity_merge" : "player_rebalance" };
+      for (const [levelId, levelPlayers] of this.groupByLevel(sourcePlayers)) {
+        const target = this.findTarget(activities, rooms, byRoom, source, levelId);
+        if (!target) continue;
+        const targetPlayers = byRoom.get(target.roomId) ?? [];
+        const capacity = Math.max(0, target.capacity - Math.max(target.players, targetPlayers.length));
+        if (capacity <= 0) continue;
+        const targetActivity = this.activity(target, targetPlayers, now).activity;
+        const groups = this.candidateGroups(levelPlayers, Math.min(levelPlayers.length, capacity), now);
+        for (const group of groups) {
+          const gain = this.moveGain(group, sourcePlayers, source.activity, targetActivity, now);
+          if (gain > (best?.gain ?? this.options.minimumGain)) {
+            best = {
+              playerIds: group.map((p) => p.playerId),
+              sourceRoomId: source.roomId,
+              targetRoomId: target.roomId,
+              gain,
+              reason: group.length > 1 ? "low_activity_merge" : "player_rebalance"
+            };
+          }
+        }
       }
       if (best) plans.push(best);
     }
     return plans.sort((a, b) => b.gain - a.gain);
+  }
+
+  /**
+   * Highest-activity room that can receive `levelId` without mixing levels: it
+   * must be empty or every occupant must already be on `levelId`. A mixed room
+   * is rejected even when it contains the requested level — the isolation pass
+   * would have to move the incoming group straight back out.
+   */
+  private findTarget(
+    activities: RoomActivity[],
+    rooms: RoomSnapshot[],
+    byRoom: Map<string, StoredTelemetry[]>,
+    source: RoomActivity,
+    levelId: number
+  ): RoomSnapshot | undefined {
+    return activities
+      .filter((candidate) => candidate.roomId !== source.roomId && candidate.activity > source.activity + 0.05)
+      .sort((a, b) => b.activity - a.activity)
+      .map((candidate) => rooms.find((room) => room.roomId === candidate.roomId))
+      .find((room) => {
+        if (!room || room.capacity - room.players <= 0) return false;
+        // Empty room, or every occupant already on the requested level. A
+        // player whose level is not known yet counts as occupying an unknown
+        // level and blocks the target until the next telemetry frame — cheaper
+        // than moving a group into a room the isolation pass must split again.
+        return (byRoom.get(room.roomId) ?? []).every((player) => player.levelId === levelId);
+      });
+  }
+
+  /** Players grouped by the level they are currently on, insertion-ordered. */
+  private groupByLevel(players: StoredTelemetry[]): Map<number, StoredTelemetry[]> {
+    const groups = new Map<number, StoredTelemetry[]>();
+    for (const player of players) {
+      if (player.levelId === undefined) continue;
+      const group = groups.get(player.levelId) ?? [];
+      group.push(player);
+      groups.set(player.levelId, group);
+    }
+    return groups;
+  }
+
+  /** True while any player in the room has just switched level. */
+  private recentlyChangedLevel(players: StoredTelemetry[], now: number): boolean {
+    const cutoff = now - this.options.levelChangeCooldownMs;
+    return players.some((player) => (player.levelChangedAt ?? 0) > cutoff);
   }
 
   private velocityOf(p: StoredTelemetry): number { return p.emaVelocity ?? p.velocity ?? 0; }

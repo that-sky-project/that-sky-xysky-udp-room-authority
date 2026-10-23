@@ -57,6 +57,20 @@ npm run dev
 
 仅类型检查（不产出）：`npm run typecheck`。
 
+### 集群模拟
+
+`scripts/simulate-merge.mjs` 用编译后的 `MoveCoordinator` 驱动一个内存集群（一个节点一个房、
+每 2.1 秒一帧 telemetry、节点命令自动 ack），不用真实集群就能看同一 level 的房会不会合并、
+选中哪个房，以及切图沉降窗口如何延后合并。运行前先执行 `npm run build`。
+
+```bash
+node scripts/simulate-merge.mjs                # 4 个单人房、3 个 level
+node scripts/simulate-merge.mjs isolated       # 每个 level 只有一个房：无合并目标
+node scripts/simulate-merge.mjs cooldown       # 刚发生过切图
+node scripts/simulate-merge.mjs offline        # 同 level 的对端节点不可达
+node scripts/simulate-merge.mjs snapshot seconds=120
+```
+
 ## 配置说明
 
 全部配置都在 **`config.yml`** 中（从工作目录加载）。管理器**不读取任何环境变量**，`config.yml`
@@ -93,6 +107,7 @@ commands:
 move:
   budget_per_cycle: 8
   transaction_timeout_ms: 15000
+  level_change_cooldown_ms: 6000
 
 debug:
   api_token: ""
@@ -117,6 +132,7 @@ debug:
 | `commands.max_pending` | `100000` | 最大未完成命令数 |
 | `move.budget_per_cycle` | `8` | 每轮规划最多启动的迁移数 |
 | `move.transaction_timeout_ms` | `15000` | 迁移事务停滞多久后中止 |
+| `move.level_change_cooldown_ms` | `6000` | 切图后的沉降窗口；窗口内任何迁移路径都不会把玩家移出该房间 |
 | `debug.api_token` | `""` | `/debug/*` 的 token；为空则保持关闭 |
 
 ### 调试接口
@@ -135,6 +151,10 @@ debug:
 
 节点在连接时注册自己的 `public_uri`，QWD 通过 `/allocate` 把该地址返回给客户端。请在你的反向代理
 处按需终止 TLS / 转发 WebSocket 升级（路径 `/`）。
+
+节点可以在升级 URL 上带一个稳定标识（`?v=1&node=<id>`）。QWD 在重连之间复用该 id，短暂的
+socket 断开会在宽限期内恢复原有房间，而不是把它们回收掉。未携带该参数的节点会得到一个按连接
+生成的 id。
 
 ## 许可证
 

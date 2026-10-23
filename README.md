@@ -61,6 +61,21 @@ npm run dev
 
 Type-check only (no emit): `npm run typecheck`.
 
+### Cluster simulation
+
+`scripts/simulate-merge.mjs` drives the compiled `MoveCoordinator` against an in-memory
+cluster (one room per node, telemetry every 2.1s, node commands auto-acked). It shows
+whether same-level rooms merge, which room is chosen, and how the level-change settling
+window delays a merge — without a live cluster. Run `npm run build` first.
+
+```bash
+node scripts/simulate-merge.mjs                # four lone players across three levels
+node scripts/simulate-merge.mjs isolated       # one room per level: nothing to merge
+node scripts/simulate-merge.mjs cooldown       # a level change just happened
+node scripts/simulate-merge.mjs offline        # a same-level peer node is unreachable
+node scripts/simulate-merge.mjs snapshot seconds=120
+```
+
 ## Configuration
 
 All configuration lives in **`config.yml`** (loaded from the working directory). The manager
@@ -97,6 +112,7 @@ commands:
 move:
   budget_per_cycle: 8
   transaction_timeout_ms: 15000
+  level_change_cooldown_ms: 6000
 
 debug:
   api_token: ""
@@ -121,6 +137,7 @@ debug:
 | `commands.max_pending` | `100000` | Max outstanding commands |
 | `move.budget_per_cycle` | `8` | Max moves started per planning cycle |
 | `move.transaction_timeout_ms` | `15000` | Abort a stalled move transaction after this |
+| `move.level_change_cooldown_ms` | `6000` | Settling window after a level change; no migration path moves players out of the room during it |
 | `debug.api_token` | `""` | Token for `/debug/*`; empty keeps them locked |
 
 ### Debug endpoints
@@ -141,6 +158,10 @@ Two distinct addresses are involved when running QWD:
 Nodes register their `public_uri` on connect; QWD hands that address back to clients via
 `/allocate`. Terminate TLS / route the WebSocket upgrade (path `/`) at your reverse proxy as
 needed.
+
+A node may add a stable identity to the upgrade URL (`?v=1&node=<id>`). QWD reuses that id
+across reconnects, so a short socket drop restores the node's rooms within the grace window
+instead of reaping them. Nodes that omit it get a per-connection id.
 
 ## License
 

@@ -12,6 +12,8 @@ export interface RequestRouterOptions {
   nodeStaleMs: number;
   assignmentTtlMs: number;
   candidateRoomLimit: number;
+  /** Fill target the candidate scan aims for; must match the policy score. */
+  preferredFillTarget: number;
 }
 
 const EMPTY_LEVELS: ReadonlySet<number> = new Set<number>();
@@ -65,7 +67,7 @@ export class RequestRouter {
 
     const candidates = this.rooms.listCandidateRooms({
       region: request.region,
-      preferredFillTarget: 7,
+      preferredFillTarget: this.options.preferredFillTarget,
       limit: this.options.candidateRoomLimit
     });
     const levelsByRoom = this.rooms.levelsByRoom();

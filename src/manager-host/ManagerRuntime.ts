@@ -59,19 +59,21 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
       isolationPressureWeight: config.moveIsolationPressureWeight,
       stalePressureWeight: config.moveStalePressureWeight,
       mergePressureThreshold: config.moveMergePressureThreshold,
-      minimumGain: config.moveMinimumGain
+      minimumGain: config.moveMinimumGain,
+      levelChangeCooldownMs: config.levelChangeCooldownMs
     },
     levelIsolation: {
       minLevelPlayers: config.levelIsolationMinLevelPlayers,
       maxPlayersPerMove: config.levelIsolationMaxPlayers,
       sparseRoomThreshold: config.levelIsolationSparseRoomThreshold,
-      levelChangeCooldownMs: config.levelIsolationLevelChangeCooldownMs
+      levelChangeCooldownMs: config.levelChangeCooldownMs
     }
-  }, logger, (reason, status) => metrics.inc("qwd_move_total", [reason, status]));
+  }, logger, (reason, status) => metrics.inc("qwd_move_total", [reason, status]), () => metrics.inc("qwd_telemetry_gap_total"));
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {
     nodeStaleMs: config.nodeStaleMs,
     assignmentTtlMs: config.assignmentTtlMs,
-    candidateRoomLimit: config.candidateRoomLimit
+    candidateRoomLimit: config.candidateRoomLimit,
+    preferredFillTarget: config.preferredFillTarget
   }, (roomId) => moves.telemetry.reserved(roomId), logger);
 
   return { nodes, rooms, pending, policy, reservations, coordinator, router, moves, metrics };

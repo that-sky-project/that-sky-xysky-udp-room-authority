@@ -63,10 +63,19 @@ export class RoomCache {
     });
   }
 
-  public upsertRoom(room: RoomSnapshot): void {
+  /**
+   * Insert or update a room snapshot. Returns false when the snapshot is older
+   * than the cached one (same node): callers use that to log a desync instead
+   * of silently keeping stale occupancy.
+   */
+  public upsertRoom(room: RoomSnapshot): boolean {
     const previous = this.rooms.get(room.roomId);
-    if (previous && room.version < previous.version) {
-      return;
+    // The version is the node's telemetry sequence. A different node owning the
+    // same room id is a new incarnation (a restarted process reusing a short
+    // numeric id), so its sequence starts over and must not be gated by the
+    // dead node's counter.
+    if (previous && previous.nodeId === room.nodeId && room.version < previous.version) {
+      return false;
     }
     if (previous && previous.nodeId !== room.nodeId) {
       this.roomsByNode.get(previous.nodeId)?.delete(room.roomId);
@@ -76,6 +85,7 @@ export class RoomCache {
     this.rooms.set(room.roomId, next);
     this.indexRoom(room.nodeId, room.roomId);
     this.indexCandidate(next);
+    return true;
   }
 
   public deleteRoom(roomId: RoomId): void {
@@ -292,13 +302,19 @@ export class RoomCache {
 
     if ((event.event === "room.created" || event.event === "room.updated") && event.data.roomId && event.data.port && event.data.udpHost) {
       const existing = this.rooms.get(event.data.roomId);
+      const capacity = typeof event.data.capacity === "number" && event.data.capacity > 0
+        ? Math.min(8, event.data.capacity)
+        : existing?.capacity ?? 8;
+      const reported = typeof event.data.players === "number" ? event.data.players : undefined;
       this.upsertRoom({
         roomId: event.data.roomId,
         nodeId: event.data.nodeId,
         udpHost: event.data.udpHost,
         udpPort: event.data.port,
-        players: existing?.players ?? 0,
-        capacity: existing?.capacity ?? 8,
+        // room.created carries the authoritative occupancy, which keeps a
+        // reconnecting node's snapshot correct before the first telemetry frame.
+        players: Math.min(capacity, reported ?? existing?.players ?? 0),
+        capacity,
         region: existing?.region,
         version: event.data.version ?? existing?.version ?? 0,
         draining: existing?.draining ?? false,
@@ -323,7 +339,10 @@ export class RoomCache {
     this.upsertRoom({
       ...room,
       players: Math.max(0, Math.min(room.capacity, room.players + delta)),
-      version: version ?? room.version + 1,
+      // A join/leave is not a telemetry frame. Advancing the version here would
+      // push the room above the node's real sequence, and every later telemetry
+      // frame (lower seq) would be rejected as stale until the node caught up.
+      version: version ?? room.version,
       lastChangedAt: asUnixMs(Date.now())
     });
   }

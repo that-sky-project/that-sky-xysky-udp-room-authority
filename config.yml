@@ -87,7 +87,9 @@ move:
   level_isolation_min_level_players: 1  # a level group this small is still moved out
   level_isolation_max_players: 8        # max players moved by a single plan
   level_isolation_sparse_room_threshold: 2  # rooms with ≤ this many players are merged if same level
-  level_isolation_level_change_cooldown_ms: 6000  # wait this long after a level change before migrating
+  # Shared settling window for every migration path: after any player in a room
+  # changes level, nobody is moved out of that room for this long.
+  level_change_cooldown_ms: 6000
 
 # ---------------------------------------------------------------------------
 # Debug HTTP endpoints (/debug/allnode, /debug/move).

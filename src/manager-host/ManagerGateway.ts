@@ -32,6 +32,8 @@ export class ManagerGateway {
   private graceSweepTimer: NodeJS.Timeout | undefined;
   /** Per-room telemetry sequence guard: rejects stale/duplicate snapshots. */
   private readonly telemetrySeq = new Map<string, number>();
+  /** Rate limit for the sequence-regression warning, per room. */
+  private readonly telemetryStaleWarnAt = new Map<string, number>();
 
   public constructor(
     private readonly config: ManagerConfig,
@@ -135,6 +137,7 @@ export class ManagerGateway {
     }
     this.metrics.set("qwd_level_mix_violations", mixed);
     this.metrics.set("qwd_players_stranded", stranded);
+    this.metrics.set("qwd_telemetry_gap_rooms", this.runtime.moves.telemetryGapCount());
   }
 
   private sweepSuspectedNodes(): void {
@@ -291,8 +294,16 @@ export class ManagerGateway {
       return;
     }
 
+    const requestedNodeId = url.searchParams.get("node") ?? "";
+    // A node reports one id for the whole lifetime of its process. Without it
+    // every reconnect arrives as a brand-new node, so its rooms can only sit
+    // under a dead connection id until the grace sweep reclaims them — the
+    // restore path below could never run.
+    const nodeId = /^[A-Za-z0-9._-]{1,128}$/.test(requestedNodeId)
+      ? asNodeId(requestedNodeId)
+      : asNodeId(`connection-${randomUUID()}`);
     const state: NodeConnectionState = {
-      nodeId: asNodeId(`connection-${randomUUID()}`),
+      nodeId,
       protocolVersion,
       connectedAt: Date.now(),
       remoteAddress: req.socket.remoteAddress ?? ""
@@ -343,7 +354,14 @@ export class ManagerGateway {
     ws.on("message", (message, isBinary) => this.handleNodeMessage(ws, state, message, isBinary).catch((error) => this.log.error({ err: error }, "node message handler error")));
     ws.on("close", () => {
       closed = true;
-      this.heartbeat.untrack(state.nodeId);
+      this.heartbeat.untrack(state.nodeId, ws);
+      // With a stable node id a reconnect can register a new transport before
+      // the old socket's close event is delivered. Only the connection that
+      // still owns the id may tear the node down.
+      if (this.runtime.nodes.getTransport(state.nodeId) !== transport) {
+        this.log.info({ nodeId: state.nodeId }, "stale node socket closed; a newer connection owns the id");
+        return;
+      }
       this.handleNodeDisconnect(state.nodeId);
     });
     ws.on("error", (error) => this.log.warn({ err: error, nodeId: state.nodeId }, "node socket error"));
@@ -370,6 +388,7 @@ export class ManagerGateway {
   }
 
   private async handleNodeMessage(ws: WebSocket, state: NodeConnectionState, message: RawData, isBinary: boolean): Promise<void> {
+    let raw: unknown;
     try {
       if (isBinary) throw new HermesError(ErrorCode.PROTOCOL_ERROR, "node messages must be JSON text");
       const text = Buffer.isBuffer(message)
@@ -377,7 +396,7 @@ export class ManagerGateway {
         : Array.isArray(message)
           ? Buffer.concat(message).toString("utf8")
           : Buffer.from(message).toString("utf8");
-      const raw = JSON.parse(text) as unknown;
+      raw = JSON.parse(text) as unknown;
       const ack = NodeAckSchema.safeParse(raw);
       if (ack.success) {
         this.runtime.pending.resolve(ack.data);
@@ -394,7 +413,11 @@ export class ManagerGateway {
         this.runtime.moves.planAndExecute().catch((error) => this.log.error({ err: error }, "plan cycle error"));
       }
     } catch (error) {
-      this.log.warn({ err: error, nodeId: state.nodeId }, "invalid node message");
+      const envelope = typeof raw === "object" && raw !== null ? (raw as { event?: unknown; data?: { roomId?: unknown; seq?: unknown } }) : undefined;
+      this.log.warn(
+        { err: error, nodeId: state.nodeId, event: envelope?.event, roomId: envelope?.data?.roomId, seq: envelope?.data?.seq },
+        "invalid node message"
+      );
       if (ws.readyState === WebSocket.OPEN) ws.send(jsonStringify(this.errorReply(error)));
     }
   }
@@ -427,6 +450,24 @@ export class ManagerGateway {
    * Returns false when the event was dropped as stale.
    */
   private applyNodeEvent(event: INodeEvent): boolean {
+    // A restarted node can reuse a short numeric room id before the old entry
+    // is swept. Its telemetry sequence starts over, so the stale-frame guard
+    // recorded for the dead incarnation must be dropped with it.
+    if (event.event === "room.created" && event.data.roomId) {
+      const existing = this.runtime.rooms.getRoom(event.data.roomId);
+      if (existing && existing.nodeId !== event.data.nodeId) {
+        this.telemetrySeq.delete(event.data.roomId as string);
+        this.telemetryStaleWarnAt.delete(event.data.roomId as string);
+        this.log.warn(
+          { roomId: event.data.roomId, previousNodeId: existing.nodeId, nodeId: event.data.nodeId },
+          "room id reused by a new node incarnation; telemetry sequence reset"
+        );
+      }
+    }
+    if (event.event === "room.destroyed" && event.data.roomId) {
+      this.telemetrySeq.delete(event.data.roomId as string);
+      this.telemetryStaleWarnAt.delete(event.data.roomId as string);
+    }
     // Telemetry carries a per-room monotonic sequence. Dropping a stale or
     // duplicated snapshot prevents an out-of-order HTTP-fallback delivery from
     // rolling the player table backwards.
@@ -435,6 +476,21 @@ export class ManagerGateway {
       const last = this.telemetrySeq.get(roomKey);
       if (last !== undefined && event.data.seq <= last) {
         this.metrics.inc("qwd_telemetry_stale_total");
+        const at = Date.now();
+        if (at - (this.telemetryStaleWarnAt.get(roomKey) ?? 0) >= 30_000) {
+          this.telemetryStaleWarnAt.set(roomKey, at);
+          this.log.warn(
+            {
+              roomId: roomKey,
+              nodeId: event.data.nodeId,
+              seq: event.data.seq,
+              lastSeq: last,
+              kind: event.data.kind ?? "full",
+              baseSeq: event.data.baseSeq
+            },
+            "telemetry sequence regressed; frame dropped"
+          );
+        }
         return false;
       }
       this.telemetrySeq.set(roomKey, event.data.seq);

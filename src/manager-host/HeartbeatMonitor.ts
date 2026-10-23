@@ -42,7 +42,13 @@ export class HeartbeatMonitor {
     });
   }
 
-  public untrack(nodeId: string): void {
+  public untrack(nodeId: string, ws?: WebSocket): void {
+    // A reconnect with the same stable node id replaces the tracked socket. The
+    // old socket closing must not drop the heartbeat of the new one.
+    if (ws) {
+      const tracked = this.sockets.get(nodeId);
+      if (tracked && tracked.ws !== ws) return;
+    }
     this.sockets.delete(nodeId);
   }
 

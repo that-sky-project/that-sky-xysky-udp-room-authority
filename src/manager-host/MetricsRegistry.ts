@@ -89,8 +89,10 @@ export const registerManagerMetrics = (metrics: MetricsRegistry, _log: Logger): 
   metrics.declareCounter("qwd_node_heartbeat_dead_total", "Nodes terminated by a missed heartbeat");
   metrics.declareCounter("qwd_move_total", "Move transactions by reason and terminal status", ["reason", "status"]);
   metrics.declareCounter("qwd_telemetry_stale_total", "Telemetry snapshots discarded due to a non-monotonic sequence");
+  metrics.declareCounter("qwd_telemetry_gap_total", "Delta telemetry frames discarded because their base sequence was unknown");
   metrics.declareGauge("qwd_rooms", "Rooms known to the manager");
   metrics.declareGauge("qwd_players", "Tracked players");
   metrics.declareGauge("qwd_level_mix_violations", "Rooms currently holding more than one level");
   metrics.declareGauge("qwd_players_stranded", "Players that want to be isolated but have no target room");
+  metrics.declareGauge("qwd_telemetry_gap_rooms", "Rooms whose delta telemetry is currently out of sync");
 };
