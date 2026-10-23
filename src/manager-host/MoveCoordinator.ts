@@ -294,10 +294,20 @@ export class MoveCoordinator {
   private async executeLevelIsolation(plan: LevelIsolationPlan, now: number, signal: AbortSignal | undefined, usedRooms: string[]): Promise<boolean> {
     const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
     const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
-    if (!source || !target || this.transactionsForPlayer(plan.playerIds).length > 0) return false;
+    if (!source || !target) {
+      this.log?.warn({ sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: room no longer cached");
+      return false;
+    }
+    if (this.transactionsForPlayer(plan.playerIds).length > 0) {
+      this.log?.debug({ playerIds: plan.playerIds }, "level isolation skipped: player already has a pending move");
+      return false;
+    }
     // The source room may legitimately appear in several plans in one cycle when
     // it holds three or more levels; only the destination has to be exclusive.
-    if (this.inCooldown(plan.targetRoomId, now)) return false;
+    if (this.inCooldown(plan.targetRoomId, now)) {
+      this.log?.debug({ targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: target room in cooldown");
+      return false;
+    }
 
     const moveId = `level-isolation-${plan.levelId}-${now}-${plan.playerIds.join("-")}`;
     const tx: LevelMoveTransaction = { ...plan, moveId, status: "prepared", createdAt: now, joinedPlayers: [], leftPlayers: [] };
@@ -328,6 +338,9 @@ export class MoveCoordinator {
       this.transactions.set(moveId, { ...tx, status: "failed" });
       this.onMoveOutcome?.(plan.reason, "failed");
     } else {
+      // no_capacity / stale_plan / no_players never reach the warn path in the
+      // executor, so a rejected merge used to disappear without a trace.
+      this.log?.info({ moveId, reason: outcome.reason, playerIds: plan.playerIds, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation not executed");
       this.transactions.delete(moveId);
     }
     return false;
