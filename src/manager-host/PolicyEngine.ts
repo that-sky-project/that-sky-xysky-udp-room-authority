@@ -27,6 +27,10 @@ export interface PolicyEngineOptions {
    *  it below any same-level or empty room while still allowing it as a last
    *  resort when nothing else has capacity. */
   wrongLevelPenalty: number;
+  /** Score penalty for placing a player whose level is unknown into a room that
+   *  already holds a known level. Unknown plus occupied is exactly how mixed
+   *  rooms are created, which isolation then has to undo. */
+  unknownLevelPenalty: number;
 }
 
 export class PolicyEngine {
@@ -69,7 +73,12 @@ export class PolicyEngine {
    * a cluster with no matching room still allocates instead of rejecting joins.
    */
   private levelScore(level: number | undefined, roomLevels: ReadonlySet<number>): number {
-    if (level === undefined) return 0;
+    if (level === undefined) {
+      // We cannot verify compatibility, so prefer a level-less (usually empty)
+      // room. Dropping an unknown player into a room with a known level is the
+      // main way mixed rooms get created in the first place.
+      return roomLevels.size > 0 ? -this.options.unknownLevelPenalty : 0;
+    }
     if (roomLevels.size === 0) return 0;
     return roomLevels.has(level) ? this.options.sameLevelBonus : -this.options.wrongLevelPenalty;
   }

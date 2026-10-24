@@ -125,6 +125,7 @@ debug:
 | `rooms.candidate_room_limit` | `256` | 每次分配扫描的最大房间数 |
 | `rooms.stale_room_ms` | `120000` | 房间快照空闲多久后丢弃 |
 | `rooms.max_players_per_room` | `8` | 单房间硬上限 |
+| `rooms.unknown_level_penalty` | `50` | 玩家 level 未知时，分配进已有 level 的房间的扣分 |
 | `nodes.stale_ms` | `10000` | 节点空闲多久后视为不健康 |
 | `nodes.backpressure_limit_bytes` | `8388608` | WS 发送缓冲超过该值时暂停发送 |
 | `nodes.circuit_open_ms` | `5000` | 熔断后保持开路的时长 |

@@ -26,7 +26,14 @@ export interface MoveExecutorOptions {
 
 export type MoveExecuteOutcome =
   | { ok: true; moveId: string }
-  | { ok: false; moveId: string; reason: "no_capacity" | "stale_plan" | "no_players" | "failed"; error?: unknown };
+  | { ok: false; moveId: string; reason: "no_capacity" | "stale_plan" | "no_players" | "failed"; error?: unknown; permanent?: boolean };
+
+/** Human-readable reason from a node ack (the node puts it under data.message). */
+const ackDetail = (ack: { code: number; message?: string | undefined; data?: unknown }): string => {
+  const payload = ack.data as { message?: unknown } | undefined;
+  if (payload && typeof payload.message === "string") return payload.message;
+  return ack.message ?? `node ack code ${ack.code}`;
+};
 
 /**
  * One place that performs a single cross-room move: reserve capacity on the
@@ -108,12 +115,18 @@ export class MoveExecutor {
         this.telemetry.releaseReservation(target.roomId, moveId);
         return { ok: false, moveId, reason: "stale_plan" };
       }
-      if (ack.code !== ErrorCode.OK) throw new Error(ack.message ?? "target rejected move");
+      if (ack.code !== ErrorCode.OK) {
+        this.telemetry.releaseReservation(target.roomId, moveId);
+        // Protocol-level rejections will not fix themselves by retrying.
+        const permanent = ack.code === ErrorCode.BAD_REQUEST || ack.code === ErrorCode.NOT_FOUND;
+        this.log?.warn({ moveId, targetRoomId: target.roomId, code: ack.code, details: ack.data }, "move.prepare rejected");
+        return { ok: false, moveId, reason: "failed", permanent, error: new Error(ackDetail(ack)) };
+      }
 
       const first = playerIds[0];
       if (!first) throw new Error("empty move group");
 
-      await this.cross.redirectPlayers(
+      const commitAck = await this.cross.redirectPlayers(
         {
           playerIds: playerIds.map((id) => id as PlayerId),
           moveId,
@@ -130,6 +143,19 @@ export class MoveExecutor {
         },
         signal
       );
+      if (commitAck.code !== ErrorCode.OK) {
+        // The source node refused to hand the players over. Previously this
+        // ack was ignored, so a rejected commit was reported as a successful
+        // migration while the target reservation expired and the planner
+        // retried forever.
+        this.telemetry.releaseReservation(target.roomId, moveId);
+        const permanent = commitAck.code === ErrorCode.BAD_REQUEST || commitAck.code === ErrorCode.NOT_FOUND;
+        this.log?.warn(
+          { moveId, sourceRoomId: source.roomId, targetRoomId: target.roomId, code: commitAck.code, details: commitAck.data },
+          "move.commit rejected by source node"
+        );
+        return { ok: false, moveId, reason: "failed", permanent, error: new Error(ackDetail(commitAck)) };
+      }
 
       this.telemetry.markMigrated(playerIds.map((id) => id as PlayerId), now);
       return { ok: true, moveId };

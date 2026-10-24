@@ -30,6 +30,10 @@ rooms:
   # Node load penalty. One node hosts one room here, so load is already counted
   # as room fill; keep this small or it outweighs the same-level bonus.
   load_penalty_weight: 10
+  # Allocation request without a level (client did not report it): penalise
+  # rooms that already hold a known level so the player lands in an empty room
+  # instead of creating a mixed room the isolation pass has to split.
+  unknown_level_penalty: 50
 
 # ---------------------------------------------------------------------------
 # Node health

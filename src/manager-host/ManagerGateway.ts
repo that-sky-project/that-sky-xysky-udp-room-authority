@@ -27,6 +27,7 @@ const isPlanningEvent = (event: INodeEvent): boolean =>
 /** Compact, log-safe view of an outbound command's routing fields. */
 const summarizeCommand = (command: IManagerCommand): {
   roomId?: string | undefined;
+  fromRoomId?: string | undefined;
   moveId?: string | undefined;
   playerIds?: string[] | undefined;
   expectedVersion?: number | undefined;
@@ -40,6 +41,7 @@ const summarizeCommand = (command: IManagerCommand): {
       : undefined;
   return {
     roomId: text("roomId") ?? text("toRoomId"),
+    fromRoomId: text("fromRoomId"),
     moveId: text("moveId"),
     playerIds,
     expectedVersion: typeof data.expectedVersion === "number" ? data.expectedVersion : undefined
@@ -57,7 +59,7 @@ export class ManagerGateway {
   /** Rate limit for the sequence-regression warning, per room. */
   private readonly telemetryStaleWarnAt = new Map<string, number>();
   /** In-flight outbound commands, so an ack can be logged with its command name. */
-  private readonly outbound = new Map<number, { cmd: string; at: number; roomId?: string | undefined; moveId?: string | undefined; playerIds?: string[] | undefined }>();
+  private readonly outbound = new Map<number, { cmd: string; at: number; roomId?: string | undefined; fromRoomId?: string | undefined; moveId?: string | undefined; playerIds?: string[] | undefined }>();
 
   public constructor(
     private readonly config: ManagerConfig,
@@ -490,6 +492,9 @@ export class ManagerGateway {
         const sent = this.outbound.get(Number(ack.data.id));
         if (sent) {
           this.outbound.delete(Number(ack.data.id));
+          const ackPayload = ack.data.data as Record<string, unknown> | undefined;
+          const ackMessage = ack.data.message
+            ?? (typeof ackPayload?.message === "string" ? ackPayload.message : undefined);
           this.runtime.events.record({
             category: "node",
             event: "node.ack",
@@ -502,7 +507,11 @@ export class ManagerGateway {
               cmd: sent.cmd,
               code: ack.data.code,
               latencyMs: Date.now() - sent.at,
-              moveId: sent.moveId
+              moveId: sent.moveId,
+              fromRoomId: sent.fromRoomId,
+              ackMessage,
+              // Only useful for failures and keeps successful acks compact.
+              ackData: ack.data.code === 0 ? undefined : ackPayload
             }
           });
         }

@@ -19,6 +19,7 @@ export interface ManagerConfig {
   maxPlayersPerRoom: number;
   preferredFillTarget: number;
   loadPenaltyWeight: number;
+  unknownLevelPenalty: number;
   nodeBackpressureLimitBytes: number;
   nodeCircuitOpenMs: number;
   nodeCircuitFailureThreshold: number;
@@ -69,7 +70,11 @@ const configSchema = z
         // Weight of the node load penalty. One node hosts one room here, so
         // load already shows up as room fill; keep this small or it cancels
         // the level bonus and pushes joins into empty rooms.
-        load_penalty_weight: floatFrom(10)
+        load_penalty_weight: floatFrom(10),
+        // Allocation request without a level: penalise rooms that already have
+        // a known level so the player lands in an empty/level-less room instead
+        // of creating a mixed room the isolation pass must split.
+        unknown_level_penalty: floatFrom(50)
       })
       .default({}),
     nodes: z
@@ -152,6 +157,7 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     maxPlayersPerRoom: parsed.rooms.max_players_per_room,
     preferredFillTarget: parsed.rooms.preferred_fill_target,
     loadPenaltyWeight: parsed.rooms.load_penalty_weight,
+    unknownLevelPenalty: parsed.rooms.unknown_level_penalty,
     nodeStaleMs: parsed.nodes.stale_ms,
     nodeBackpressureLimitBytes: parsed.nodes.backpressure_limit_bytes,
     nodeCircuitOpenMs: parsed.nodes.circuit_open_ms,

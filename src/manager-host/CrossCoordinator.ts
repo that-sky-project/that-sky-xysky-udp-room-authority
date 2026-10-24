@@ -12,6 +12,21 @@ export interface CrossCoordinatorOptions {
 
 export type RedirectReason = "merge" | "split" | "manual" | "capacity-rebalance" | "level-isolation" | "level-consolidation";
 
+/**
+ * OLD node builds validate the destination as a TgcUuid text and reject a bare
+ * numeric room id. New room ids are 8-digit numbers, so send the same
+ * deterministic uuid the node derives locally (RoomServer.destinationUuid).
+ * This keeps cross-room moves working while the cluster is half upgraded.
+ */
+const destinationUuidText = (roomId: string): string | undefined => {
+  const value = String(roomId ?? "");
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) return value;
+  if (!/^\d{1,15}$/.test(value)) return undefined;
+  const numeric = Number(value);
+  if (!Number.isSafeInteger(numeric) || numeric > 0xffffffffffff) return undefined;
+  return `00000000-0000-4000-8000-${numeric.toString(16).padStart(12, "0")}`;
+};
+
 export interface RedirectPlan {
   playerId: PlayerId;
   fromRoomId: RoomId;
@@ -68,6 +83,8 @@ export class CrossCoordinator {
         playerIds: plan.playerIds,
         fromRoomId: plan.fromRoomId,
         toRoomId: plan.to.roomId,
+        // Numeric room ids are not valid TgcUuid text; old nodes need this.
+        toRoomUuid: destinationUuidText(plan.to.roomId),
         udpHost: plan.to.udpHost,
         udpPort: plan.to.udpPort,
         reason: plan.reason

@@ -130,6 +130,7 @@ debug:
 | `rooms.candidate_room_limit` | `256` | Max rooms scanned per allocation |
 | `rooms.stale_room_ms` | `120000` | Drop a room snapshot after this idle time |
 | `rooms.max_players_per_room` | `8` | Hard per-room cap |
+| `rooms.unknown_level_penalty` | `50` | Score penalty for placing a player with an unknown level into a room that already has one |
 | `nodes.stale_ms` | `10000` | Node considered unhealthy after this idle time |
 | `nodes.backpressure_limit_bytes` | `8388608` | Pause sends above this WS buffer size |
 | `nodes.circuit_open_ms` | `5000` | Circuit-open duration after tripping |

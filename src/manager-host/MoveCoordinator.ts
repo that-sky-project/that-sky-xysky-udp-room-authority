@@ -1,5 +1,5 @@
 import type { PlayerId, RoomId } from "../types/branded.js";
-import { asProtocolVersion } from "../types/branded.js";
+import { asProtocolVersion, asUnixMs } from "../types/branded.js";
 import type { INodeEvent, PlayerTelemetry, RoomSnapshot } from "../types/contracts.js";
 import type { Logger } from "../infra/logger/logger.js";
 import type { CrossCoordinator } from "./CrossCoordinator.js";
@@ -40,9 +40,13 @@ export class MoveCoordinator {
   private readonly transactions = new Map<string, MoveTransaction | LevelMoveTransaction>();
   /** roomId -> last observed roster signature and how many cycles it repeated. */
   private readonly roomStability = new Map<string, { signature: string; cycles: number }>();
+  /** Permanently rejected plans: move key -> source roster signature at rejection. */
+  private readonly suppressedPlans = new Map<string, string>();
   private readonly pendingCancels = new Map<string, { roomId: RoomId; moveId: string; playerIds: string[] }>();
   private lastPlanAt = 0;
   private planning = false;
+  /** Monotonic suffix for move ids (see nextMoveId). */
+  private moveSeq = 0;
   /** Latest full roster per room, used to apply delta telemetry frames. */
   private readonly roomRoster = new Map<string, { seq: number; players: Map<string, PlayerTelemetry> }>();
   /** Rooms whose delta stream is currently out of sync with our roster. */
@@ -51,6 +55,8 @@ export class MoveCoordinator {
   private readonly telemetryGapWarnAt = new Map<string, number>();
   /** Rate limit for the version-regression warning, per room. */
   private readonly telemetryVersionWarnAt = new Map<string, number>();
+  /** Rate limit for "node clock is skewed" warnings, per room. */
+  private readonly clockSkewWarnAt = new Map<string, number>();
 
   public constructor(
     private readonly rooms: RoomCache,
@@ -86,6 +92,37 @@ export class MoveCoordinator {
     if (event.event === "room.telemetry" && event.data.roomId) {
       const roomId = event.data.roomId;
       const incoming = Array.isArray(event.data.players) ? event.data.players : [];
+
+      // Node clocks are not guaranteed to be in sync with the manager. The node
+      // stamps stateAt / lastMoveAt with its own clock; a node that is minutes
+      // behind makes every player look stale to freshness-based planning (and
+      // one that is ahead makes dead players look alive). Normalise against the
+      // frame timestamp, which the node also sends from its own clock.
+      const receivedAt = Date.now();
+      const frameTimestamp = typeof event.data.timestamp === "number" ? event.data.timestamp : undefined;
+      const rawOffset = frameTimestamp === undefined ? 0 : frameTimestamp - receivedAt;
+      const clockOffset = Math.abs(rawOffset) >= 1_000 ? rawOffset : 0;
+      if (Math.abs(rawOffset) > 10_000) {
+        const at = receivedAt;
+        // A clock that is simply wrong will keep warning; 5 minutes is enough
+        // to notice without flooding the log.
+        if (at - (this.clockSkewWarnAt.get(roomId) ?? 0) >= 300_000) {
+          this.clockSkewWarnAt.set(roomId, at);
+          const direction = rawOffset < 0 ? "behind" : "ahead of";
+          this.log?.warn(
+            { roomId, nodeId: event.data.nodeId, offsetMs: Math.round(rawOffset) },
+            `node clock is ${Math.round(Math.abs(rawOffset) / 1000)}s ${direction} the manager; normalising telemetry timestamps`
+          );
+          this.record({
+            category: "telemetry",
+            event: "telemetry.clock_skew",
+            message: `node clock is ${Math.round(Math.abs(rawOffset) / 1000)}s ${direction} the manager`,
+            roomId,
+            nodeId: event.data.nodeId,
+            data: { offsetMs: Math.round(rawOffset) }
+          });
+        }
+      }
 
       // Delta frames only carry players whose state changed. Apply them onto the
       // roster we already hold for the room so occupancy and level grouping stay
@@ -176,7 +213,32 @@ export class MoveCoordinator {
       }
 
       for (const player of incoming) {
-        this.telemetry.upsert(roomId, player);
+        const normalized: PlayerTelemetry = clockOffset === 0
+          ? player
+          : {
+              ...player,
+              ...(player.stateAt !== undefined ? { stateAt: asUnixMs(player.stateAt - clockOffset) } : {}),
+              ...(player.lastMoveAt !== undefined ? { lastMoveAt: asUnixMs(player.lastMoveAt - clockOffset) } : {})
+            };
+        const previous = this.telemetry.get(player.playerId);
+        const stored = this.telemetry.upsert(roomId, normalized, receivedAt);
+        // Surface level switches: "why was this room mixed?" is otherwise only
+        // answerable from raw telemetry.
+        if (
+          previous?.levelId !== undefined &&
+          stored.levelId !== undefined &&
+          previous.levelId !== stored.levelId
+        ) {
+          this.record({
+            category: "player",
+            event: "player.level_changed",
+            message: `level ${previous.levelId} -> ${stored.levelId}`,
+            roomId,
+            nodeId: event.data.nodeId,
+            playerIds: [player.playerId],
+            data: { from: previous.levelId, to: stored.levelId }
+          });
+        }
         // Track every player, not only those with a known level: the location
         // is also restored from telemetry after a manager restart now that
         // reconnects no longer replay one player.join per player.
@@ -374,7 +436,8 @@ export class MoveCoordinator {
       const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
       const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
       if (!source || !target || this.transactionsForPlayer(plan.playerIds).length > 0) continue;
-      const moveId = `move-${now}-${plan.playerIds.join("-")}`;
+      if (this.planSuppressed(plan.sourceRoomId, plan.targetRoomId, plan.playerIds, byRoom.get(plan.sourceRoomId) ?? [])) continue;
+      const moveId = this.nextMoveId("move", now);
       const tx: MoveTransaction = { ...plan, moveId, status: "prepared", createdAt: now, joinedPlayers: [], leftPlayers: [] };
       this.transactions.set(moveId, tx);
 
@@ -402,6 +465,9 @@ export class MoveCoordinator {
           data: { moveId, reason: plan.reason, sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId, gain: plan.gain }
         });
       } else if (outcome.reason === "failed") {
+        if (outcome.permanent) {
+          this.suppressPlan(plan.sourceRoomId, plan.targetRoomId, plan.playerIds, byRoom.get(plan.sourceRoomId) ?? []);
+        }
         this.queueCancel(target.roomId, moveId, plan.playerIds);
         this.transactions.set(moveId, { ...tx, status: "failed" });
         this.onMoveOutcome?.(plan.reason, "failed");
@@ -510,8 +576,14 @@ export class MoveCoordinator {
       this.recordSkippedLevelPlan(plan, "target_busy");
       return false;
     }
+    const sourcePlayers = this.telemetry.listRoom(plan.sourceRoomId as RoomId, now);
+    if (this.planSuppressed(plan.sourceRoomId, plan.targetRoomId, plan.playerIds, sourcePlayers)) {
+      this.log?.debug({ sourceRoomId: plan.sourceRoomId, targetRoomId: plan.targetRoomId }, "level isolation skipped: identical plan was rejected");
+      this.recordSkippedLevelPlan(plan, "previously_rejected");
+      return false;
+    }
 
-    const moveId = `level-isolation-${plan.levelId}-${now}-${plan.playerIds.join("-")}`;
+    const moveId = this.nextMoveId("isolation", now, String(plan.levelId));
     const tx: LevelMoveTransaction = { ...plan, moveId, status: "prepared", createdAt: now, joinedPlayers: [], leftPlayers: [] };
     this.transactions.set(moveId, tx);
 
@@ -549,6 +621,7 @@ export class MoveCoordinator {
     }
 
     if (outcome.reason === "failed") {
+      if (outcome.permanent) this.suppressPlan(plan.sourceRoomId, plan.targetRoomId, plan.playerIds, sourcePlayers);
       this.queueCancel(target.roomId, moveId, plan.playerIds);
       this.transactions.set(moveId, { ...tx, status: "failed" });
       this.onMoveOutcome?.(plan.reason, "failed");
@@ -584,6 +657,22 @@ export class MoveCoordinator {
     return false;
   }
 
+  /**
+   * Compact, unique move id. The previous format appended every player UUID,
+   * which exceeded the 128-character protocol limit for groups of three or
+   * more. The destination node then echoed that over-long id in move.result /
+   * move.completed, the manager rejected its own event, the transaction never
+   * settled and the target reservation expired. Player ids are already in the
+   * event payloads and logs, so the id does not need them.
+   */
+  private nextMoveId(kind: string, now: number, tag?: string): string {
+    this.moveSeq += 1;
+    const suffix = this.moveSeq.toString(36);
+    return tag === undefined
+      ? `${kind}-${now.toString(36)}-${suffix}`
+      : `${kind}-${tag}-${now.toString(36)}-${suffix}`;
+  }
+
   /** Drop every per-room telemetry bookkeeping entry (room gone for good). */
   public forgetRoom(roomId: string): void {
     this.roomRoster.delete(roomId);
@@ -591,6 +680,11 @@ export class MoveCoordinator {
     this.telemetryGap.delete(roomId);
     this.telemetryGapWarnAt.delete(roomId);
     this.telemetryVersionWarnAt.delete(roomId);
+    this.clockSkewWarnAt.delete(roomId);
+    for (const key of [...this.suppressedPlans.keys()]) {
+      const pair = key.slice(0, key.indexOf(":")).split("->");
+      if (pair[0] === roomId || pair[1] === roomId) this.suppressedPlans.delete(key);
+    }
   }
 
   /** Record a structured event for GET /debug/logs (no-op without a sink). */
@@ -641,7 +735,7 @@ export class MoveCoordinator {
     const locations = playerIds.map((id) => this.rooms.getPlayerLocation(id as PlayerId));
     if (locations.some((location) => !location || location.roomId !== source.roomId)) throw new Error("one or more players are not in the source room");
 
-    const moveId = `debug-move-${now}-${playerIds.join("-")}`;
+    const moveId = this.nextMoveId("debug", now);
     const tx: MoveTransaction = {
       playerIds,
       sourceRoomId: source.roomId,
@@ -698,6 +792,42 @@ export class MoveCoordinator {
     return false;
   }
 
+  private roomSignature(players: PlayerTelemetry[]): string {
+    return players
+      .map((player) => `${player.playerId}:${player.levelId ?? "?"}`)
+      .sort()
+      .join(",");
+  }
+
+  private planKey(sourceRoomId: string, targetRoomId: string, playerIds: string[]): string {
+    return `${sourceRoomId}->${targetRoomId}:${[...playerIds].sort().join(",")}`;
+  }
+
+  /**
+   * A plan the node rejected permanently is not retried until the source
+   * room's roster changes. Replaces a retry backoff timer with observation:
+   * identical input, identical rejection.
+   */
+  private planSuppressed(sourceRoomId: string, targetRoomId: string, playerIds: string[], players: PlayerTelemetry[]): boolean {
+    const key = this.planKey(sourceRoomId, targetRoomId, playerIds);
+    const signature = this.suppressedPlans.get(key);
+    if (signature === undefined) return false;
+    if (signature === this.roomSignature(players)) return true;
+    this.suppressedPlans.delete(key);
+    return false;
+  }
+
+  private suppressPlan(sourceRoomId: string, targetRoomId: string, playerIds: string[], players: PlayerTelemetry[]): void {
+    if (this.suppressedPlans.size >= 1000) {
+      const oldest = this.suppressedPlans.keys().next().value;
+      if (oldest !== undefined) this.suppressedPlans.delete(oldest);
+    }
+    this.suppressedPlans.set(
+      this.planKey(sourceRoomId, targetRoomId, playerIds),
+      this.roomSignature(players)
+    );
+  }
+
   /**
    * True once the room's roster signature (playerId:levelId set) has been
    * identical for `confirmationCycles` consecutive planning cycles. Joins,
@@ -705,10 +835,7 @@ export class MoveCoordinator {
    * this is what replaces the old wall-clock room cooldown.
    */
   private isRoomStable(roomId: string, players: PlayerTelemetry[]): boolean {
-    const signature = players
-      .map((player) => `${player.playerId}:${player.levelId ?? "?"}`)
-      .sort()
-      .join(",");
+    const signature = this.roomSignature(players);
     const previous = this.roomStability.get(roomId);
     const cycles = previous?.signature === signature ? previous.cycles + 1 : 1;
     this.roomStability.set(roomId, { signature, cycles });

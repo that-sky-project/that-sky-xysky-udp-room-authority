@@ -50,7 +50,8 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
     // A wrong-level room must lose to any same-level or empty room that has
     // capacity, so the penalty exceeds the widest possible fill bonus (8*7=56).
     sameLevelBonus: 20,
-    wrongLevelPenalty: 80
+    wrongLevelPenalty: 80,
+    unknownLevelPenalty: config.unknownLevelPenalty
   });
   const coordinator = new CrossCoordinator(nodes, rooms, pending, { commandTimeoutMs: config.commandTimeoutMs });
   const moves = new MoveCoordinator(rooms, nodes, pending, coordinator, {

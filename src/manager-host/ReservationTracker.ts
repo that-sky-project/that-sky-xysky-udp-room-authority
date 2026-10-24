@@ -54,6 +54,11 @@ export class ReservationTracker {
     this.release(playerId);
   }
 
+  /** Room currently held for this player, if any. */
+  public roomFor(playerId: PlayerId): RoomId | undefined {
+    return this.holdsByPlayer.get(playerId)?.roomId;
+  }
+
   public release(playerId: PlayerId): void {
     const hold = this.holdsByPlayer.get(playerId);
     if (!hold) return;

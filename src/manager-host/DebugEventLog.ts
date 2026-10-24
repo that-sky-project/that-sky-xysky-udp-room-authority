@@ -116,7 +116,9 @@ export class DebugEventLog {
     const last = entries[entries.length - 1];
     return {
       entries,
-      nextSince: last?.id ?? since ?? 0,
+      // With no matching entries a poller should still advance past the
+      // buffered window instead of re-reading the same filtered range forever.
+      nextSince: last?.id ?? (since !== undefined ? since : newestId ?? 0),
       oldestId,
       newestId,
       buffered: this.size,

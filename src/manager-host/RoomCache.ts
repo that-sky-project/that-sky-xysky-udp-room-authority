@@ -43,6 +43,13 @@ export class RoomCache {
   private readonly rooms: LRUCache<RoomId, RoomSnapshot>;
   private readonly roomsByNode = new Map<NodeId, Set<RoomId>>();
   private readonly playerLocations = new Map<PlayerId, PlayerLocation>();
+  /**
+   * Rooms whose occupancy was just seeded from room.created. Until the first
+   * telemetry frame arrives, player.join/leave events are ignored for counting:
+   * older node builds replay one join per online player right after
+   * room.created, which would double the occupancy for up to a full resync.
+   */
+  private readonly awaitingTelemetry = new Set<RoomId>();
   private readonly candidateBuckets = new Map<string, Array<Set<RoomId>>>();
   private readonly candidateIndex = new Map<RoomId, Array<{ key: string; bucket: number }>>();
   /** nodeId -> 时刻，表示该节点的连接已断开但仍处于宽限期。 */
@@ -92,6 +99,7 @@ export class RoomCache {
     this.removeCandidateIndex(roomId);
     this.rooms.delete(roomId);
     this.removeRoomIndex(roomId);
+    this.awaitingTelemetry.delete(roomId);
   }
 
   public getRoom(roomId: RoomId): RoomSnapshot | undefined {
@@ -296,6 +304,12 @@ export class RoomCache {
       for (const room of event.data.rooms) this.upsertRoom(room);
     }
 
+    // The first telemetry frame is authoritative for occupancy; from then on
+    // join/leave deltas are trusted again.
+    if (event.event === "room.telemetry" && event.data.roomId) {
+      this.awaitingTelemetry.delete(event.data.roomId);
+    }
+
     if (event.event === "room.destroyed" && event.data.roomId) {
       this.deleteRoom(event.data.roomId);
       return;
@@ -321,6 +335,7 @@ export class RoomCache {
         draining: existing?.draining ?? false,
         lastChangedAt: asUnixMs(Date.now())
       });
+      this.awaitingTelemetry.add(event.data.roomId);
     }
 
     if (event.event === "player.join" && event.data.player?.playerId && event.data.roomId) {
@@ -335,6 +350,9 @@ export class RoomCache {
   }
 
   private bumpPlayers(roomId: RoomId, delta: number, version?: number): void {
+    // room.created already reported the authoritative count; replayed joins
+    // from older node builds must not add to it before telemetry confirms it.
+    if (this.awaitingTelemetry.has(roomId)) return;
     const room = this.rooms.get(roomId);
     if (!room) return;
     this.upsertRoom({

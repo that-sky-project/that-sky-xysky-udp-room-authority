@@ -66,6 +66,28 @@ export class RequestRouter {
       }
     }
 
+    // A retry of the same allocation request while the first slot is still held
+    // must return the same room. Without this the client got a second
+    // room.reserve for the same player and a different score/room.
+    const heldRoomId = this.reservations.roomFor(playerId);
+    if (heldRoomId) {
+      const held = this.rooms.getRoom(heldRoomId);
+      if (held) {
+        this.log?.info({ playerId, roomId: held.roomId, reason: "pending_reservation" }, "room allocated");
+        this.record({
+          category: "allocation",
+          event: "allocation.reused",
+          message: `player ${playerId} reuses held room ${held.roomId}`,
+          roomId: held.roomId,
+          nodeId: held.nodeId,
+          playerIds: [playerId],
+          data: { reason: "pending_reservation", players: held.players, capacity: held.capacity }
+        });
+        return { code: ErrorCode.OK, data: this.assignmentFor(held, playerId) };
+      }
+      this.reservations.release(playerId);
+    }
+
     const nodeHealth = new Map(this.nodes.listHealthy(this.options.nodeStaleMs).map((node) => [node.nodeId as string, node]));
     const context = {
       playerId,
@@ -113,6 +135,7 @@ export class RequestRouter {
           players: selection.room.players,
           capacity: selection.room.capacity,
           level: context.level ?? null,
+          rawLevel: request.level ?? null,
           candidates: candidates.length + 1
         }, "room allocated");
         this.record({
@@ -128,6 +151,7 @@ export class RequestRouter {
             players: selection.room.players,
             capacity: selection.room.capacity,
             level: context.level ?? null,
+            rawLevel: request.level ?? null,
             candidates: candidates.length + 1
           }
         });
@@ -147,6 +171,7 @@ export class RequestRouter {
       playerIds: [playerId],
       data: {
         level: context.level ?? null,
+        rawLevel: request.level ?? null,
         candidates: candidates.length,
         rooms: this.rooms.listRooms().length,
         reservations: this.reservations.size()
