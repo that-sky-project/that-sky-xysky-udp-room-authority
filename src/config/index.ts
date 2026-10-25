@@ -42,6 +42,7 @@ export interface ManagerConfig {
   levelIsolationSparseRoomThreshold: number;
   levelChangeCooldownMs: number;
   joinSettleMs: number;
+  protectedLevels: number[];
   debugApiToken: string;
   debugLogBufferSize: number;
 }
@@ -128,7 +129,15 @@ const configSchema = z
         // A player who just joined a room (friend-join teleport / cross-room
         // move) is still loading the destination map and may briefly report
         // the previous level. Do not isolate the room until this settles.
-        join_settle_ms: positiveInt(4000)
+        join_settle_ms: positiveInt(4000),
+        // Level ids (maps) that quarantine their room. While a player is on
+        // one of these levels, nobody in the room is migrated or merged, and
+        // allocation keeps other levels out of the room. If another level
+        // intrudes, the protected level keeps the room and the intruding
+        // levels are moved out; players on a protected level are never moved.
+        // Protection ends when the last protected occupant changes level or
+        // leaves.
+        protected_levels: z.array(z.number().int().positive()).default([])
       })
       .default({}),
     debug: z
@@ -185,6 +194,7 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     levelIsolationSparseRoomThreshold: parsed.move.level_isolation_sparse_room_threshold,
     levelChangeCooldownMs: parsed.move.level_change_cooldown_ms,
     joinSettleMs: parsed.move.join_settle_ms,
+    protectedLevels: parsed.move.protected_levels,
     debugApiToken: parsed.debug.api_token,
     debugLogBufferSize: parsed.debug.log_buffer_size
   };

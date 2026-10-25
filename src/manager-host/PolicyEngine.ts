@@ -31,10 +31,18 @@ export interface PolicyEngineOptions {
    *  already holds a known level. Unknown plus occupied is exactly how mixed
    *  rooms are created, which isolation then has to undo. */
   unknownLevelPenalty: number;
+  /** Level ids (maps) whose rooms are quarantined. Allocation never places a
+   *  player of another level into such a room, and a player on a protected
+   *  level only joins an empty room or a room already running that level. */
+  protectedLevels: number[];
 }
 
 export class PolicyEngine {
-  public constructor(private readonly options: PolicyEngineOptions) {}
+  private readonly protectedLevels: Set<number>;
+
+  public constructor(private readonly options: PolicyEngineOptions) {
+    this.protectedLevels = new Set(options.protectedLevels.filter((id) => Number.isInteger(id) && id > 0));
+  }
 
   public selectRoom(
     context: RoomRequestContext,
@@ -56,7 +64,11 @@ export class PolicyEngine {
       const fillDistance = Math.abs(this.options.preferredFillTarget - fillAfterJoin);
       const regionScore = context.region && room.region === context.region ? this.options.sameRegionBonus : 0;
       const loadPenalty = health.load * this.options.loadPenaltyWeight;
-      const levelScore = this.levelScore(context.level, levelsOf(room));
+      const roomLevels = levelsOf(room);
+      // Protected rooms are a hard constraint, not a score: placing anyone
+      // there would make the isolation pass move them straight back out.
+      if (!this.levelAllowed(context.level, roomLevels)) continue;
+      const levelScore = this.levelScore(context.level, roomLevels);
       const score = 100 - fillDistance * 8 - freeSlots * 0.5 + regionScore - loadPenalty + levelScore;
 
       if (!best || score > best.score) {
@@ -64,6 +76,28 @@ export class PolicyEngine {
       }
     }
     return best;
+  }
+
+  /**
+   * Hard filter for protected (quarantined) levels.
+   *
+   * - A player on a protected level may only join an empty room or a room that
+   *   already runs exactly that level. Joining a different-level room would
+   *   force the isolation pass to evict the other occupants.
+   * - Any other player (including one whose level is unknown) is kept out of a
+   *   protected room entirely, because the eviction pass would move them out
+   *   again right after the reservation.
+   */
+  private levelAllowed(level: number | undefined, roomLevels: ReadonlySet<number>): boolean {
+    if (this.protectedLevels.size === 0) return true;
+    if (level !== undefined && this.protectedLevels.has(level)) {
+      if (roomLevels.size === 0) return true;
+      return roomLevels.size === 1 && roomLevels.has(level);
+    }
+    for (const roomLevel of roomLevels) {
+      if (this.protectedLevels.has(roomLevel)) return false;
+    }
+    return true;
   }
 
   /**

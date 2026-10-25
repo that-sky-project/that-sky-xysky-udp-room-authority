@@ -140,6 +140,7 @@ debug:
 | `move.transaction_timeout_ms` | `15000` | 迁移事务停滞多久后中止 |
 | `move.level_change_cooldown_ms` | `6000` | 玩家切图后的沉降窗口；窗口内该玩家不计入 level 分组、也不参与迁移决策 |
 | `move.join_settle_ms` | `4000` | 玩家刚加入房间（好友传送、跨房迁移）后的沉降窗口 |
+| `move.protected_levels` | `[]` | 受保护的地图 level id：有玩家在该 level 时，房间不迁移、不合并；分配时也不会把其他 level 放进该房间；若被其他 level 混入，则把混入的 level 拆出去（永不移动受保护玩家） |
 | `debug.api_token` | `""` | `/debug/*` 的 token；留空则不校验 |
 | `debug.log_buffer_size` | `2000` | `GET /debug/logs` 使用的内存事件环形缓冲区大小 |
 

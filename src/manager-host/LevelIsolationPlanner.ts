@@ -29,6 +29,12 @@ export interface LevelIsolationOptions {
    *  is still loading the destination map and may briefly report the previous
    *  level. Leave the room alone for this long before isolating anyone. */
   joinSettleMs: number;
+  /** Level ids (maps) that quarantine their room. A room holding one of these
+   *  levels is never merged and never migrated; if another level intrudes, the
+   *  protected level keeps the room and every other level is moved out. Players
+   *  on a protected level are never moved. Protection is level-based, so it
+   *  ends by itself when the last protected occupant changes level or leaves. */
+  protectedLevels: number[];
 }
 
 interface RoomLevelGroup {
@@ -42,7 +48,8 @@ const DEFAULT_OPTIONS: LevelIsolationOptions = {
   maxPlayersPerMove: 8,
   sparseRoomThreshold: 2,
   levelChangeCooldownMs: 6_000,
-  joinSettleMs: 4_000
+  joinSettleMs: 4_000,
+  protectedLevels: []
 };
 
 /**
@@ -57,9 +64,11 @@ const DEFAULT_OPTIONS: LevelIsolationOptions = {
  */
 export class LevelIsolationPlanner {
   private readonly options: LevelIsolationOptions;
+  private readonly protectedLevels: Set<number>;
 
   public constructor(options: Partial<LevelIsolationOptions> = {}) {
     this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.protectedLevels = new Set((options.protectedLevels ?? DEFAULT_OPTIONS.protectedLevels).filter((id) => Number.isInteger(id) && id > 0));
   }
 
   public plan(
@@ -98,23 +107,60 @@ export class LevelIsolationPlanner {
 
       let players = byRoom.get(room.roomId) ?? [];
 
+      // A room holding a protected level is quarantined. A clean protected
+      // room (every occupant on a protected level) is left completely alone —
+      // no isolation, no consolidation, no activity merge. If another level is
+      // present the room is mixed: the protected level owns the room and every
+      // other-level group is moved out to a clean same-level or empty room.
+      // Players on a protected level are never moved. The check is level-based,
+      // so protection ends by itself once the last protected occupant switches
+      // maps or leaves — the room then behaves normally again.
+      let forcedGroups: RoomLevelGroup[] = [];
+      const protectedPlayers = this.protectedLevels.size > 0
+        ? players.filter((p) => this.isProtectedLevel(p.levelId))
+        : [];
+      if (protectedPlayers.length > 0) {
+        const others = players.filter((p) => !this.isProtectedLevel(p.levelId));
+        if (others.length === 0) continue;
+        // An intruder who just arrived is still loading and may briefly report
+        // the wrong map; wait for the settling window before evicting anyone.
+        forcedGroups = this.groupByLevel(others, now);
+        if (forcedGroups.length === 0) continue;
+      }
+
       // Unsettled players are excluded from the groups below, but the room
-      // itself stays usable for its settled occupants.
-      let groups = this.groupByLevel(players, now);
+      // itself stays usable for its settled occupants. A protected room never
+      // runs the normal isolation pass — only the forced evictions above.
+      let groups = protectedPlayers.length > 0 ? [] : this.groupByLevel(players, now);
       // A room may hold three or more levels. Keep draining its minority levels
       // in the same cycle until one is left, so a single mixed room does not
       // need one cooldown window per stray level.
-      while (groups.length >= 2 && budget > 0) {
-        const source = this.pickSourceGroup(groups);
-        if (!source || source.players.length < this.options.minLevelPlayers) break;
+      while ((forcedGroups.length > 0 || groups.length >= 2) && budget > 0) {
+        const forced = forcedGroups.shift();
+        const source: RoomLevelGroup | undefined = forced ?? this.pickSourceGroup(groups);
+        if (!source) break;
+        // A forced eviction always runs, whatever minLevelPlayers says: the
+        // point is to un-mix a protected room, not to avoid tiny migrations.
+        if (!forced && source.players.length < this.options.minLevelPlayers) break;
 
         const movable = source.players.filter((p) => !claimedPlayers.has(p.playerId as string));
-        if (movable.length === 0) break;
+        if (movable.length === 0) {
+          if (forced) continue;
+          break;
+        }
+        // Hand-holding friends travel together. When one of them changes level,
+        // the pair temporarily spans two level groups; isolating the changed
+        // player alone tears the pair apart. Expand the group with bonded peers
+        // (transitively) so the whole chain moves to the new level together.
+        // A forced eviction never expands: the group being moved is the
+        // non-protected side, and dragging a bonded protected player along
+        // would defeat the quarantine.
+        if (!forced) this.expandBonded(movable, players, claimedPlayers);
 
         // Try candidate targets in priority order; use the first one that can
         // fit the whole bonded group (hand-holding friends travel together).
         let picked: { target: RoomSnapshot; selected: StoredTelemetry[] } | undefined;
-        for (const candidate of this.targetCandidates(source.levelId, room.roomId, rooms, levelsByRoom, occupancy, byRoom, movable, now)) {
+        for (const candidate of this.targetCandidates(source.levelId, room.roomId, rooms, levelsByRoom, occupancy, byRoom, movable, now, !forced)) {
           const cap = Math.max(0, candidate.capacity - (occupancy.get(candidate.roomId) ?? 0));
           const sel = this.selectBondedGroups(movable, cap, Math.min(this.options.maxPlayersPerMove, budget));
           if (sel.length > 0) { picked = { target: candidate, selected: sel }; break; }
@@ -126,6 +172,9 @@ export class LevelIsolationPlanner {
             roomCount: rooms.length,
             emptyRooms: [...occupancy.values()].filter((v) => v === 0).length
           }, "level isolation: no target fits the bonded group");
+          // A protected room may hold several intruding levels; keep trying the
+          // remaining ones so the room still converges when one has no target.
+          if (forced) continue;
           break;
         }
 
@@ -163,6 +212,9 @@ export class LevelIsolationPlanner {
         if (!players.some((p) => p.levelId === source.levelId)) {
           levelsByRoom.get(room.roomId)?.delete(source.levelId);
         }
+        // Protected room: only the forced evictions run, never the normal
+        // isolation pass, so the (stale) level groups are not recomputed.
+        if (forced) continue;
         groups = this.groupByLevel(players, now);
       }
     }
@@ -204,6 +256,8 @@ export class LevelIsolationPlanner {
       const levelId = [...levels][0];
       if (levelId === undefined) continue;
       const unsettled = this.hasUnsettled(byRoom.get(room.roomId) ?? [], now);
+      // Protected levels are never merged (neither as source nor as target).
+      if (this.hasProtected(byRoom.get(room.roomId) ?? [])) continue;
       // A room with a player who has not settled yet is "expecting" them
       // (friend-join / cross-room arrival). Do not drain it or fill it until
       // the arrival is resolved; moving the resident out is exactly what
@@ -397,6 +451,16 @@ export class LevelIsolationPlanner {
     return newest;
   }
 
+  /** Whether this level is a protected (quarantined) map. */
+  private isProtectedLevel(levelId: number | undefined): boolean {
+    return levelId !== undefined && this.protectedLevels.has(levelId);
+  }
+
+  /** True when at least one occupant is on a protected level. */
+  private hasProtected(players: StoredTelemetry[]): boolean {
+    return players.some((player) => this.isProtectedLevel(player.levelId));
+  }
+
   /**
    * A player's level is settled once they have been in the room for a moment
    * and have not just switched level. While unsettled, their reported level is
@@ -411,6 +475,38 @@ export class LevelIsolationPlanner {
   /** True while any occupant of the room is still settling. */
   private hasUnsettled(players: StoredTelemetry[], now: number): boolean {
     return players.some((player) => !this.isSettled(player, now));
+  }
+
+  /**
+   * Add bonded peers (affinity ≥ 0.9, transitively) to `movable`. A
+   * hand-holding chain must not be split by level isolation: when one member
+   * loads the new map, the others are pulled through the portal too, so they
+   * travel to the same target room even though their reported level is still
+   * the old one.
+   */
+  private expandBonded(
+    movable: StoredTelemetry[],
+    roomPlayers: StoredTelemetry[],
+    claimed: Set<string>
+  ): void {
+    const included = new Set(movable.map((player) => player.playerId as string));
+    const queue = [...movable];
+    while (queue.length > 0) {
+      const player = queue.pop();
+      if (!player) break;
+      for (const other of roomPlayers) {
+        const otherId = other.playerId as string;
+        if (included.has(otherId) || claimed.has(otherId)) continue;
+        const affinity = Math.max(
+          player.affinity?.[otherId] ?? 0,
+          other.affinity?.[player.playerId as string] ?? 0
+        );
+        if (affinity < 0.9) continue;
+        included.add(otherId);
+        movable.push(other);
+        queue.push(other);
+      }
+    }
   }
 
   /**
@@ -438,6 +534,10 @@ export class LevelIsolationPlanner {
    *
    * Priority: clean same-level room > empty room > mixed room with this level.
    * Within the first tier, rooms are sorted by spatial proximity then occupancy.
+   *
+   * `allowMixed = false` drops the last tier. A forced eviction from a
+   * protected room uses that: its intruders must land in a clean room, never in
+   * another mixed room.
    */
   private targetCandidates(
     levelId: number,
@@ -447,11 +547,15 @@ export class LevelIsolationPlanner {
     occupancy: Map<string, number>,
     byRoom: Map<string, StoredTelemetry[]>,
     sourcePlayers: StoredTelemetry[],
-    now: number
+    now: number,
+    allowMixed = true
   ): RoomSnapshot[] {
     const isUsable = (room: RoomSnapshot): boolean => {
       if (room.roomId === sourceRoomId || room.draining) return false;
       if ((occupancy.get(room.roomId) ?? 0) >= room.capacity) return false;
+      // Never pull players into a room holding a protected level; it is
+      // quarantined and belongs to whoever is already on that map.
+      if (this.hasProtected(byRoom.get(room.roomId) ?? [])) return false;
       // Never pull players into a room that still has an unsettled player.
       return !this.hasUnsettled(byRoom.get(room.roomId) ?? [], now);
     };
@@ -481,6 +585,7 @@ export class LevelIsolationPlanner {
       })
       .sort(byProximity);
 
+    if (!allowMixed) return [...sameLevel, ...empty];
     return [...sameLevel, ...empty, ...mixed];
   }
 

@@ -40,6 +40,9 @@ export interface MovePlannerOptions {
   /** A player who just joined the room may still be loading the destination
    *  map (friend-join teleport); do not migrate anyone until it settles. */
   joinSettleMs: number;
+  /** Level ids (maps) that quarantine their room: no merge in or out while a
+   *  player is on one of these levels. */
+  protectedLevels: number[];
 }
 
 const clamp = (value: number): number => Math.max(0, Math.min(1, value));
@@ -59,16 +62,19 @@ const DEFAULT_OPTIONS: MovePlannerOptions = {
   stalePressureWeight: 0.4,
   clusterSplitPenalty: 0.05,
   levelChangeCooldownMs: 6_000,
-  joinSettleMs: 4_000
+  joinSettleMs: 4_000,
+  protectedLevels: []
 };
 
 export class MovePlanner {
   private weights = { ...WEIGHT_BASE };
   private reliability: Record<WeightField, number> = { occupancy: 0.5, freshness: 0.5, movement: 0.5, social: 0.5, spatial: 0.5 };
   private readonly options: MovePlannerOptions;
+  private readonly protectedLevels: Set<number>;
 
   public constructor(options: Partial<MovePlannerOptions> = {}) {
     this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.protectedLevels = new Set((options.protectedLevels ?? DEFAULT_OPTIONS.protectedLevels).filter((id) => Number.isInteger(id) && id > 0));
   }
 
   public getWeights(): Readonly<typeof this.weights> { return { ...this.weights }; }
@@ -113,6 +119,8 @@ export class MovePlanner {
       const sourceRoom = rooms.find((room) => room.roomId === source.roomId);
       const roomPlayers = byRoom.get(source.roomId) ?? [];
       if (!sourceRoom) continue;
+      // A room holding a protected level is quarantined: no merge in or out.
+      if (this.hasProtected(roomPlayers)) continue;
       // A room that is expecting an unsettled arrival (friend-join, cross-room
       // move) must not be drained: the resident is usually the person being
       // joined, and moving them breaks the join.
@@ -177,6 +185,8 @@ export class MovePlanner {
       .find((room) => {
         if (!room || room.capacity - room.players <= 0) return false;
         const targetPlayers = byRoom.get(room.roomId) ?? [];
+        // Never move anyone into a room holding a protected level.
+        if (this.hasProtected(targetPlayers)) return false;
         // Never move anyone into a room whose occupants are still settling.
         if (targetPlayers.some((player) => !this.isSettled(player, now))) return false;
         // Empty room, or every occupant already on the requested level. A
@@ -197,6 +207,12 @@ export class MovePlanner {
       groups.set(player.levelId, group);
     }
     return groups;
+  }
+
+  /** True when at least one occupant is on a protected (quarantined) level. */
+  private hasProtected(players: StoredTelemetry[]): boolean {
+    if (this.protectedLevels.size === 0) return false;
+    return players.some((player) => player.levelId !== undefined && this.protectedLevels.has(player.levelId));
   }
 
   /**

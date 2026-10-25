@@ -294,7 +294,32 @@ export class MoveCoordinator {
         }
         const current = this.telemetry.get(event.data.player.playerId);
         if (!current || current.roomId === event.data.roomId) this.telemetry.remove(event.data.player.playerId);
-      } else if (event.data.roomId) this.telemetry.upsert(event.data.roomId, { playerId: event.data.player.playerId });
+      } else if (event.data.roomId) {
+        // Feed the JoinGame level into the store now. It is authoritative for
+        // the new room, and a level that differs from the previous room starts
+        // the settling window at join time instead of waiting for telemetry.
+        const joinLevel = event.data.player.level;
+        const previous = this.telemetry.get(event.data.player.playerId);
+        const stored = this.telemetry.upsert(event.data.roomId, {
+          playerId: event.data.player.playerId,
+          ...(joinLevel !== undefined ? { levelId: joinLevel } : {})
+        });
+        if (
+          previous?.levelId !== undefined &&
+          stored.levelId !== undefined &&
+          previous.levelId !== stored.levelId
+        ) {
+          this.record({
+            category: "player",
+            event: "player.level_changed",
+            message: `level ${previous.levelId} -> ${stored.levelId}`,
+            roomId: event.data.roomId,
+            nodeId: event.data.nodeId,
+            playerIds: [event.data.player.playerId],
+            data: { from: previous.levelId, to: stored.levelId, source: "player.join" }
+          });
+        }
+      }
       if (event.event === "player.join" && event.data.roomId) {
         for (const tx of this.transactions.values()) {
           if (tx.status === "committed" && tx.targetRoomId === event.data.roomId && tx.playerIds.includes(event.data.player.playerId as string)) {
@@ -412,13 +437,23 @@ export class MoveCoordinator {
 
     const plans = this.planner.plan(rooms, byRoom, now);
     const usedTargets = new Set<string>(); let moveBudget = this.options.moveBudgetPerCycle ?? 8;
+    // Rooms touched by the isolation pass are owned by it for this cycle: the
+    // activity planner moved players straight back out of a room that isolation
+    // had just filled, which made a player travel A -> B -> A within seconds.
+    const isolationRooms = new Set<string>();
+    for (const isolationPlan of isolationPlans) {
+      isolationRooms.add(isolationPlan.sourceRoomId);
+      isolationRooms.add(isolationPlan.targetRoomId);
+    }
 
     for (const isolationPlan of isolationPlans) {
       // A room with three or more levels produces one plan per stray level, so
       // the source room is allowed to repeat; only the destination must be
       // unique, since one target room cannot absorb two concurrent moves.
       if (moveBudget < isolationPlan.playerIds.length || usedTargets.has(isolationPlan.targetRoomId)) continue;
-      if (this.roomHasActiveMove(isolationPlan.targetRoomId)) continue;
+      // Same-cycle plans are allowed to chain; only transactions from an
+      // earlier cycle make the room busy.
+      if (this.roomBusy(isolationPlan.sourceRoomId, now) || this.roomBusy(isolationPlan.targetRoomId, now)) continue;
       const executed = await this.executeLevelIsolation(isolationPlan, now, signal);
       if (executed) {
         usedTargets.add(isolationPlan.targetRoomId);
@@ -428,11 +463,10 @@ export class MoveCoordinator {
 
     for (const plan of plans) {
       if (moveBudget < plan.playerIds.length || usedTargets.has(plan.targetRoomId)) continue;
-      // A target with a prepared/committed transaction is being written to
-      // right now; a source with one only has those players blocked, which
-      // transactionsForPlayer() below covers.
-      if (this.roomHasActiveMove(plan.targetRoomId)) continue;
-      if (isolationPlans.some((isolationPlan) => isolationPlan.sourceRoomId === plan.sourceRoomId)) continue;
+      if (isolationRooms.has(plan.sourceRoomId) || isolationRooms.has(plan.targetRoomId)) continue;
+      // A room involved in a move from an earlier cycle is still settling; do
+      // not plan another move into or out of it until that transaction ends.
+      if (this.roomBusy(plan.sourceRoomId, now) || this.roomBusy(plan.targetRoomId, now)) continue;
       const source = this.rooms.getRoom(plan.sourceRoomId as RoomId);
       const target = this.rooms.getRoom(plan.targetRoomId as RoomId);
       if (!source || !target || this.transactionsForPlayer(plan.playerIds).length > 0) continue;
@@ -571,8 +605,8 @@ export class MoveCoordinator {
     }
     // The source room may legitimately appear in several plans in one cycle when
     // it holds three or more levels; only the destination has to be exclusive.
-    if (this.roomHasActiveMove(plan.targetRoomId)) {
-      this.log?.debug({ targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: target already has an in-flight move");
+    if (this.roomBusy(plan.targetRoomId, now)) {
+      this.log?.debug({ targetRoomId: plan.targetRoomId, levelId: plan.levelId }, "level isolation skipped: target has an in-flight move");
       this.recordSkippedLevelPlan(plan, "target_busy");
       return false;
     }
@@ -783,11 +817,14 @@ export class MoveCoordinator {
   }
   private transactionsForPlayer(playerIds: string[]): Array<MoveTransaction | LevelMoveTransaction> { return [...this.transactions.values()].filter((tx) => tx.status === "prepared" || tx.status === "committed").filter((tx) => tx.playerIds.some((id) => playerIds.includes(id))); }
 
-  /** A target room with a prepared/committed transaction is being written to. */
-  private roomHasActiveMove(roomId: string): boolean {
+  /** True when a room is involved in a transaction started in an earlier cycle. */
+  private roomBusy(roomId: string, cycleNow: number): boolean {
     for (const tx of this.transactions.values()) {
       if (tx.status !== "prepared" && tx.status !== "committed") continue;
-      if (tx.targetRoomId === roomId) return true;
+      // Transactions created by this cycle are allowed to chain (a room with
+      // several stray levels is drained in one pass).
+      if (tx.createdAt >= cycleNow) continue;
+      if (tx.sourceRoomId === roomId || tx.targetRoomId === roomId) return true;
     }
     return false;
   }

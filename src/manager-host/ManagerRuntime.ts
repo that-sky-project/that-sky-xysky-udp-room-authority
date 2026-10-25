@@ -51,7 +51,11 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
     // capacity, so the penalty exceeds the widest possible fill bonus (8*7=56).
     sameLevelBonus: 20,
     wrongLevelPenalty: 80,
-    unknownLevelPenalty: config.unknownLevelPenalty
+    unknownLevelPenalty: config.unknownLevelPenalty,
+    // Protected maps are a hard allocation constraint: nobody of another level
+    // may be placed into their room (the isolation pass would evict them again)
+    // and they may only join empty or same-level rooms.
+    protectedLevels: config.protectedLevels
   });
   const coordinator = new CrossCoordinator(nodes, rooms, pending, { commandTimeoutMs: config.commandTimeoutMs });
   const moves = new MoveCoordinator(rooms, nodes, pending, coordinator, {
@@ -68,14 +72,16 @@ export const createManagerRuntime = (config: ManagerConfig, logger?: Logger): Ma
       minimumGain: config.moveMinimumGain,
       levelChangeCooldownMs: config.levelChangeCooldownMs,
       joinSettleMs: config.joinSettleMs,
-      clusterSplitPenalty: config.moveClusterSplitPenalty
+      clusterSplitPenalty: config.moveClusterSplitPenalty,
+      protectedLevels: config.protectedLevels
     },
     levelIsolation: {
       minLevelPlayers: config.levelIsolationMinLevelPlayers,
       maxPlayersPerMove: config.levelIsolationMaxPlayers,
       sparseRoomThreshold: config.levelIsolationSparseRoomThreshold,
       levelChangeCooldownMs: config.levelChangeCooldownMs,
-      joinSettleMs: config.joinSettleMs
+      joinSettleMs: config.joinSettleMs,
+      protectedLevels: config.protectedLevels
     }
   }, logger, (reason, status) => metrics.inc("qwd_move_total", [reason, status]), () => metrics.inc("qwd_telemetry_gap_total"), events);
   const router = new RequestRouter(rooms, nodes, policy, reservations, coordinator, {

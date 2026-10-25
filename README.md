@@ -145,6 +145,7 @@ debug:
 | `move.transaction_timeout_ms` | `15000` | Abort a stalled move transaction after this |
 | `move.level_change_cooldown_ms` | `6000` | Per-player settling window after a level change; the player is excluded from level grouping and migration decisions during it |
 | `move.join_settle_ms` | `4000` | Per-player settling window after joining a room (friend-join teleport, cross-room move) |
+| `move.protected_levels` | `[]` | Level ids whose room is quarantined: no migration or merge while a player is on that level; allocation keeps other levels out; a room made mixed by an intruding level is cleaned by moving the intruders out (never the protected players) |
 | `debug.api_token` | `""` | Token for `/debug/*`; empty disables the check |
 | `debug.log_buffer_size` | `2000` | In-memory event history behind `GET /debug/logs` |
 
