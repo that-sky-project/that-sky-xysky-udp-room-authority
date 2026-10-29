@@ -211,3 +211,35 @@ export interface RoomAssignment {
   udpPort: Port;
   expiresAt: UnixMs;
 }
+
+/**
+ * Chat is delivered per room, so the caller needs the room of every online
+ * player at once. The single-player route would turn one broadcast into one
+ * HTTP request per recipient.
+ */
+export const BatchRoomLookupSchema = z
+  .object({
+    playerIds: z.array(stringId).min(1).max(1000)
+  })
+  .strict();
+
+export type BatchRoomLookup = z.infer<typeof BatchRoomLookupSchema>;
+
+/**
+ * A player the manager does not know (never placed, or already left) maps to
+ * `null`: "not in a room" is a normal state, not a failed lookup, and the caller
+ * must be able to tell it apart from an error.
+ *
+ * The shape matches the existing GET /players/:id/room reply so both routes can
+ * share one builder and current consumers keep working unchanged.
+ */
+export interface RoomLookup {
+  playerId: PlayerId;
+  roomId: RoomId;
+  udp: { host: UdpHost; port: Port };
+  players: number;
+  capacity: number;
+  level: number | null;
+  levelId: number | null;
+  updatedAt: UnixMs;
+}

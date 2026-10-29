@@ -9,8 +9,8 @@ import type { ManagerRuntime } from "./ManagerRuntime.js";
 import type { NodeTransport } from "./NodeRegistry.js";
 import { HeartbeatMonitor } from "./HeartbeatMonitor.js";
 import { MetricsRegistry, registerManagerMetrics } from "./MetricsRegistry.js";
-import { asNodeId, asPlayerId, asProtocolVersion, asRoomId, asUnixMs } from "../types/branded.js";
-import { AllocationRequestSchema, NodeAckSchema, NodeEventSchema, type IManagerCommand, type INodeEvent } from "../types/contracts.js";
+import { asNodeId, asPlayerId, asProtocolVersion, asRoomId, asUnixMs, type PlayerId } from "../types/branded.js";
+import { AllocationRequestSchema, BatchRoomLookupSchema, NodeAckSchema, NodeEventSchema, type IManagerCommand, type INodeEvent, type RoomLookup } from "../types/contracts.js";
 import { ErrorCode, HermesError, isHermesError } from "../types/errors.js";
 
 interface NodeConnectionState {
@@ -303,26 +303,22 @@ export class ManagerGateway {
         if (!encodedPlayerId) throw new HermesError(ErrorCode.BAD_REQUEST, "playerId is required");
         const playerId = asPlayerId(decodeURIComponent(encodedPlayerId));
 
-        const location = this.runtime.rooms.getPlayerLocation(playerId);
-        if (!location) throw new HermesError(ErrorCode.NOT_FOUND, "player is not in any known room", { playerId });
+        const data = this.lookupRoom(playerId);
+        if (!data) throw new HermesError(ErrorCode.NOT_FOUND, "player is not in any known room", { playerId });
+        this.writeJson(res, 200, { code: ErrorCode.OK, data });
+        return;
+      }
 
-        const room = this.runtime.rooms.getRoom(location.roomId);
-        if (!room) throw new HermesError(ErrorCode.NOT_FOUND, "player room is no longer available", { playerId, roomId: location.roomId });
-
-        const telemetry = this.runtime.moves.telemetry.get(playerId);
-        this.writeJson(res, 200, {
-          code: ErrorCode.OK,
-          data: {
-            playerId,
-            roomId: room.roomId,
-            udp: { host: room.udpHost, port: room.udpPort },
-            players: room.players,
-            capacity: room.capacity,
-            level: location.level ?? null,
-            levelId: telemetry?.levelId ?? null,
-            updatedAt: location.updatedAt
-          }
-        });
+      // Batch form of the route above. Chat fan-out needs the room of every
+      // online player at once; one request per recipient would put the manager
+      // on the critical path of every chat message.
+      if (method === "POST" && url.pathname === "/players/rooms") {
+        const request = BatchRoomLookupSchema.parse(JSON.parse(await this.readBody(req, 256 * 1024)));
+        const rooms: Record<string, ReturnType<ManagerGateway["lookupRoom"]>> = {};
+        for (const playerId of request.playerIds) {
+          rooms[playerId] = this.lookupRoom(asPlayerId(playerId));
+        }
+        this.writeJson(res, 200, { code: ErrorCode.OK, data: { rooms } });
         return;
       }
 
@@ -694,6 +690,31 @@ export class ManagerGateway {
     } catch (error) {
       this.writeJson(res, 200, this.errorReply(error));
     }
+  }
+
+  /**
+   * Room view for one player, shared by the single and batch lookup routes.
+   * Returns null when the player is unknown or their room is already gone;
+   * "not in a room" is a normal state for a client that has not been placed yet.
+   */
+  private lookupRoom(playerId: PlayerId): RoomLookup | null {
+    const location = this.runtime.rooms.getPlayerLocation(playerId);
+    if (!location) return null;
+
+    const room = this.runtime.rooms.getRoom(location.roomId);
+    if (!room) return null;
+
+    const telemetry = this.runtime.moves.telemetry.get(playerId);
+    return {
+      playerId,
+      roomId: room.roomId,
+      udp: { host: room.udpHost, port: room.udpPort },
+      players: room.players,
+      capacity: room.capacity,
+      level: location.level ?? null,
+      levelId: telemetry?.levelId ?? null,
+      updatedAt: location.updatedAt
+    };
   }
 
   private requireDebugToken(req: IncomingMessage): void {
