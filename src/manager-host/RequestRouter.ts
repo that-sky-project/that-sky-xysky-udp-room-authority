@@ -1,152 +1,204 @@
-import type { CrossCoordinator } from "./CrossCoordinator.js";
-import type { DebugEventInput, DebugEventLog } from "./DebugEventLog.js";
-import type { NodeRegistry } from "./NodeRegistry.js";
-import type { PolicyEngine } from "./PolicyEngine.js";
-import type { ReservationTracker } from "./ReservationTracker.js";
-import type { RoomCache } from "./RoomCache.js";
-import type { Logger } from "../infra/logger/logger.js";
-import { asUnixMs, type PlayerId, type RoomId } from "../types/branded.js";
-import type { IAllocationReply, IAllocationRequest, RoomAssignment } from "../types/contracts.js";
-import { ErrorCode, HermesError, isHermesError } from "../types/errors.js";
+import type { CrossCoordinator } from './CrossCoordinator.js'
+import type { DebugEventInput, DebugEventLog } from './DebugEventLog.js'
+import type { NodeRegistry } from './NodeRegistry.js'
+import type { PolicyEngine } from './PolicyEngine.js'
+import type { ReservationTracker } from './ReservationTracker.js'
+import type { RoomCache } from './RoomCache.js'
+import type { Logger } from '../infra/logger/logger.js'
+import { asUnixMs, type PlayerId, type RoomId } from '../types/branded.js'
+import type {
+  IAllocationReply,
+  IAllocationRequest,
+  RoomAssignment
+} from '../types/contracts.js'
+import { ErrorCode, HermesError, isHermesError } from '../types/errors.js'
 
 export interface RequestRouterOptions {
-  nodeStaleMs: number;
-  assignmentTtlMs: number;
-  candidateRoomLimit: number;
-  /** Fill target the candidate scan aims for; must match the policy score. */
-  preferredFillTarget: number;
+  nodeStaleMs: number
+  assignmentTtlMs: number
+  candidateRoomLimit: number
+  preferredFillTarget: number
 }
 
-const EMPTY_LEVELS: ReadonlySet<number> = new Set<number>();
+const EMPTY_LEVELS: ReadonlySet<number> = new Set<number>()
 
 export class RequestRouter {
-  public constructor(
+  public constructor (
     private readonly rooms: RoomCache,
     private readonly nodes: NodeRegistry,
     private readonly policy: PolicyEngine,
     private readonly reservations: ReservationTracker,
     private readonly coordinator: CrossCoordinator,
     private readonly options: RequestRouterOptions,
-    // Move reservations live in the MoveCoordinator's TelemetryStore; fold them
-    // into the effective occupancy so allocation never fills slots an in-flight
-    // move already claimed on the same target room.
     private readonly moveReserved: (roomId: RoomId) => number = () => 0,
     private readonly log?: Logger,
     /** Structured operational history surfaced by GET /debug/logs. */
     private readonly events?: DebugEventLog
   ) {}
 
-  public async allocate(request: IAllocationRequest, signal?: AbortSignal): Promise<IAllocationReply> {
+  public async allocate (
+    request: IAllocationRequest,
+    signal?: AbortSignal
+  ): Promise<IAllocationReply> {
     try {
-      return await this.requestRoom(request, signal);
+      return await this.requestRoom(request, signal)
     } catch (error) {
       if (isHermesError(error)) {
-        return { code: error.code, data: { message: error.message, details: error.details } };
+        return {
+          code: error.code,
+          data: { message: error.message, details: error.details }
+        }
       }
-      return { code: ErrorCode.INTERNAL, data: { message: error instanceof Error ? error.message : String(error) } };
+      return {
+        code: ErrorCode.INTERNAL,
+        data: {
+          message: error instanceof Error ? error.message : String(error)
+        }
+      }
     }
   }
 
-  private async requestRoom(request: IAllocationRequest, signal?: AbortSignal): Promise<IAllocationReply> {
-    const playerId = request.playerId;
-    const knownLocation = this.rooms.getPlayerLocation(playerId);
+  private async requestRoom (
+    request: IAllocationRequest,
+    signal?: AbortSignal
+  ): Promise<IAllocationReply> {
+    const playerId = request.playerId
+    const knownLocation = this.rooms.getPlayerLocation(playerId)
     if (knownLocation) {
-      const room = this.rooms.getRoom(knownLocation.roomId);
+      const room = this.rooms.getRoom(knownLocation.roomId)
       if (room) {
-        this.log?.info({ playerId, roomId: room.roomId, reason: "known_location", players: room.players }, "room allocated");
+        this.log?.info(
+          {
+            playerId,
+            roomId: room.roomId,
+            reason: 'known_location',
+            players: room.players
+          },
+          'room allocated'
+        )
         this.record({
-          category: "allocation",
-          event: "allocation.known",
+          category: 'allocation',
+          event: 'allocation.known',
           message: `player ${playerId} already belongs to room ${room.roomId}`,
           roomId: room.roomId,
           playerIds: [playerId],
-          data: { reason: "known_location", players: room.players, capacity: room.capacity }
-        });
-        return { code: ErrorCode.OK, data: this.assignmentFor(room, playerId) };
+          data: {
+            reason: 'known_location',
+            players: room.players,
+            capacity: room.capacity
+          }
+        })
+        return { code: ErrorCode.OK, data: this.assignmentFor(room, playerId) }
       }
     }
 
-    // A retry of the same allocation request while the first slot is still held
-    // must return the same room. Without this the client got a second
-    // room.reserve for the same player and a different score/room.
-    const heldRoomId = this.reservations.roomFor(playerId);
+    const heldRoomId = this.reservations.roomFor(playerId)
     if (heldRoomId) {
-      const held = this.rooms.getRoom(heldRoomId);
+      const held = this.rooms.getRoom(heldRoomId)
       if (held) {
-        this.log?.info({ playerId, roomId: held.roomId, reason: "pending_reservation" }, "room allocated");
+        this.log?.info(
+          { playerId, roomId: held.roomId, reason: 'pending_reservation' },
+          'room allocated'
+        )
         this.record({
-          category: "allocation",
-          event: "allocation.reused",
+          category: 'allocation',
+          event: 'allocation.reused',
           message: `player ${playerId} reuses held room ${held.roomId}`,
           roomId: held.roomId,
           nodeId: held.nodeId,
           playerIds: [playerId],
-          data: { reason: "pending_reservation", players: held.players, capacity: held.capacity }
-        });
-        return { code: ErrorCode.OK, data: this.assignmentFor(held, playerId) };
+          data: {
+            reason: 'pending_reservation',
+            players: held.players,
+            capacity: held.capacity
+          }
+        })
+        return { code: ErrorCode.OK, data: this.assignmentFor(held, playerId) }
       }
-      this.reservations.release(playerId);
+      this.reservations.release(playerId)
     }
 
-    const nodeHealth = new Map(this.nodes.listHealthy(this.options.nodeStaleMs).map((node) => [node.nodeId as string, node]));
+    const nodeHealth = new Map(
+      this.nodes
+        .listHealthy(this.options.nodeStaleMs)
+        .map(node => [node.nodeId as string, node])
+    )
     const context = {
       playerId,
       region: request.region,
-      // 0 is not a real level id. Treat it as "unknown" so a room holding a
-      // real level is not scored as a wrong-level room.
-      level: request.level !== undefined && request.level > 0 ? request.level : undefined,
+      level:
+        request.level !== undefined && request.level > 0
+          ? request.level
+          : undefined,
       preferences: request.preferences
-    };
+    }
 
     const candidates = this.rooms.listCandidateRooms({
       region: request.region,
       preferredFillTarget: this.options.preferredFillTarget,
       limit: this.options.candidateRoomLimit
-    });
-    const levelsByRoom = this.rooms.levelsByRoom();
+    })
+    const levelsByRoom = this.rooms.levelsByRoom()
 
     while (candidates.length > 0) {
       const selection = this.policy.selectRoom(
         context,
         candidates,
         nodeHealth,
-        (room) => this.reservations.effectivePlayers(room) + this.moveReserved(room.roomId),
-        (room) => levelsByRoom.get(room.roomId) ?? EMPTY_LEVELS
-      );
-      if (!selection) break;
+        room =>
+          this.reservations.effectivePlayers(room) +
+          this.moveReserved(room.roomId),
+        room => levelsByRoom.get(room.roomId) ?? EMPTY_LEVELS
+      )
+      if (!selection) break
 
-      const index = candidates.findIndex((room) => room.roomId === selection.room.roomId);
-      if (index >= 0) candidates.splice(index, 1);
+      const index = candidates.findIndex(
+        room => room.roomId === selection.room.roomId
+      )
+      if (index >= 0) candidates.splice(index, 1)
 
-      if (!this.reservations.tryAcquire(selection.room, playerId)) continue;
+      if (!this.reservations.tryAcquire(selection.room, playerId)) continue
 
       try {
-        const ack = await this.coordinator.reserveRoom(selection.room, playerId, signal);
+        const ack = await this.coordinator.reserveRoom(
+          selection.room,
+          playerId,
+          signal
+        )
         if (ack.code !== ErrorCode.OK) {
-          this.reservations.release(playerId);
-          throw new HermesError(ack.code, ack.message ?? "node rejected room reservation", ack.data);
+          this.reservations.release(playerId)
+          throw new HermesError(
+            ack.code,
+            ack.message ?? 'node rejected room reservation',
+            ack.data
+          )
         }
 
-        this.log?.info({
-          playerId,
-          roomId: selection.room.roomId,
-          reason: "policy_score",
-          score: Math.round(selection.score),
-          players: selection.room.players,
-          capacity: selection.room.capacity,
-          level: context.level ?? null,
-          rawLevel: request.level ?? null,
-          candidates: candidates.length + 1
-        }, "room allocated");
+        this.log?.info(
+          {
+            playerId,
+            roomId: selection.room.roomId,
+            reason: 'policy_score',
+            score: Math.round(selection.score),
+            players: selection.room.players,
+            capacity: selection.room.capacity,
+            level: context.level ?? null,
+            rawLevel: request.level ?? null,
+            candidates: candidates.length + 1
+          },
+          'room allocated'
+        )
         this.record({
-          category: "allocation",
-          event: "allocation.assigned",
-          message: `player ${playerId} -> room ${selection.room.roomId} (score ${Math.round(selection.score)})`,
+          category: 'allocation',
+          event: 'allocation.assigned',
+          message: `player ${playerId} -> room ${
+            selection.room.roomId
+          } (score ${Math.round(selection.score)})`,
           roomId: selection.room.roomId,
           nodeId: selection.room.nodeId,
           playerIds: [playerId],
           data: {
-            reason: "policy_score",
+            reason: 'policy_score',
             score: Math.round(selection.score),
             players: selection.room.players,
             capacity: selection.room.capacity,
@@ -154,19 +206,31 @@ export class RequestRouter {
             rawLevel: request.level ?? null,
             candidates: candidates.length + 1
           }
-        });
-        return { code: ErrorCode.OK, data: this.assignmentFor(selection.room, playerId) };
+        })
+        return {
+          code: ErrorCode.OK,
+          data: this.assignmentFor(selection.room, playerId)
+        }
       } catch (error) {
-        this.reservations.release(playerId);
-        if (isHermesError(error) && error.code === ErrorCode.NODE_UNAVAILABLE) continue;
-        throw error;
+        this.reservations.release(playerId)
+        if (isHermesError(error) && error.code === ErrorCode.NODE_UNAVAILABLE)
+          continue
+        throw error
       }
     }
 
-    this.log?.warn({ playerId, candidates: candidates.length, rooms: this.rooms.listRooms().length, level: request.level ?? null }, "allocation found no usable room");
+    this.log?.warn(
+      {
+        playerId,
+        candidates: candidates.length,
+        rooms: this.rooms.listRooms().length,
+        level: request.level ?? null
+      },
+      'allocation found no usable room'
+    )
     this.record({
-      category: "allocation",
-      event: "allocation.none",
+      category: 'allocation',
+      event: 'allocation.none',
       message: `no usable room for player ${playerId}`,
       playerIds: [playerId],
       data: {
@@ -176,25 +240,33 @@ export class RequestRouter {
         rooms: this.rooms.listRooms().length,
         reservations: this.reservations.size()
       }
-    });
-    throw new HermesError(ErrorCode.NO_CAPACITY, "no room capacity is currently available");
+    })
+    throw new HermesError(
+      ErrorCode.NO_CAPACITY,
+      'no room capacity is currently available'
+    )
   }
 
-  private record(event: DebugEventInput): void {
-    this.events?.record(event);
+  private record (event: DebugEventInput): void {
+    this.events?.record(event)
   }
 
-  private assignmentFor(
-    room: { roomId: RoomAssignment["roomId"]; nodeId: RoomAssignment["nodeId"]; udpHost: RoomAssignment["udpHost"]; udpPort: RoomAssignment["udpPort"] },
+  private assignmentFor (
+    room: {
+      roomId: RoomAssignment['roomId']
+      nodeId: RoomAssignment['nodeId']
+      udpHost: RoomAssignment['udpHost']
+      udpPort: RoomAssignment['udpPort']
+    },
     playerId: PlayerId
   ): RoomAssignment {
-    const expiresAt = asUnixMs(Date.now() + this.options.assignmentTtlMs);
+    const expiresAt = asUnixMs(Date.now() + this.options.assignmentTtlMs)
     return {
       roomId: room.roomId,
       nodeId: room.nodeId,
       udpHost: room.udpHost,
       udpPort: room.udpPort,
       expiresAt
-    };
+    }
   }
 }

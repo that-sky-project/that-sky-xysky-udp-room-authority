@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from 'zod'
 import type {
   CommandId,
   NodeId,
@@ -9,7 +9,7 @@ import type {
   RoomId,
   UdpHost,
   UnixMs
-} from "./branded.js";
+} from './branded.js'
 import {
   asCommandId,
   asNodeId,
@@ -20,13 +20,13 @@ import {
   asRoomId,
   asUdpHost,
   asUnixMs
-} from "./branded.js";
+} from './branded.js'
 
-const stringId = z.string().min(1).max(128);
-const commandId = z.number().int().positive().transform(asCommandId);
-const port = z.number().int().min(1).max(65535).transform(asPort);
-const unixMs = z.number().int().nonnegative().transform(asUnixMs);
-const protocolVersion = z.number().int().positive().transform(asProtocolVersion);
+const stringId = z.string().min(1).max(128)
+const commandId = z.number().int().positive().transform(asCommandId)
+const port = z.number().int().min(1).max(65535).transform(asPort)
+const unixMs = z.number().int().nonnegative().transform(asUnixMs)
+const protocolVersion = z.number().int().positive().transform(asProtocolVersion)
 
 export const PlayerSchema = z
   .object({
@@ -36,9 +36,9 @@ export const PlayerSchema = z
     level: z.number().int().min(0).max(0xffffffff).optional(),
     metadata: z.record(z.unknown()).optional()
   })
-  .strict();
+  .strict()
 
-export type PlayerInfo = z.infer<typeof PlayerSchema>;
+export type PlayerInfo = z.infer<typeof PlayerSchema>
 
 export const RoomSnapshotSchema = z
   .object({
@@ -55,9 +55,9 @@ export const RoomSnapshotSchema = z
     lastMergeAt: unixMs.optional(),
     lastSplitAt: unixMs.optional()
   })
-  .strict();
+  .strict()
 
-export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema>;
+export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema>
 
 export const AllocationRequestSchema = z
   .object({
@@ -66,24 +66,40 @@ export const AllocationRequestSchema = z
     level: z.number().int().min(0).max(0xffffffff).optional(),
     preferences: z.record(z.unknown()).optional()
   })
-  .strict();
+  .strict()
 
 export interface IAllocationRequest {
-  playerId: PlayerId;
-  region?: Region | undefined;
-  level?: number | undefined;
-  preferences?: Record<string, unknown> | undefined;
+  playerId: PlayerId
+  region?: Region | undefined
+  level?: number | undefined
+  preferences?: Record<string, unknown> | undefined
 }
 
 export interface IAllocationReply {
-  code: number;
-  data?: RoomAssignment | { message: string; details?: unknown } | undefined;
+  code: number
+  data?: RoomAssignment | { message: string; details?: unknown } | undefined
 }
 
 export const NodeEventSchema = z
   .object({
     v: protocolVersion.default(asProtocolVersion(1)),
-    event: z.enum(["player.join", "player.leave", "room.created", "room.updated", "room.destroyed", "heartbeat", "node.ready", "node.draining", "room.telemetry", "move.result", "move.completed", "reservation.expired"]),
+    event: z.enum([
+      'player.join',
+      'player.leave',
+      'room.created',
+      'room.updated',
+      'room.destroyed',
+      'heartbeat',
+      'node.ready',
+      'node.draining',
+      'room.telemetry',
+      'move.result',
+      'move.completed',
+      'reservation.expired',
+      'seat.occupied',
+      'seat.released',
+      'spotlight.changed'
+    ]),
     data: z
       .object({
         nodeId: stringId.transform(asNodeId).optional(),
@@ -91,35 +107,44 @@ export const NodeEventSchema = z
         port: port.optional(),
         udpHost: z.string().min(1).max(255).transform(asUdpHost).optional(),
         player: PlayerSchema.optional(),
-        // Room lifecycle events use this field as an occupancy count; telemetry
-        // events send an array. A delta frame carries only the players whose
-        // state changed since `baseSeq`; `removedPlayers` lists departed ids.
-        players: z.union([
-          z.number().int().min(0).max(8),
-          z.array(z.object({
-            playerId: stringId.transform(asPlayerId),
-            levelId: z.number().int().nonnegative().optional(),
-            position: z.tuple([z.number(), z.number(), z.number()]).optional(),
-            velocity: z.number().nonnegative().optional(),
-            stateAt: unixMs.optional(),
-            affinity: z.record(z.number().min(0).max(1)).optional(),
-            lastMoveAt: unixMs.optional()
-          }).strict()).max(8)
-        ]).optional(),
-        /** Telemetry framing: `full` (default) or `delta` against `baseSeq`. */
-        kind: z.enum(["full", "delta"]).optional(),
+        players: z
+          .union([
+            z.number().int().min(0).max(8),
+            z
+              .array(
+                z
+                  .object({
+                    playerId: stringId.transform(asPlayerId),
+                    levelId: z.number().int().nonnegative().optional(),
+                    position: z
+                      .tuple([z.number(), z.number(), z.number()])
+                      .optional(),
+                    velocity: z.number().nonnegative().optional(),
+                    stateAt: unixMs.optional(),
+                    affinity: z.record(z.number().min(0).max(1)).optional(),
+                    lastMoveAt: unixMs.optional()
+                  })
+                  .passthrough()
+              )
+              .max(8)
+          ])
+          .optional(),
+        kind: z.enum(['full', 'delta']).optional(),
         baseSeq: z.number().int().nonnegative().optional(),
         removedPlayers: z.array(stringId).max(8).optional(),
         seq: z.number().int().nonnegative().optional(),
-        // Move ids are generated by the manager. Keep headroom over the old
-        // player-list-derived format so an older/other manager cannot get its
-        // own completion event rejected.
         moveId: z.string().min(1).max(256).optional(),
         playerIds: z.array(stringId).max(8).optional(),
         accepted: z.boolean().optional(),
         movedPlayerIds: z.array(stringId).max(8).optional(),
         failedPlayerIds: z.array(stringId).max(8).optional(),
         reason: z.string().max(128).optional(),
+        levelId: z.number().int().nonnegative().optional(),
+        benchId: z.number().int().nonnegative().optional(),
+        seatId: z.number().int().min(0).max(7).optional(),
+        entityId: z.number().int().nonnegative().optional(),
+        position: z.tuple([z.number(), z.number(), z.number()]).optional(),
+        levelTime: z.number().nonnegative().optional(),
         occupiedPorts: z.array(port).max(65535).optional(),
         rooms: z.array(RoomSnapshotSchema).max(5000).optional(),
         version: z.number().int().nonnegative().optional(),
@@ -127,63 +152,109 @@ export const NodeEventSchema = z
         load: z.number().min(0).max(1).optional(),
         timestamp: unixMs.optional()
       })
-      .strict()
+      .passthrough()
   })
-  .strict();
+  .passthrough()
 
 export interface INodeEvent {
-  v?: ProtocolVersion | undefined;
-  event: "player.join" | "player.leave" | "room.created" | "room.updated" | "room.destroyed" | "heartbeat" | "node.ready" | "node.draining" | "room.telemetry" | "move.result" | "move.completed" | "reservation.expired";
+  v?: ProtocolVersion | undefined
+  event:
+    | 'player.join'
+    | 'player.leave'
+    | 'room.created'
+    | 'room.updated'
+    | 'room.destroyed'
+    | 'heartbeat'
+    | 'node.ready'
+    | 'node.draining'
+    | 'room.telemetry'
+    | 'move.result'
+    | 'move.completed'
+    | 'reservation.expired'
+    | 'seat.occupied'
+    | 'seat.released'
+    | 'spotlight.changed'
   data: {
-    nodeId: NodeId;
-    roomId?: RoomId | undefined;
-    port?: Port | undefined;
-    udpHost?: UdpHost | undefined;
-    player?: PlayerInfo | undefined;
-    players?: PlayerTelemetry[] | number | undefined;
-    kind?: "full" | "delta" | undefined;
-    baseSeq?: number | undefined;
-    removedPlayers?: string[] | undefined;
-    seq?: number | undefined;
-    moveId?: string | undefined;
-    playerIds?: string[] | undefined;
-    accepted?: boolean | undefined;
-    movedPlayerIds?: string[] | undefined;
-    failedPlayerIds?: string[] | undefined;
-    reason?: string | undefined;
-    occupiedPorts?: Port[] | undefined;
-    rooms?: RoomSnapshot[] | undefined;
-    version?: number | undefined;
-    capacity?: number | undefined;
-    load?: number | undefined;
-    timestamp?: UnixMs | undefined;
-  };
+    nodeId: NodeId
+    roomId?: RoomId | undefined
+    port?: Port | undefined
+    udpHost?: UdpHost | undefined
+    player?: PlayerInfo | undefined
+    players?: PlayerTelemetry[] | number | undefined
+    kind?: 'full' | 'delta' | undefined
+    baseSeq?: number | undefined
+    removedPlayers?: string[] | undefined
+    seq?: number | undefined
+    moveId?: string | undefined
+    playerIds?: string[] | undefined
+    accepted?: boolean | undefined
+    movedPlayerIds?: string[] | undefined
+    failedPlayerIds?: string[] | undefined
+    reason?: string | undefined
+    levelId?: number | undefined
+    benchId?: number | undefined
+    seatId?: number | undefined
+    entityId?: number | undefined
+    position?: [number, number, number] | undefined
+    levelTime?: number | undefined
+    /** `spotlight.changed`: whether the player entered (true) or left the stage. */
+    active?: boolean | undefined
+    occupiedPorts?: Port[] | undefined
+    rooms?: RoomSnapshot[] | undefined
+    version?: number | undefined
+    capacity?: number | undefined
+    load?: number | undefined
+    timestamp?: UnixMs | undefined
+  }
 }
 
 export interface PlayerTelemetry {
-  playerId: PlayerId;
-  levelId?: number | undefined;
-  position?: [number, number, number] | undefined;
-  velocity?: number | undefined;
-  stateAt?: UnixMs | undefined;
-  affinity?: Record<string, number> | undefined;
-  lastMoveAt?: UnixMs | undefined;
+  playerId: PlayerId
+  levelId?: number | undefined
+  position?: [number, number, number] | undefined
+  velocity?: number | undefined
+  stateAt?: UnixMs | undefined
+  affinity?: Record<string, number> | undefined
+  lastMoveAt?: UnixMs | undefined
 }
 
 export const ManagerCommandSchema = z
   .object({
     v: protocolVersion.default(asProtocolVersion(1)),
     id: commandId,
-    cmd: z.enum(["player.redirect", "room.destroy", "node.drain", "room.reserve", "move.prepare", "move.commit", "move.cancel"]),
+    cmd: z.enum([
+      'player.redirect',
+      'room.destroy',
+      'node.drain',
+      'room.reserve',
+      'move.prepare',
+      'move.commit',
+      'move.cancel',
+      'seat.assign',
+      'seat.release',
+      'audience.snapshot',
+      'level.audience'
+    ]),
     data: z.record(z.unknown()).optional()
   })
-  .strict();
+  .strict()
 
 export interface IManagerCommand<TData = unknown> {
-  v?: ProtocolVersion | undefined;
-  id: CommandId;
-  cmd: "player.redirect" | "room.destroy" | "node.drain" | "room.reserve" | "move.prepare" | "move.commit" | "move.cancel";
-  data?: TData | undefined;
+  v?: ProtocolVersion | undefined
+  id: CommandId
+  cmd:
+    | 'player.redirect'
+    | 'room.destroy'
+    | 'node.drain'
+    | 'room.reserve'
+    | 'move.prepare'
+    | 'move.commit'
+    | 'move.cancel'
+    | 'seat.assign'
+    | 'seat.release'
+    | 'audience.snapshot'
+    | 'level.audience'
+  data?: TData | undefined
 }
 
 export const NodeAckSchema = z
@@ -194,22 +265,22 @@ export const NodeAckSchema = z
     message: z.string().max(512).optional(),
     data: z.record(z.unknown()).optional()
   })
-  .strict();
+  .strict()
 
 export interface INodeAck<TData = unknown> {
-  v?: ProtocolVersion | undefined;
-  id: CommandId;
-  code: number;
-  message?: string | undefined;
-  data?: TData | undefined;
+  v?: ProtocolVersion | undefined
+  id: CommandId
+  code: number
+  message?: string | undefined
+  data?: TData | undefined
 }
 
 export interface RoomAssignment {
-  roomId: RoomId;
-  nodeId: NodeId;
-  udpHost: UdpHost;
-  udpPort: Port;
-  expiresAt: UnixMs;
+  roomId: RoomId
+  nodeId: NodeId
+  udpHost: UdpHost
+  udpPort: Port
+  expiresAt: UnixMs
 }
 
 /**
@@ -221,9 +292,36 @@ export const BatchRoomLookupSchema = z
   .object({
     playerIds: z.array(stringId).min(1).max(1000)
   })
-  .strict();
+  .strict()
 
-export type BatchRoomLookup = z.infer<typeof BatchRoomLookupSchema>;
+export type BatchRoomLookup = z.infer<typeof BatchRoomLookupSchema>
+
+/**
+ * Concert seat reservation, forwarded by the account server on behalf of the
+ * game client. `benchId`/`seatId` are present only when the client picked a
+ * different bench (an in-game seat change); otherwise the manager assigns the
+ * lowest free seat. `level` is the concert map, used only when a bench still
+ * needs a UDP room allocated.
+ *
+ * `recentPlayerUuids` / `allPlayerUuids` mirror the client's own request fields
+ * (`sub_141998B70` writes both for a free reservation): the people the client
+ * wants to sit with. They are seated on the same bench as the caller, because a
+ * bench is a UDP room and only same-room players render each other in full.
+ * Both lists are merged and capped at one room's worth of companions.
+ */
+export const ReserveRequestSchema = z
+  .object({
+    playerId: stringId.transform(asPlayerId),
+    levelId: z.number().int().nonnegative(),
+    benchId: z.number().int().nonnegative().optional(),
+    seatId: z.number().int().min(0).max(7).optional(),
+    level: z.number().int().min(0).max(0xffffffff).optional(),
+    recentPlayerUuids: z.array(stringId).max(8).optional(),
+    allPlayerUuids: z.array(stringId).max(8).optional()
+  })
+  .strict()
+
+export type IReserveRequest = z.infer<typeof ReserveRequestSchema>
 
 /**
  * A player the manager does not know (never placed, or already left) maps to
@@ -234,12 +332,12 @@ export type BatchRoomLookup = z.infer<typeof BatchRoomLookupSchema>;
  * share one builder and current consumers keep working unchanged.
  */
 export interface RoomLookup {
-  playerId: PlayerId;
-  roomId: RoomId;
-  udp: { host: UdpHost; port: Port };
-  players: number;
-  capacity: number;
-  level: number | null;
-  levelId: number | null;
-  updatedAt: UnixMs;
+  playerId: PlayerId
+  roomId: RoomId
+  udp: { host: UdpHost; port: Port }
+  players: number
+  capacity: number
+  level: number | null
+  levelId: number | null
+  updatedAt: UnixMs
 }

@@ -2,7 +2,6 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-
 export interface ManagerConfig {
   host: string;
   port: number;
@@ -46,10 +45,8 @@ export interface ManagerConfig {
   debugApiToken: string;
   debugLogBufferSize: number;
 }
-
 const positiveInt = (fallback: number) => z.coerce.number().int().positive().default(fallback);
 const floatFrom = (fallback: number) => z.coerce.number().default(fallback);
-
 const configSchema = z
   .object({
     host: z.string().trim().min(1).default("0.0.0.0"),
@@ -64,17 +61,8 @@ const configSchema = z
         candidate_room_limit: positiveInt(256),
         stale_room_ms: positiveInt(120_000),
         max_players_per_room: positiveInt(8),
-        // Room fill level the allocator aims for. High values keep piling
-        // same-level players into an existing room; low values scatter them
-        // into empty rooms that only get merged later.
         preferred_fill_target: positiveInt(6),
-        // Weight of the node load penalty. One node hosts one room here, so
-        // load already shows up as room fill; keep this small or it cancels
-        // the level bonus and pushes joins into empty rooms.
         load_penalty_weight: floatFrom(10),
-        // Allocation request without a level: penalise rooms that already have
-        // a known level so the player lands in an empty/level-less room instead
-        // of creating a mixed room the isolation pass must split.
         unknown_level_penalty: floatFrom(50)
       })
       .default({}),
@@ -104,12 +92,7 @@ const configSchema = z
     move: z
       .object({
         budget_per_cycle: positiveInt(8),
-        // A room must keep the same roster/level signature for this many
-        // planning cycles before it may be used as a move source or target.
-        // State-based hysteresis; replaces the old wall-clock room cooldown.
         confirmation_cycles: positiveInt(2),
-        // Extra gain penalty per spatial-cluster mate a partial migration
-        // leaves behind. Higher values prefer moving whole clusters.
         cluster_split_penalty: floatFrom(0.05),
         transaction_timeout_ms: positiveInt(15_000),
         state_ema_half_life_ms: positiveInt(3_000),
@@ -122,39 +105,22 @@ const configSchema = z
         level_isolation_min_level_players: positiveInt(1),
         level_isolation_max_players: positiveInt(8),
         level_isolation_sparse_room_threshold: positiveInt(2),
-        // Shared settling window for every migration path (isolation,
-        // same-level consolidation and activity merge): after anyone in a room
-        // changes level, nobody is moved out of it for this long.
         level_change_cooldown_ms: positiveInt(6000),
-        // A player who just joined a room (friend-join teleport / cross-room
-        // move) is still loading the destination map and may briefly report
-        // the previous level. Do not isolate the room until this settles.
         join_settle_ms: positiveInt(4000),
-        // Level ids (maps) that quarantine their room. While a player is on
-        // one of these levels, nobody in the room is migrated or merged, and
-        // allocation keeps other levels out of the room. If another level
-        // intrudes, the protected level keeps the room and the intruding
-        // levels are moved out; players on a protected level are never moved.
-        // Protection ends when the last protected occupant changes level or
-        // leaves.
         protected_levels: z.array(z.number().int().positive()).default([])
       })
       .default({}),
     debug: z
       .object({
         api_token: z.string().default(""),
-        // Ring buffer behind GET /debug/logs (moves, allocations, node traffic,
-        // telemetry gaps). In-memory only; lost on restart.
         log_buffer_size: positiveInt(2000)
       })
       .default({})
   })
   .strict();
-
 export const loadConfig = (configFile: string = path.resolve(process.cwd(), "config.yml")): ManagerConfig => {
   const raw = parseYaml(readFileSync(configFile, "utf8"));
   const parsed = configSchema.parse(raw ?? {});
-
   return {
     host: parsed.host,
     port: parsed.port,

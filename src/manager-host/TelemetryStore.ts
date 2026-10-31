@@ -1,110 +1,141 @@
-import type { PlayerId, RoomId } from "../types/branded.js";
-import type { PlayerTelemetry } from "../types/contracts.js";
-
+import type { PlayerId, RoomId } from '../types/branded.js'
+import type { PlayerTelemetry } from '../types/contracts.js'
 export interface StoredTelemetry extends PlayerTelemetry {
-  roomId: RoomId;
-  receivedAt: number;
-  emaVelocity?: number | undefined;
-  lastMigratedAt?: number | undefined;
-  /** When this player was last observed switching level; 0 if never seen to. */
-  levelChangedAt?: number | undefined;
-  /** When this player last appeared in a different room (join / cross-room move). */
-  roomJoinedAt?: number | undefined;
+  roomId: RoomId
+  receivedAt: number
+  emaVelocity?: number | undefined
+  lastMigratedAt?: number | undefined
+  levelChangedAt?: number | undefined
+  roomJoinedAt?: number | undefined
 }
-
 export interface TelemetryStoreOptions {
-  stateEmaHalfLifeMs: number;
+  stateEmaHalfLifeMs: number
 }
-
 export class TelemetryStore {
-  private readonly players = new Map<PlayerId, StoredTelemetry>();
-  private readonly reservations = new Map<RoomId, Map<string, { expiresAt: number; slots: number }>>();
-
-  public constructor(private readonly options: TelemetryStoreOptions = { stateEmaHalfLifeMs: 3_000 }) {}
-
-  public upsert(roomId: RoomId, input: PlayerTelemetry, now = Date.now()): StoredTelemetry {
-    const previous = this.players.get(input.playerId);
-    const rawVelocity = input.velocity ?? previous?.velocity ?? 0;
-    // 0 is the node's "no level reported" sentinel (JoinGame without levelId).
-    // Treat it as unknown here so it never becomes a phantom level group that
-    // makes a room look mixed; a later frame with a real level fills it in.
-    const hasLevel = input.levelId !== undefined;
-    const incomingLevel = input.levelId === 0 ? undefined : input.levelId;
+  private readonly players = new Map<PlayerId, StoredTelemetry>()
+  private readonly reservations = new Map<
+    RoomId,
+    Map<string, { expiresAt: number; slots: number }>
+  >()
+  public constructor (
+    private readonly options: TelemetryStoreOptions = {
+      stateEmaHalfLifeMs: 3_000
+    }
+  ) {}
+  public upsert (
+    roomId: RoomId,
+    input: PlayerTelemetry,
+    now = Date.now()
+  ): StoredTelemetry {
+    const previous = this.players.get(input.playerId)
+    const rawVelocity = input.velocity ?? previous?.velocity ?? 0
+    const hasLevel = input.levelId !== undefined
+    const incomingLevel = input.levelId === 0 ? undefined : input.levelId
     const levelChanged =
-      hasLevel && previous?.levelId !== undefined && incomingLevel !== undefined && previous.levelId !== incomingLevel;
-    const roomChanged = previous !== undefined && previous.roomId !== roomId;
+      hasLevel &&
+      previous?.levelId !== undefined &&
+      incomingLevel !== undefined &&
+      previous.levelId !== incomingLevel
+    const roomChanged = previous !== undefined && previous.roomId !== roomId
     const next: StoredTelemetry = {
       ...previous,
       ...input,
       ...(hasLevel ? { levelId: incomingLevel } : {}),
       roomId,
       receivedAt: now,
-      emaVelocity: this.smooth(previous?.emaVelocity, rawVelocity, previous?.receivedAt, now),
+      emaVelocity: this.smooth(
+        previous?.emaVelocity,
+        rawVelocity,
+        previous?.receivedAt,
+        now
+      ),
       levelChangedAt: levelChanged ? now : previous?.levelChangedAt,
-      // A friend-join teleport enters the UDP room while still on the previous
-      // map, so the room is briefly "mixed" through no fault of the players.
-      // Planners use this to hold off until the newcomer has loaded in.
-      roomJoinedAt: roomChanged || previous === undefined ? now : previous.roomJoinedAt ?? now
-    };
-    this.players.set(input.playerId, next);
-    return next;
+      roomJoinedAt:
+        roomChanged || previous === undefined
+          ? now
+          : previous.roomJoinedAt ?? now
+    }
+    this.players.set(input.playerId, next)
+    return next
   }
-
-  private smooth(prev: number | undefined, value: number, prevAt: number | undefined, now: number): number {
-    if (prev === undefined || prevAt === undefined) return value;
-    const dt = Math.max(0, now - prevAt);
-    const alpha = 1 - Math.pow(0.5, dt / Math.max(1, this.options.stateEmaHalfLifeMs));
-    return prev + alpha * (value - prev);
+  private smooth (
+    prev: number | undefined,
+    value: number,
+    prevAt: number | undefined,
+    now: number
+  ): number {
+    if (prev === undefined || prevAt === undefined) return value
+    const dt = Math.max(0, now - prevAt)
+    const alpha =
+      1 - Math.pow(0.5, dt / Math.max(1, this.options.stateEmaHalfLifeMs))
+    return prev + alpha * (value - prev)
   }
-
-  public remove(playerId: PlayerId): void { this.players.delete(playerId); }
-  public get(playerId: PlayerId): StoredTelemetry | undefined { return this.players.get(playerId); }
-  public list(): StoredTelemetry[] { return [...this.players.values()]; }
-  public listRoom(roomId: RoomId, now = Date.now()): StoredTelemetry[] {
-    // Keep stale samples long enough for the planner to identify inactive
-    // players. Freshness is scored by MovePlanner; dropping stale samples here
-    // would make dead rooms look empty and prevent cleanup migrations.
-    const retentionMs = 5 * 60_000;
-    return this.list().filter((player) => player.roomId === roomId && now - player.receivedAt <= retentionMs);
+  public remove (playerId: PlayerId): void {
+    this.players.delete(playerId)
   }
-
-  public markMigrated(playerIds: PlayerId[], now = Date.now()): void {
+  public get (playerId: PlayerId): StoredTelemetry | undefined {
+    return this.players.get(playerId)
+  }
+  public list (): StoredTelemetry[] {
+    return [...this.players.values()]
+  }
+  public listRoom (roomId: RoomId, now = Date.now()): StoredTelemetry[] {
+    const retentionMs = 5 * 60_000
+    return this.list().filter(
+      player =>
+        player.roomId === roomId && now - player.receivedAt <= retentionMs
+    )
+  }
+  public markMigrated (playerIds: PlayerId[], now = Date.now()): void {
     for (const playerId of playerIds) {
-      const player = this.players.get(playerId);
-      if (player) this.players.set(playerId, { ...player, lastMigratedAt: now });
+      const player = this.players.get(playerId)
+      if (player) this.players.set(playerId, { ...player, lastMigratedAt: now })
     }
   }
-
-  public reserved(roomId: RoomId, now = Date.now()): number {
-    const holds = this.reservations.get(roomId);
-    if (!holds) return 0;
-    let total = 0;
-    for (const [moveId, hold] of holds) { if (hold.expiresAt <= now) holds.delete(moveId); else total += hold.slots; }
-    return total;
+  public reserved (roomId: RoomId, now = Date.now()): number {
+    const holds = this.reservations.get(roomId)
+    if (!holds) return 0
+    let total = 0
+    for (const [moveId, hold] of holds) {
+      if (hold.expiresAt <= now) holds.delete(moveId)
+      else total += hold.slots
+    }
+    return total
   }
-
-  public tryReserve(roomId: RoomId, moveId: string, slots: number, capacity: number, occupied: number, ttlMs: number, now = Date.now()): boolean {
-    const holds = this.reservations.get(roomId) ?? new Map<string, { expiresAt: number; slots: number }>();
-    this.reservations.set(roomId, holds);
-    this.reserved(roomId, now);
-    if (occupied + this.reserved(roomId, now) + slots > capacity) return false;
-    holds.set(moveId, { expiresAt: now + ttlMs, slots });
-    return true;
+  public tryReserve (
+    roomId: RoomId,
+    moveId: string,
+    slots: number,
+    capacity: number,
+    occupied: number,
+    ttlMs: number,
+    now = Date.now()
+  ): boolean {
+    const holds =
+      this.reservations.get(roomId) ??
+      new Map<string, { expiresAt: number; slots: number }>()
+    this.reservations.set(roomId, holds)
+    this.reserved(roomId, now)
+    if (occupied + this.reserved(roomId, now) + slots > capacity) return false
+    holds.set(moveId, { expiresAt: now + ttlMs, slots })
+    return true
   }
-
-  public releaseReservation(roomId: RoomId, moveId: string): void {
-    const holds = this.reservations.get(roomId);
-    holds?.delete(moveId);
-    if (holds?.size === 0) this.reservations.delete(roomId);
+  public releaseReservation (roomId: RoomId, moveId: string): void {
+    const holds = this.reservations.get(roomId)
+    holds?.delete(moveId)
+    if (holds?.size === 0) this.reservations.delete(roomId)
   }
-
-  public releaseReservationSlots(roomId: RoomId, moveId: string, slots: number): void {
-    const holds = this.reservations.get(roomId);
-    if (!holds) return;
-    const hold = holds?.get(moveId);
-    if (!hold) return;
-    if (slots >= hold.slots) holds.delete(moveId);
-    else holds.set(moveId, { ...hold, slots: hold.slots - Math.max(0, slots) });
-    if (holds.size === 0) this.reservations.delete(roomId);
+  public releaseReservationSlots (
+    roomId: RoomId,
+    moveId: string,
+    slots: number
+  ): void {
+    const holds = this.reservations.get(roomId)
+    if (!holds) return
+    const hold = holds?.get(moveId)
+    if (!hold) return
+    if (slots >= hold.slots) holds.delete(moveId)
+    else holds.set(moveId, { ...hold, slots: hold.slots - Math.max(0, slots) })
+    if (holds.size === 0) this.reservations.delete(roomId)
   }
 }

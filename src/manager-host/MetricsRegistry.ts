@@ -1,42 +1,27 @@
 import type { Logger } from "../infra/logger/logger.js";
-
 interface CounterState {
   help: string;
   labels: string;
   values: Map<string, number>;
 }
-
-/**
- * Minimal Prometheus text-format exporter. Counters and gauges only — the
- * manager only needs to answer "is the cluster healthy and are migrations
- * working", not to be a full metrics platform.
- *
- * A metric name is declared once with its label names; `inc`/`set` take label
- * values in the same order.
- */
 export class MetricsRegistry {
   private readonly counters = new Map<string, CounterState>();
   private readonly gauges = new Map<string, CounterState>();
   private readonly series: Array<{ name: string; kind: "counter" | "gauge"; help: string; labels: string[]; value: number; tag: string }> = [];
-
   public declareCounter(name: string, help: string, labels: string[] = []): void {
     if (!this.counters.has(name)) this.counters.set(name, { help, labels: labels.join(","), values: new Map() });
   }
-
   public declareGauge(name: string, help: string, labels: string[] = []): void {
     if (!this.gauges.has(name)) this.gauges.set(name, { help, labels: labels.join(","), values: new Map() });
   }
-
   public inc(name: string, labelValues: string[] = [], delta = 1): void {
     this.add(this.counters, name, "counter", labelValues, delta);
   }
-
   public set(name: string, value: number, labelValues: string[] = []): void {
     const state = this.gauges.get(name);
     if (!state) return;
     state.values.set(this.tagOf(state.labels, labelValues), value);
   }
-
   public render(): string {
     const out: string[] = [];
     for (const [name, state] of [...this.counters, ...this.gauges]) {
@@ -51,7 +36,6 @@ export class MetricsRegistry {
     }
     return `${out.join("\n")}\n`;
   }
-
   private add(
     registry: Map<string, CounterState>,
     name: string,
@@ -64,16 +48,13 @@ export class MetricsRegistry {
     const tag = this.tagOf(state.labels, labelValues);
     state.values.set(tag, (state.values.get(tag) ?? 0) + delta);
   }
-
   private tagOf(labels: string, labelValues: string[]): string {
     if (!labels) return "";
     return labelValues.map((value) => encodeURIComponent(value)).join("|");
   }
-
   private parseLabels(labels: string): string[] {
     return labels ? labels.split(",") : [];
   }
-
   private renderTag(labels: string[], tag: string): string {
     if (labels.length === 0) return "";
     const values = tag.split("|");
@@ -81,8 +62,6 @@ export class MetricsRegistry {
     return `{${pairs.join(",")}}`;
   }
 }
-
-/** Registers the metric set the manager exposes. */
 export const registerManagerMetrics = (metrics: MetricsRegistry, _log: Logger): void => {
   metrics.declareCounter("qwd_ws_queue_dropped_total", "Telemetry frames dropped because the node queue was full");
   metrics.declareCounter("qwd_node_reclaimed_total", "Nodes reclaimed after their disconnect grace window expired");

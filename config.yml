@@ -1,13 +1,3 @@
-# Hermes Room Manager (QWD) configuration.
-# This file is the single source of configuration. The manager does NOT read
-# any environment variables.
-
-# ---------------------------------------------------------------------------
-# Listener
-# ---------------------------------------------------------------------------
-# One HTTP server serves BOTH:
-#   - the WebSocket control channel that UDP room nodes connect to (path "/")
-#   - the HTTP JSON API, including POST {allocate_path} used by XYSky/matchmakers
 host: 0.0.0.0
 port: 1131
 allocate_path: /allocate

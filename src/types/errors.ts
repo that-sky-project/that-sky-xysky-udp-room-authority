@@ -16,15 +16,16 @@ export enum ErrorCode {
 }
 
 export class HermesError extends Error {
-  public readonly code: ErrorCode;
-  public readonly details: unknown;
+  public readonly code: ErrorCode
+  public readonly details: unknown
 
-  public constructor(code: ErrorCode, message: string, details?: unknown) {
-    super(message);
-    this.name = "HermesError";
-    this.code = code;
-    this.details = details;
+  public constructor (code: ErrorCode, message: string, details?: unknown) {
+    super(message)
+    this.name = 'HermesError'
+    this.code = code
+    this.details = details
   }
 }
 
-export const isHermesError = (error: unknown): error is HermesError => error instanceof HermesError;
+export const isHermesError = (error: unknown): error is HermesError =>
+  error instanceof HermesError
