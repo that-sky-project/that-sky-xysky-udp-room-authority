@@ -254,6 +254,45 @@ export class ReservationService {
           if (!host) continue
           benchHosts.set(seat.benchId, host.roomId)
         }
+        // R7: rebind benches that lost their room binding. `bindBenchRoom`
+        // happens on seat allocation, but a manager restart keeps seats in
+        // memory only through allocations — a bench whose host room vanished
+        // (node reclaimed, crash) leaves its players permanently invisible:
+        // no receiving room exists for their bench, so the per-room diff
+        // below never reaches anyone. The seat's own telemetry remembers the
+        // room the player is actually in (`setPosition` from seat.occupied),
+        // so rebind there — but only when that room is still alive, and only
+        // when the bench is genuinely unbound (never steal a live binding).
+        for (const seat of seats) {
+          if (benchHosts.has(seat.benchId)) continue
+          const reported = seat.roomId
+          if (!reported) continue
+          const room = this.rooms.getRoom(reported)
+          if (!room) continue
+          this.allocator.bindBenchRoom(seat.benchId, {
+            host: room.udpHost,
+            port: room.udpPort,
+            roomId: reported
+          })
+          benchHosts.set(seat.benchId, reported)
+          // A binding that comes back after being gone usually means this
+          // manager (or its snapshot cache) restarted while the seats
+          // survived in the allocator. Rooms whose cache was rebuilt from
+          // nothing would otherwise see an empty diff and never learn about
+          // the rebound bench's players — mark every OTHER receiving room for
+          // a full snapshot this round.
+          for (const other of seats) {
+            if (other.benchId === seat.benchId) continue
+            const otherHost = benchHosts.get(other.benchId) ?? other.roomId
+            if (otherHost && otherHost !== reported) {
+              this.pendingFullSnapshots.add(otherHost)
+            }
+          }
+          this.log?.info(
+            { levelId, benchId: seat.benchId, roomId: reported },
+            'bench rebound to the room its players report from'
+          )
+        }
       }
 
       // Rooms that must render this level's crowd: on a seated level that is
@@ -350,6 +389,20 @@ export class ReservationService {
         }
 
         const full = this.pendingFullSnapshots.has(roomId)
+        // A full snapshot carries EVERY remote seat, not the diff: the room's
+        // cache is the thing that is suspect (send failed earlier, or the
+        // room's own state was rebuilt), so diffing against it proves nothing.
+        const outboundSeats: SnapshotSeat[] = full
+          ? allRemote.map(seat => ({
+              playerId: seat.playerId,
+              entityId: seat.entityId,
+              benchId: seat.benchId,
+              seatId: seat.seatId,
+              position: seat.position,
+              levelTime: seat.levelTime,
+              spotlight: spotlighted === seat.playerId
+            }))
+          : remoteSeats
 
         // The performance session (packet 24) rides on this frame. The live
         // server pushes it every second for as long as a performance exists
@@ -358,7 +411,11 @@ export class ReservationService {
         // diff is otherwise empty (the usual single-room case) would otherwise
         // never learn who is performing.
         const spotlightSession = this.spotlightSession(levelId)
-        if (remoteSeats.length === 0 && removed.length === 0 && !spotlightSession) {
+        if (
+          outboundSeats.length === 0 &&
+          removed.length === 0 &&
+          !spotlightSession
+        ) {
           continue
         }
 
@@ -367,7 +424,7 @@ export class ReservationService {
             snapshot,
             {
               levelId,
-              seats: remoteSeats,
+              seats: outboundSeats,
               removed,
               full,
               spotlightSession
@@ -658,6 +715,23 @@ export class ReservationService {
       )
       if (ack.code === ErrorCode.OK) {
         this.seated.set(playerId, { levelId, roomId })
+        // Remember the room the seat lives in even before the first
+        // seat.occupied telemetry: the snapshot round uses this to rebind a
+        // bench whose host room binding was lost, and a seat recorded without
+        // a room can never be rebound (roomId stays null forever). Reuse any
+        // position already reported; if none yet, record the room alone by
+        // passing the seat's placeholder position — setPosition keeps the
+        // previous position when only the room is new information.
+        const known = this.allocator
+          .snapshot(levelId)
+          .find(entry => entry.playerId === playerId)
+        this.allocator.setPosition(
+          levelId,
+          playerId,
+          known?.position ?? [0, 0, 0],
+          known?.levelTime ?? Date.now() / 1000,
+          roomId
+        )
       } else {
         this.log?.warn(
           { playerId, roomId, levelId, code: ack.code },
