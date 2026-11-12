@@ -24,6 +24,7 @@ import {
 } from '../types/branded.js'
 import {
   AllocationRequestSchema,
+  AudienceChatGlobalRequestSchema,
   BatchRoomLookupSchema,
   NodeAckSchema,
   NodeEventSchema,
@@ -157,6 +158,8 @@ export class ManagerGateway {
     this.performanceTimer = setInterval(() => {
       this.runtime.performance.tick()
       this.runtime.audienceReactions.tick()
+      this.runtime.liveBroadcasts.tick()
+      this.runtime.audienceChatGlobal.tick()
     }, 100)
     this.performanceTimer.unref?.()
     this.audienceSnapshotTimer = setInterval(() => {
@@ -183,6 +186,8 @@ export class ManagerGateway {
     this.heartbeat.stop()
     if (this.performanceTimer) clearInterval(this.performanceTimer)
     this.performanceTimer = undefined
+    this.runtime.liveBroadcasts.stop()
+    this.runtime.audienceChatGlobal.stop()
     this.runtime.audienceReactions.stop()
     this.runtime.performance.stop()
     this.runtime.seating.stop()
@@ -251,6 +256,8 @@ export class ManagerGateway {
     this.runtime.rooms.purgeDepartedPlayers()
     for (const { nodeId, rooms } of this.runtime.rooms.sweepSuspectedNodes()) {
       for (const room of rooms) {
+        this.runtime.liveBroadcasts.forgetRoom(asRoomId(room.roomId as string))
+        this.runtime.audienceChatGlobal.forgetRoom(asRoomId(room.roomId as string))
         this.runtime.audienceReactions.forgetRoom(asRoomId(room.roomId as string))
         this.runtime.performance.forgetRoom(asRoomId(room.roomId as string))
         this.runtime.moves.forgetRoom(room.roomId as string)
@@ -319,7 +326,7 @@ export class ManagerGateway {
         const parsed = NodeEventSchema.parse(
           JSON.parse(await this.readBody(req, 128 * 1024))
         )
-        if (parsed.event.startsWith('performance.') || parsed.event === 'audience.reaction') throw new HermesError(ErrorCode.FORBIDDEN, 'audience events require a current node socket')
+        if (parsed.event.startsWith('performance.') || parsed.event.startsWith('liveBroadcast.') || parsed.event === 'audience.reaction') throw new HermesError(ErrorCode.FORBIDDEN, 'audience events require a current node socket')
         const nodeId =
           parsed.data.nodeId ??
           asNodeId(`http-${parsed.data.roomId ?? randomUUID()}`)
@@ -333,6 +340,21 @@ export class ManagerGateway {
             .catch(error => this.log.error({ err: error }, 'plan cycle error'))
         }
         this.writeJson(res, 200, { code: ErrorCode.OK })
+        return
+      }
+      if (method === 'POST' && url.pathname === '/audience/chat-global') {
+        this.requireDebugToken(req)
+        const idempotencyKeyHeader = req.headers['idempotency-key']
+        const idempotencyKey = typeof idempotencyKeyHeader === 'string' && idempotencyKeyHeader.trim().length > 0 && idempotencyKeyHeader.trim().length <= 128
+          ? idempotencyKeyHeader.trim()
+          : undefined
+        const body = AudienceChatGlobalRequestSchema.parse(
+          JSON.parse(await this.readBody(req, 16 * 1024))
+        )
+        const state = this.runtime.audienceChatGlobal.set(
+          body.levelId, body.enabled, body.seconds, idempotencyKey
+        )
+        this.writeJson(res, 200, { code: ErrorCode.OK, data: state })
         return
       }
       if (method === 'GET' && url.pathname === '/healthz') {
@@ -515,9 +537,25 @@ export class ManagerGateway {
         error instanceof HermesError && error.message.endsWith('body too large')
       this.writeJson(
         res,
-        tooLarge ? 413 : isHermesError(error) ? 400 : 500,
+        tooLarge
+          ? 413
+          : isHermesError(error)
+            ? this.httpStatusForError(error)
+            : 500,
         this.errorReply(error)
       )
+    }
+  }
+
+  private httpStatusForError (error: HermesError): number {
+    switch (error.code) {
+      case ErrorCode.UNAUTHORIZED: return 401
+      case ErrorCode.FORBIDDEN: return 403
+      case ErrorCode.NOT_FOUND: return 404
+      case ErrorCode.CONFLICT: return 409
+      case ErrorCode.BAD_REQUEST: return 400
+      case ErrorCode.PAYLOAD_TOO_LARGE: return 413
+      default: return 400
     }
   }
 
@@ -625,7 +663,9 @@ export class ManagerGateway {
     this.heartbeat.track(state.nodeId, ws)
     const restored = this.runtime.rooms.restoreNode(state.nodeId)
     this.runtime.audienceReactions.forgetNode(state.nodeId)
+    this.runtime.audienceChatGlobal.reconnectNode(state.nodeId)
     this.runtime.performance.reconnectNode(state.nodeId)
+    this.runtime.liveBroadcasts.reconnectNode(state.nodeId)
     if (restored) {
       this.log.info(
         { nodeId: state.nodeId },
@@ -675,6 +715,8 @@ export class ManagerGateway {
     if (!this.runtime.nodes.getTransport(nodeId)) {
       return
     }
+    this.runtime.liveBroadcasts.forgetNode(nodeId)
+    this.runtime.audienceChatGlobal.forgetNode(nodeId)
     this.runtime.audienceReactions.forgetNode(nodeId)
     this.runtime.nodes.unregister(nodeId)
     this.runtime.rooms.markNodeSuspected(nodeId)
@@ -847,6 +889,7 @@ export class ManagerGateway {
   }
 
   private applyNodeEvent (event: INodeEvent, fromNodeSocket = true): boolean {
+    if (event.event.startsWith('liveBroadcast.')) return fromNodeSocket && this.runtime.liveBroadcasts.handle(event)
     if (event.event === 'audience.reaction') return fromNodeSocket && this.runtime.audienceReactions.handle(event)
     if (event.event.startsWith('performance.')) return fromNodeSocket && this.runtime.performance.handle(event)
     if (event.data.roomId && event.event !== 'room.created') {
@@ -854,6 +897,8 @@ export class ManagerGateway {
       if (owner && owner.nodeId !== event.data.nodeId) return false
     }
     if (fromNodeSocket && event.event === 'room.destroyed' && event.data.roomId) {
+      this.runtime.liveBroadcasts.forgetRoom(event.data.roomId)
+      this.runtime.audienceChatGlobal.forgetRoom(event.data.roomId)
       this.runtime.audienceReactions.forgetRoom(event.data.roomId)
       this.runtime.performance.forgetRoom(event.data.roomId)
       this.runtime.seating.forgetRoom(event.data.roomId)
@@ -1118,7 +1163,7 @@ export class ManagerGateway {
         if (settled) return
         totalBytes += chunk.byteLength
         if (totalBytes > maxBytes) {
-          fail(new HermesError(ErrorCode.BAD_REQUEST, 'request body too large'))
+          fail(new HermesError(ErrorCode.PAYLOAD_TOO_LARGE, 'request body too large'))
           req.resume()
           return
         }

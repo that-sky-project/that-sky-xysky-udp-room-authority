@@ -7,6 +7,8 @@ import { ReservationTracker } from './ReservationTracker.js'
 import { ReservationService } from './ReservationService.js'
 import { PerformanceService } from './PerformanceService.js'
 import { AudienceReactionService } from './AudienceReactionService.js'
+import { LiveBroadcastService } from './LiveBroadcastService.js'
+import { AudienceChatGlobalService } from './AudienceChatGlobalService.js'
 import { RequestRouter } from './RequestRouter.js'
 import { RoomCache } from './RoomCache.js'
 import { SeatAllocator } from './SeatAllocator.js'
@@ -28,6 +30,8 @@ export interface ManagerRuntime {
   seating: ReservationService
   performance: PerformanceService
   audienceReactions: AudienceReactionService
+  liveBroadcasts: LiveBroadcastService
+  audienceChatGlobal: AudienceChatGlobalService
 }
 export const createManagerRuntime = (
   config: ManagerConfig,
@@ -128,7 +132,15 @@ export const createManagerRuntime = (
   const performance = new PerformanceService(rooms, seating, coordinator, { durationMs: config.performanceDurationMs, preparationMs: config.performancePreparationMs, queueLimit: config.performanceQueueLimit }, logger)
   seating.setPerformanceService(performance)
   const audienceReactions = new AudienceReactionService(rooms, performance, coordinator, { ttlMs: config.audienceReactionTtlMs }, logger)
+  const audienceChatGlobal = new AudienceChatGlobalService(rooms, coordinator, { maxSeconds: config.audienceChatGlobalMaxSeconds }, logger)
+  const liveBroadcasts = new LiveBroadcastService(rooms, performance, coordinator, {
+    allowedPlayerUuids: config.liveBroadcastAllowedPlayerUuids,
+    playerNames: config.liveBroadcastPlayerNames,
+    maxStreamsPerLevel: config.liveBroadcastMaxStreamsPerLevel
+  }, logger)
   return {
+    audienceChatGlobal,
+    liveBroadcasts,
     audienceReactions,
     performance,
     nodes,

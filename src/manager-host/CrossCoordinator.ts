@@ -7,6 +7,10 @@ import type {
   IManagerCommand,
   INodeAck,
   AudienceReactionDelivery,
+  AudienceChatGlobalState,
+  LiveBroadcastCapability,
+  LiveBroadcastDelivery,
+  LiveBroadcastCommand,
   PerformanceState,
   PerformanceDecision,
   PerformanceDelivery,
@@ -184,12 +188,30 @@ export class CrossCoordinator {
       signal
     )
   }
+  public async chatGlobal (room: RoomSnapshot, data: AudienceChatGlobalState, signal?: AbortSignal): Promise<INodeAck> {
+    const current = this.rooms.getRoom(room.roomId)
+    const transport = this.nodes.getTransport(room.nodeId)
+    if (!current || current.nodeId !== room.nodeId || current.udpHost !== room.udpHost || current.udpPort !== room.udpPort ||
+      !transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
+      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'audience chat-global destination unavailable')
+    }
+    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd: 'audience.chatGlobal', data: { ...data, roomId: room.roomId } }, command => transport.send(command), signal)
+  }
   public async audienceReaction (room: RoomSnapshot, data: AudienceReactionDelivery, signal?: AbortSignal): Promise<INodeAck> {
     const transport = this.nodes.getTransport(room.nodeId)
     if (!transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
       throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'reaction destination unavailable')
     }
     return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd: 'audience.reaction', data }, command => transport.send(command), signal)
+  }
+  public async liveBroadcast (room: RoomSnapshot, cmd: LiveBroadcastCommand, data: LiveBroadcastCapability | LiveBroadcastDelivery, signal?: AbortSignal): Promise<INodeAck> {
+    const current = this.rooms.getRoom(room.roomId)
+    const transport = this.nodes.getTransport(room.nodeId)
+    if (!current || current.nodeId !== room.nodeId || current.udpHost !== room.udpHost || current.udpPort !== room.udpPort ||
+      !transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
+      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'live broadcast destination unavailable')
+    }
+    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd, data: { ...data, roomId: room.roomId } }, command => transport.send(command), signal)
   }
   public async performance (
     room: RoomSnapshot,

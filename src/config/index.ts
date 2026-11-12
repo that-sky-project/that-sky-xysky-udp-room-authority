@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { PlayerUuidSchema } from '../types/contracts.js';
 export interface ManagerConfig {
   host: string;
   port: number;
@@ -11,6 +12,10 @@ export interface ManagerConfig {
   performancePreparationMs: number;
   performanceQueueLimit: number;
   audienceReactionTtlMs: number;
+  audienceChatGlobalMaxSeconds: number;
+  liveBroadcastAllowedPlayerUuids: string[];
+  liveBroadcastPlayerNames: Record<string, string>;
+  liveBroadcastMaxStreamsPerLevel: number;
   maxRooms: number;
   candidateRoomLimit: number;
   staleRoomMs: number;
@@ -51,6 +56,27 @@ export interface ManagerConfig {
 }
 const positiveInt = (fallback: number) => z.coerce.number().int().positive().default(fallback);
 const floatFrom = (fallback: number) => z.coerce.number().default(fallback);
+const livePlayerEntry = z.string().transform((value, ctx) => {
+  const separator = value.indexOf(":");
+  const name = separator < 0 ? null : value.slice(0, separator).trim();
+  const uuid = PlayerUuidSchema.safeParse(separator < 0 ? value : value.slice(separator + 1));
+  if (!uuid.success || (name !== null && (!name || Array.from(name).length > 64 || /[\u0000-\u001f\u007f]/u.test(name)))) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "expected UUID or displayName:UUID with a nonempty name of at most 64 characters" });
+    return z.NEVER;
+  }
+  return { playerId: uuid.data, name };
+});
+const livePlayerEntries = z.array(livePlayerEntry).max(8192).default([]).superRefine((entries, ctx) => {
+  const names = new Map<string, string>();
+  entries.forEach((entry, index) => {
+    if (entry.name === null) return;
+    const previous = names.get(entry.playerId);
+    if (previous !== undefined && previous !== entry.name) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [index], message: "conflicting display names for the same UUID" });
+    }
+    names.set(entry.playerId, entry.name);
+  });
+});
 const configSchema = z
   .object({
     host: z.string().trim().min(1).default("0.0.0.0"),
@@ -59,7 +85,12 @@ const configSchema = z
     logging: z
       .object({ level: z.string().trim().min(1).default("info") })
       .default({}),
+    liveBroadcast: z.object({
+      allowedPlayerUuids: livePlayerEntries,
+      maxStreamsPerLevel: positiveInt(7).pipe(z.number().max(7))
+    }).strict().default({}),
     audienceReaction: z.object({ ttlMs: positiveInt(2000) }).default({}),
+    audienceChatGlobal: z.object({ maxSeconds: positiveInt(86_400) }).strict().default({}),
     performance: z.object({ durationMs: positiveInt(300_000), preparationMs: positiveInt(15_000), queueLimit: positiveInt(1000).pipe(z.number().max(10000)) }).default({}),
     rooms: z
       .object({
@@ -136,6 +167,10 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     performancePreparationMs: parsed.performance.preparationMs,
     performanceQueueLimit: parsed.performance.queueLimit,
     audienceReactionTtlMs: parsed.audienceReaction.ttlMs,
+    audienceChatGlobalMaxSeconds: parsed.audienceChatGlobal.maxSeconds,
+    liveBroadcastAllowedPlayerUuids: [...new Set(parsed.liveBroadcast.allowedPlayerUuids.map(entry => entry.playerId))],
+    liveBroadcastPlayerNames: Object.fromEntries(parsed.liveBroadcast.allowedPlayerUuids.filter(entry => entry.name !== null).map(entry => [entry.playerId, entry.name!])),
+    liveBroadcastMaxStreamsPerLevel: parsed.liveBroadcast.maxStreamsPerLevel,
     maxRooms: parsed.rooms.max_rooms,
     candidateRoomLimit: parsed.rooms.candidate_room_limit,
     staleRoomMs: parsed.rooms.stale_room_ms,

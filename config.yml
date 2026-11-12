@@ -7,8 +7,16 @@ performance:
   durationMs: 300000 # QWD authoritative duration; no client deadline compensation
   queueLimit: 1000 # bounded FIFO; maximum 10000
 
+liveBroadcast:
+  allowedPlayerUuids: [ "" ] # displayName:UUID or UUID; authorization uses UUID only
+  maxStreamsPerLevel: 7 # conservative policy reserves one piano playback slot
+  # Fixed defaults: capability lease 5000ms, refresh 2000ms, event TTL 3000ms, stream idle 5000ms.
+
 audienceReaction:
   ttlMs: 2000 # next normal 1Hz frame plus network/application ACK margin; no replay after deadline
+
+audienceChatGlobal:
+  maxSeconds: 86400 # maximum accepted operator-requested global-chat window per level
 
 logging:
   # pino level: fatal | error | warn | info | debug | trace

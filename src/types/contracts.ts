@@ -22,6 +22,65 @@ import {
   asUnixMs
 } from './branded.js'
 
+export interface AudienceChatGlobalState {
+  authorityEpoch: string
+  revision: number
+  levelId: number
+  enabled: boolean
+  remainingSeconds: number
+  serverNowMs: number
+  expiresAtMs: number
+}
+export type AudienceChatGlobalCommand = 'audience.chatGlobal'
+export const AudienceChatGlobalRequestSchema = z.object({
+  levelId: z.number().int().min(0).max(0xffffffff),
+  enabled: z.boolean(),
+  seconds: z.number().int().optional()
+}).strict()
+
+export interface LiveBroadcastCapability {
+  authorityEpoch: string
+  capabilityId: string
+  revision: number
+  levelId: number
+  allowedPlayerIds: string[]
+  serverNowMs: number
+  expiresAtMs: number
+}
+export interface LiveBroadcastDelivery {
+  authorityEpoch: string
+  /** Destination room capability, never the source upload capability. */
+  capabilityId: string
+  levelId: number
+  playerId: string
+  streamId: string
+  eventId: string
+  eventSeq: number
+  serverNowMs: number
+  expiresAtMs: number
+  /** QWD clock in seconds. */
+  timestamp: number
+  actionId: number
+  payloadBase64: string
+}
+export type LiveBroadcastCommand = 'liveBroadcast.capability' | 'liveBroadcast.deliver'
+export const LIVE_BROADCAST_MAX_PAYLOAD_BYTES = 48 * 1024
+export const PlayerUuidSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).transform(value => value.toLowerCase())
+const liveId = z.string().min(1).max(128)
+const liveLevel = z.number().int().min(0).max(0xffffffff)
+export const LiveBroadcastPublishSchema = z.object({
+  roomId: liveId, player: z.object({ playerId: PlayerUuidSchema }).passthrough(), levelId: liveLevel,
+  capabilityId: liveId, sourceStreamId: liveId, eventId: liveId,
+  timestamp: z.number().finite().min(0).max(Number.MAX_SAFE_INTEGER),
+  actionId: z.number().int().min(0).max(0xffffffff),
+  payloadBase64: z.string().max(4 * Math.ceil(LIVE_BROADCAST_MAX_PAYLOAD_BYTES / 3)).refine(value =>
+    value.length > 0 && value.length % 4 === 0 &&
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value) &&
+    Buffer.byteLength(value, 'base64') <= LIVE_BROADCAST_MAX_PAYLOAD_BYTES &&
+    Buffer.from(value, 'base64').toString('base64') === value, 'invalid or oversized canonical base64')
+})
+export const LiveBroadcastSyncSchema = z.object({ roomId: liveId, levelIds: z.array(liveLevel).max(16) })
+
 export interface AudienceReaction {
   flag7: number
   /** Ordinary audience reactions only; spotlight types 14/15 are excluded. */
@@ -208,7 +267,9 @@ export const NodeEventSchema = z
       'audience.reaction',
       'performance.request',
       'performance.publish',
-      'performance.sync'
+      'performance.sync',
+      'liveBroadcast.sync',
+      'liveBroadcast.publish'
     ]),
     data: z
       .object({
@@ -263,6 +324,7 @@ export const NodeEventSchema = z
         timestamp: z.number().finite().optional(),
         requestId: stringId.optional(), requested: z.boolean().optional(),
         expectedSessionId: stringId.optional(), expectedPreparationId: stringId.optional(), sessionId: stringId.optional(),
+        capabilityId: liveId.optional(), sourceStreamId: liveId.optional(),
         eventId: stringId.optional(), actionId: z.number().optional(), payloadBase64: z.string().optional(),
         levelIds: z.array(z.number()).optional(), authorityEpoch: stringId.optional(),
         eventCursors: z.record(z.number()).optional(),
@@ -275,6 +337,8 @@ export const NodeEventSchema = z
     const schema = value.event === 'performance.request' ? performanceRequest
       : value.event === 'performance.publish' ? performancePublish
       : value.event === 'performance.sync' ? performanceSync
+      : value.event === 'liveBroadcast.publish' ? LiveBroadcastPublishSchema
+      : value.event === 'liveBroadcast.sync' ? LiveBroadcastSyncSchema
       : value.event === 'audience.reaction' ? audienceReaction : undefined
     if (schema) {
       const parsed = schema.safeParse(value.data)
@@ -305,6 +369,8 @@ export interface INodeEvent {
     | 'performance.request'
     | 'performance.publish'
     | 'performance.sync'
+    | 'liveBroadcast.sync'
+    | 'liveBroadcast.publish'
   data: {
     nodeId: NodeId
     roomId?: RoomId | undefined
@@ -333,6 +399,8 @@ export interface INodeEvent {
     expectedSessionId?: string | undefined
     expectedPreparationId?: string | undefined
     sessionId?: string | undefined
+    capabilityId?: string | undefined
+    sourceStreamId?: string | undefined
     eventId?: string | undefined
     actionId?: number | undefined
     payloadBase64?: string | undefined
@@ -375,11 +443,14 @@ export const ManagerCommandSchema = z
       'seat.release',
       'audience.snapshot',
       'audience.reaction',
+      'audience.chatGlobal',
       'level.audience',
       'performance.state',
       'performance.decision',
       'performance.deliver',
-      'performance.gap'
+      'performance.gap',
+      'liveBroadcast.capability',
+      'liveBroadcast.deliver'
     ]),
     data: z.record(z.unknown()).optional()
   })
@@ -400,8 +471,10 @@ export interface IManagerCommand<TData = unknown> {
     | 'seat.release'
     | 'audience.snapshot'
     | 'audience.reaction'
+    | AudienceChatGlobalCommand
     | 'level.audience'
     | PerformanceCommand
+    | LiveBroadcastCommand
   data?: TData | undefined
 }
 

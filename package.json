@@ -15,7 +15,8 @@
     "verify:seating": "npm run build && node scripts/verify-seating.mjs",
     "verify:snapshot": "npm run build && node scripts/verify-snapshot-round.mjs",
     "verify:performance": "npm run build && node scripts/verify-performance.mjs",
-    "verify:audience-reaction": "npm run build && node scripts/verify-audience-reaction.mjs"
+    "verify:audience-reaction": "npm run build && node scripts/verify-audience-reaction.mjs",
+    "verify:live-broadcast": "npm run build && node scripts/verify-live-broadcast.mjs"
   },
   "dependencies": {
     "lru-cache": "^11.0.2",

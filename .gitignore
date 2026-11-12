@@ -15,5 +15,6 @@ Thumbs.db
 scripts/*
 !scripts/verify-performance.mjs
 !scripts/verify-audience-reaction.mjs
+!scripts/verify-live-broadcast.mjs
 
 .vscode/
