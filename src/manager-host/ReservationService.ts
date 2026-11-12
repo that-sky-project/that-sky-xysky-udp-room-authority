@@ -61,13 +61,6 @@ const sameSeat = (a: CachedSeat, b: CachedSeat): boolean => {
  * level receives it back through the audience snapshot, so all rooms — not
  * just the performer's — flip the entity into the spotlight render path.
  */
-interface SpotlightState {
-  playerId: PlayerId
-  startedAt: number
-}
-
-/** How long a performer stays on stage when nobody releases them. */
-export const SPOTLIGHT_MAX_MS = 5 * 60 * 1000
 
 const DEFAULT_SEAT_RELEASE_GRACE_MS = 15_000
 
@@ -98,8 +91,15 @@ export class ReservationService {
   private readonly levelBaselines = new Map<number, Map<string, CachedSeat>>()
   /** Set while a snapshot round is being awaited; guards re-entrant rounds. */
   private snapshotInFlight = false
-  /** levelId -> the current hall-wide performer. One at a time. */
-  private readonly spotlights = new Map<number, SpotlightState>()
+  private performance: {
+    currentPerformer(levelId: number): PlayerId | undefined
+    removePlayer(playerId: PlayerId, reason: string, levelId?: number): void
+  } | undefined
+  public setPerformanceService (service: NonNullable<ReservationService['performance']>): void { this.performance = service }
+  public stop (): void {
+    for (const timer of this.pendingReleases.values()) clearTimeout(timer)
+    this.pendingReleases.clear()
+  }
   /**
    * Rooms whose last diff frame failed to reach the node. The next round for
    * them sends every remote seat with `full: true` instead of a bare diff,
@@ -229,7 +229,7 @@ export class ReservationService {
         this.levelBaselines.get(levelId) ?? new Map<string, CachedSeat>()
       const current = new Map<string, CachedSeat>()
       const changed: SnapshotSeat[] = []
-      const spotlighted = this.currentSpotlight(levelId)
+      const spotlighted = this.performance?.currentPerformer(levelId)
       for (const seat of seats) {
         const entry: CachedSeat = {
           entityId: seat.entityId,
@@ -362,7 +362,7 @@ export class ReservationService {
           this.snapshotCache.get(key) ?? new Map<string, CachedSeat>()
         const currentRoom = new Map<string, CachedSeat>()
         const remoteSeats: SnapshotSeat[] = []
-        const spotlighted = this.currentSpotlight(levelId)
+        const spotlighted = this.performance?.currentPerformer(levelId)
         for (const seat of allRemote) {
           const entry: CachedSeat = {
             entityId: seat.entityId,
@@ -404,33 +404,23 @@ export class ReservationService {
             }))
           : remoteSeats
 
-        // The performance session (packet 24) rides on this frame. The live
-        // server pushes it every second for as long as a performance exists
-        // (3294 packets in the 54 s reference capture), so a seat-less diff
-        // must still go out while someone is on stage — a room whose bench
-        // diff is otherwise empty (the usual single-room case) would otherwise
-        // never learn who is performing.
-        const spotlightSession = this.spotlightSession(levelId)
-        if (
-          outboundSeats.length === 0 &&
-          removed.length === 0 &&
-          !spotlightSession
-        ) {
+        // Performance state has its own versioned delivery channel, including idle.
+        if (outboundSeats.length === 0 && removed.length === 0 && !full) {
           continue
         }
 
         try {
-          await this.coordinator.audienceSnapshot(
+          const ack = await this.coordinator.audienceSnapshot(
             snapshot,
             {
               levelId,
               seats: outboundSeats,
               removed,
-              full,
-              spotlightSession
+              full
             },
             signal
           )
+          if (ack.code !== ErrorCode.OK) throw new Error('audience snapshot rejected')
           // Remember the room's full remote state, not just the seats this
           // frame happened to carry: caching a partial frame would make the
           // seats it omitted look deleted on the next round.
@@ -480,6 +470,7 @@ export class ReservationService {
   public release (playerId: PlayerId, levelId?: number): boolean {
     this.cancelPendingRelease(playerId)
     this.seated.delete(playerId)
+    this.performance?.removePlayer(playerId, 'seat_released', levelId)
     if (levelId !== undefined) return this.allocator.release(levelId, playerId)
     const seat = this.allocator.latestSeatOf(playerId)
     return seat ? this.allocator.release(seat.levelId, playerId) : false
@@ -503,12 +494,7 @@ export class ReservationService {
         if (!bound || bound.roomId !== roomId) continue
         this.cancelPendingRelease(seat.playerId)
         this.seated.delete(seat.playerId)
-        // A reclaimed room cannot hold the stage any more; the diff would
-        // otherwise keep telling every room the departed player is lit.
-        if (this.spotlights.get(levelId)?.playerId === seat.playerId) {
-          this.spotlights.delete(levelId)
-          this.log?.info({ levelId, playerId: seat.playerId }, 'spotlight ended: performer left')
-        }
+        this.performance?.removePlayer(seat.playerId, 'room_reclaimed', levelId)
         if (this.allocator.release(levelId, seat.playerId)) freed += 1
       }
     }
@@ -543,6 +529,7 @@ export class ReservationService {
           : this.allocator.seatOf(levelId, playerId)
       if (!seat) return
       this.allocator.release(seat.levelId, playerId)
+      this.performance?.removePlayer(playerId, 'seat_released', seat.levelId)
       this.log?.info(
         {
           playerId,
@@ -562,73 +549,6 @@ export class ReservationService {
     if (seat && !levelNeedsSeat(seat.levelId))
       this.noteSeatReleased(playerId, seat.levelId)
   }
-
-  /**
-   * Record a hall-wide spotlight change reported by a node.
-   *
-   * One performer per level: a new request while someone else is on stage
-   * replaces them. The change reaches every room through the next audience
-   * snapshot round, because the diff treats `spotlight` as part of seat state.
-   *
-   * @returns whether the state was applied (a change for an unknown level or a
-   *   player without a seat in it is ignored)
-   */
-  public noteSpotlightChanged (levelId: number, playerId: PlayerId, active: boolean): boolean {
-    if (!levelNeedsSeat(levelId)) return false
-    const existing = this.spotlights.get(levelId)
-    if (!active) {
-      if (!existing || existing.playerId !== playerId) return false
-      this.spotlights.delete(levelId)
-      this.log?.info({ levelId, playerId }, 'spotlight released')
-      return true
-    }
-    const seat = this.allocator.seatOf(levelId, playerId)
-    if (!seat) {
-      this.log?.warn({ levelId, playerId }, 'spotlight request from a player without a seat; ignored')
-      return false
-    }
-    this.spotlights.set(levelId, { playerId, startedAt: Date.now() })
-    this.log?.info(
-      { levelId, playerId, benchId: seat.benchId, seatId: seat.seatId, replaced: existing?.playerId },
-      'spotlight started'
-    )
-    return true
-  }
-
-  /** The player currently on stage in a level, if any and not expired. */
-  public currentSpotlight (levelId: number): PlayerId | undefined {
-    const state = this.spotlights.get(levelId)
-    if (!state) return undefined
-    if (Date.now() - state.startedAt > SPOTLIGHT_MAX_MS) {
-      this.spotlights.delete(levelId)
-      this.log?.info({ levelId, playerId: state.playerId }, 'spotlight expired')
-      return undefined
-    }
-    return state.playerId
-  }
-
-  /**
-   * The performance-session descriptor for a level's current spotlight, in the
-   * shape the client's packet-24 handler parses (`sub_1409508C0` reads
-   * `plyr[0].phdr.id` — the performer's uuid — and `sub_1417F8190` keys the
-   * stage session by `stid`). Null when nobody is on stage.
-   */
-  public spotlightSession (levelId: number): {
-    sessionId: string
-    performerId: string
-    startedAt: number
-  } | null {
-    const state = this.spotlights.get(levelId)
-    if (!state) return null
-    if (Date.now() - state.startedAt > SPOTLIGHT_MAX_MS) return null
-    return {
-      // One stage per level, so the level id is the stable session key.
-      sessionId: `stage-${levelId}`,
-      performerId: state.playerId,
-      startedAt: state.startedAt
-    }
-  }
-
 
   public cancelPendingRelease (playerId: PlayerId): void {
     const timer = this.pendingReleases.get(playerId)

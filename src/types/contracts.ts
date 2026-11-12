@@ -22,6 +22,94 @@ import {
   asUnixMs
 } from './branded.js'
 
+export interface AudienceReaction {
+  flag7: number
+  /** Ordinary audience reactions only; spotlight types 14/15 are excluded. */
+  type: number
+}
+export interface AudienceReactionDelivery {
+  authorityEpoch: string
+  levelId: number
+  playerId: string
+  eventId: string
+  /** QWD sequence scoped to (authorityEpoch, levelId, playerId); not a wire counter. */
+  eventSeq: number
+  serverNowMs: number
+  expiresAtMs: number
+  reaction: AudienceReaction
+}
+export const AudienceReactionSchema = z.object({
+  flag7: z.number().int().min(0).max(7),
+  type: z.number().int().min(0).max(13)
+}).strict()
+
+export interface PerformanceState {
+  authorityEpoch: string
+  levelId: number
+  revision: number
+  serverNowMs: number
+  /** Preparation keeps its player at queue[0]; no broadcast session exists yet. */
+  preparing: {
+    preparationId: string
+    performerId: string
+    startedAtMs: number
+    expiresAtMs: number
+    durationMs: number
+  } | null
+  current: {
+    sessionId: string
+    performerId: string
+    startedAtMs: number
+    // The authoritative deadline is never shifted. Client StreamInfo deadline
+    // encoding (including any performer-only compensation) belongs to the node.
+    expiresAtMs: number
+    durationMs: number
+  } | null
+  /** FIFO array order is the receiver's zero-based queue index; QWD emits no wire fields. */
+  queue: Array<{ playerId: string; enqueuedAtMs: number }>
+  lastEnded: {
+    sessionId: string
+    performerId: string
+    endedAtMs: number
+    reason: string
+    revision: number
+  } | null
+}
+export interface PerformanceDecision {
+  requestId: string
+  playerId: string
+  requested: boolean
+  status: 'started' | 'queued' | 'released' | 'cancelled' | 'rejected'
+  reason?: string | undefined
+  state: PerformanceState
+}
+export interface PerformanceDelivery {
+  state: PerformanceState
+  eventId: string
+  eventSeq: number
+  sessionId: string
+  playerId: string
+  timestamp: number
+  actionId: number
+  payloadBase64: string
+}
+export interface PerformanceGap {
+  authorityEpoch: string
+  levelId: number
+  sessionId: string | null
+  requestedCursor: number
+  oldestAvailableSeq: number
+  latestEventSeq: number
+  reason: 'epoch_changed' | 'cursor_ahead' | 'journal_gap' | 'session_ended'
+}
+export type PerformanceCommand = 'performance.state' | 'performance.decision' | 'performance.deliver' | 'performance.gap'
+export const PERFORMANCE_MAX_PAYLOAD_BYTES = 64 * 1024
+const strictBase64 = z.string().max(4 * Math.ceil(PERFORMANCE_MAX_PAYLOAD_BYTES / 3))
+  .refine(value => value.length > 0 && value.length % 4 === 0 &&
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value) &&
+    Buffer.byteLength(value, 'base64') <= PERFORMANCE_MAX_PAYLOAD_BYTES &&
+    Buffer.from(value, 'base64').toString('base64') === value, 'invalid or oversized canonical base64')
+
 const stringId = z.string().min(1).max(128)
 const commandId = z.number().int().positive().transform(asCommandId)
 const port = z.number().int().min(1).max(65535).transform(asPort)
@@ -80,6 +168,25 @@ export interface IAllocationReply {
   data?: RoomAssignment | { message: string; details?: unknown } | undefined
 }
 
+const audienceReaction = z.object({
+  roomId: stringId, player: PlayerSchema, levelId: z.number().int().positive(),
+  eventId: stringId, reaction: AudienceReactionSchema
+})
+const performanceRequest = z.object({
+  roomId: stringId, player: PlayerSchema, levelId: z.number().int().positive(),
+  requestId: stringId, requested: z.boolean(), expectedSessionId: stringId.optional(), expectedPreparationId: stringId.optional()
+})
+const performancePublish = z.object({
+  roomId: stringId, player: PlayerSchema, levelId: z.number().int().positive(),
+  sessionId: stringId, eventId: stringId, timestamp: z.number().finite(),
+  actionId: z.number().int().min(0).max(0xffffffff), payloadBase64: strictBase64
+})
+const performanceSync = z.object({
+  roomId: stringId, levelIds: z.array(z.number().int().positive()).max(16),
+  authorityEpoch: stringId.optional(),
+  eventCursors: z.record(stringId, z.number().int().nonnegative().safe()).refine(value => Object.keys(value).length <= 16).optional()
+})
+
 export const NodeEventSchema = z
   .object({
     v: protocolVersion.default(asProtocolVersion(1)),
@@ -98,7 +205,10 @@ export const NodeEventSchema = z
       'reservation.expired',
       'seat.occupied',
       'seat.released',
-      'spotlight.changed'
+      'audience.reaction',
+      'performance.request',
+      'performance.publish',
+      'performance.sync'
     ]),
     data: z
       .object({
@@ -150,11 +260,29 @@ export const NodeEventSchema = z
         version: z.number().int().nonnegative().optional(),
         capacity: z.number().int().min(0).optional(),
         load: z.number().min(0).max(1).optional(),
-        timestamp: unixMs.optional()
+        timestamp: z.number().finite().optional(),
+        requestId: stringId.optional(), requested: z.boolean().optional(),
+        expectedSessionId: stringId.optional(), expectedPreparationId: stringId.optional(), sessionId: stringId.optional(),
+        eventId: stringId.optional(), actionId: z.number().optional(), payloadBase64: z.string().optional(),
+        levelIds: z.array(z.number()).optional(), authorityEpoch: stringId.optional(),
+        eventCursors: z.record(z.number()).optional(),
+        reaction: AudienceReactionSchema.optional()
       })
       .passthrough()
   })
   .passthrough()
+  .superRefine((value, ctx) => {
+    const schema = value.event === 'performance.request' ? performanceRequest
+      : value.event === 'performance.publish' ? performancePublish
+      : value.event === 'performance.sync' ? performanceSync
+      : value.event === 'audience.reaction' ? audienceReaction : undefined
+    if (schema) {
+      const parsed = schema.safeParse(value.data)
+      if (!parsed.success) for (const issue of parsed.error.issues) ctx.addIssue({ ...issue, path: ['data', ...issue.path] })
+    } else if (value.data.timestamp !== undefined && (!Number.isSafeInteger(value.data.timestamp) || value.data.timestamp < 0)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['data', 'timestamp'], message: 'expected Unix milliseconds' })
+    }
+  })
 
 export interface INodeEvent {
   v?: ProtocolVersion | undefined
@@ -173,7 +301,10 @@ export interface INodeEvent {
     | 'reservation.expired'
     | 'seat.occupied'
     | 'seat.released'
-    | 'spotlight.changed'
+    | 'audience.reaction'
+    | 'performance.request'
+    | 'performance.publish'
+    | 'performance.sync'
   data: {
     nodeId: NodeId
     roomId?: RoomId | undefined
@@ -197,14 +328,24 @@ export interface INodeEvent {
     entityId?: number | undefined
     position?: [number, number, number] | undefined
     levelTime?: number | undefined
-    /** `spotlight.changed`: whether the player entered (true) or left the stage. */
-    active?: boolean | undefined
+    requestId?: string | undefined
+    requested?: boolean | undefined
+    expectedSessionId?: string | undefined
+    expectedPreparationId?: string | undefined
+    sessionId?: string | undefined
+    eventId?: string | undefined
+    actionId?: number | undefined
+    payloadBase64?: string | undefined
+    levelIds?: number[] | undefined
+    authorityEpoch?: string | undefined
+    eventCursors?: Record<string, number> | undefined
+    reaction?: AudienceReaction | undefined
     occupiedPorts?: Port[] | undefined
     rooms?: RoomSnapshot[] | undefined
     version?: number | undefined
     capacity?: number | undefined
     load?: number | undefined
-    timestamp?: UnixMs | undefined
+    timestamp?: number | undefined
   }
 }
 
@@ -233,7 +374,12 @@ export const ManagerCommandSchema = z
       'seat.assign',
       'seat.release',
       'audience.snapshot',
-      'level.audience'
+      'audience.reaction',
+      'level.audience',
+      'performance.state',
+      'performance.decision',
+      'performance.deliver',
+      'performance.gap'
     ]),
     data: z.record(z.unknown()).optional()
   })
@@ -253,7 +399,9 @@ export interface IManagerCommand<TData = unknown> {
     | 'seat.assign'
     | 'seat.release'
     | 'audience.snapshot'
+    | 'audience.reaction'
     | 'level.audience'
+    | PerformanceCommand
   data?: TData | undefined
 }
 

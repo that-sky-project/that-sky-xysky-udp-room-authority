@@ -993,6 +993,9 @@ export class MoveCoordinator {
   public telemetryGapCount (): number {
     return this.telemetryGap.size
   }
+  public hasTelemetryGap (roomId: RoomId): boolean {
+    return this.telemetryGap.has(roomId)
+  }
   public async manualMove (
     input: {
       sourceRoomId: string

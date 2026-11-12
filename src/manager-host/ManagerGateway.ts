@@ -85,6 +85,7 @@ export class ManagerGateway {
   private graceSweepTimer: NodeJS.Timeout | undefined
   /** Periodic hall-wide seating push, so every node can render the whole audience. */
   private audienceSnapshotTimer: NodeJS.Timeout | undefined
+  private performanceTimer: NodeJS.Timeout | undefined
   /** Per-room telemetry sequence guard: rejects stale/duplicate snapshots. */
   private readonly telemetrySeq = new Map<string, number>()
   /** Rate limit for the sequence-regression warning, per room. */
@@ -153,6 +154,11 @@ export class ManagerGateway {
     this.graceSweepTimer = setInterval(() => this.sweepSuspectedNodes(), 2_000)
     this.graceSweepTimer.unref?.()
 
+    this.performanceTimer = setInterval(() => {
+      this.runtime.performance.tick()
+      this.runtime.audienceReactions.tick()
+    }, 100)
+    this.performanceTimer.unref?.()
     this.audienceSnapshotTimer = setInterval(() => {
       this.runtime.seating
         .broadcastSnapshot()
@@ -175,6 +181,11 @@ export class ManagerGateway {
     this.nodeServer = undefined
 
     this.heartbeat.stop()
+    if (this.performanceTimer) clearInterval(this.performanceTimer)
+    this.performanceTimer = undefined
+    this.runtime.audienceReactions.stop()
+    this.runtime.performance.stop()
+    this.runtime.seating.stop()
     if (this.graceSweepTimer) clearInterval(this.graceSweepTimer)
     this.graceSweepTimer = undefined
     if (this.audienceSnapshotTimer) clearInterval(this.audienceSnapshotTimer)
@@ -240,6 +251,8 @@ export class ManagerGateway {
     this.runtime.rooms.purgeDepartedPlayers()
     for (const { nodeId, rooms } of this.runtime.rooms.sweepSuspectedNodes()) {
       for (const room of rooms) {
+        this.runtime.audienceReactions.forgetRoom(asRoomId(room.roomId as string))
+        this.runtime.performance.forgetRoom(asRoomId(room.roomId as string))
         this.runtime.moves.forgetRoom(room.roomId as string)
         const freed = this.runtime.seating.forgetRoom(asRoomId(room.roomId as string))
         if (freed > 0) {
@@ -306,6 +319,7 @@ export class ManagerGateway {
         const parsed = NodeEventSchema.parse(
           JSON.parse(await this.readBody(req, 128 * 1024))
         )
+        if (parsed.event.startsWith('performance.') || parsed.event === 'audience.reaction') throw new HermesError(ErrorCode.FORBIDDEN, 'audience events require a current node socket')
         const nodeId =
           parsed.data.nodeId ??
           asNodeId(`http-${parsed.data.roomId ?? randomUUID()}`)
@@ -313,7 +327,7 @@ export class ManagerGateway {
           ...parsed,
           data: { ...parsed.data, nodeId }
         }
-        if (this.applyNodeEvent(event) && isPlanningEvent(event)) {
+        if (this.applyNodeEvent(event, false) && isPlanningEvent(event)) {
           this.runtime.moves
             .planAndExecute()
             .catch(error => this.log.error({ err: error }, 'plan cycle error'))
@@ -610,6 +624,8 @@ export class ManagerGateway {
     this.runtime.nodes.register(transport)
     this.heartbeat.track(state.nodeId, ws)
     const restored = this.runtime.rooms.restoreNode(state.nodeId)
+    this.runtime.audienceReactions.forgetNode(state.nodeId)
+    this.runtime.performance.reconnectNode(state.nodeId)
     if (restored) {
       this.log.info(
         { nodeId: state.nodeId },
@@ -659,6 +675,7 @@ export class ManagerGateway {
     if (!this.runtime.nodes.getTransport(nodeId)) {
       return
     }
+    this.runtime.audienceReactions.forgetNode(nodeId)
     this.runtime.nodes.unregister(nodeId)
     this.runtime.rooms.markNodeSuspected(nodeId)
     for (const roomId of this.telemetrySeq.keys()) {
@@ -687,6 +704,7 @@ export class ManagerGateway {
     message: RawData,
     isBinary: boolean
   ): Promise<void> {
+    if (this.runtime.nodes.getTransport(state.nodeId)?.connectedAt !== state.connectedAt) return
     let raw: unknown
     try {
       if (isBinary)
@@ -828,7 +846,18 @@ export class ManagerGateway {
     return true
   }
 
-  private applyNodeEvent (event: INodeEvent): boolean {
+  private applyNodeEvent (event: INodeEvent, fromNodeSocket = true): boolean {
+    if (event.event === 'audience.reaction') return fromNodeSocket && this.runtime.audienceReactions.handle(event)
+    if (event.event.startsWith('performance.')) return fromNodeSocket && this.runtime.performance.handle(event)
+    if (event.data.roomId && event.event !== 'room.created') {
+      const owner = this.runtime.rooms.getRoom(event.data.roomId)
+      if (owner && owner.nodeId !== event.data.nodeId) return false
+    }
+    if (fromNodeSocket && event.event === 'room.destroyed' && event.data.roomId) {
+      this.runtime.audienceReactions.forgetRoom(event.data.roomId)
+      this.runtime.performance.forgetRoom(event.data.roomId)
+      this.runtime.seating.forgetRoom(event.data.roomId)
+    }
     if (event.event === 'room.created' && event.data.roomId) {
       const existing = this.runtime.rooms.getRoom(event.data.roomId)
       if (existing && existing.nodeId !== event.data.nodeId) {
@@ -915,6 +944,7 @@ export class ManagerGateway {
       const playerId = event.data.player.playerId
       const roomId = asRoomId(event.data.roomId as string)
       const levelId = Number(event.data.player.level ?? 0)
+      if (fromNodeSocket) this.runtime.performance.notePlayerSeen(playerId, roomId, levelId)
       this.runtime.seating
         .handlePlayerJoined(playerId, roomId, levelId)
         .catch(error =>
@@ -931,9 +961,11 @@ export class ManagerGateway {
       Array.isArray(event.data.players)
     ) {
       const roomId = asRoomId(event.data.roomId as string)
+      if (fromNodeSocket && !this.runtime.moves.hasTelemetryGap(roomId)) this.runtime.performance.noteRoomRoster(roomId, event.data.players.map(p => p.playerId), event.data.kind !== 'delta', event.data.removedPlayers)
       for (const player of event.data.players) {
         if (!player?.playerId) continue
         const levelId = Number(player.levelId ?? 0)
+        if (fromNodeSocket && !this.runtime.moves.hasTelemetryGap(roomId)) this.runtime.performance.notePlayerSeen(player.playerId, roomId, levelId)
         this.runtime.seating
           .notePlayerLevel(player.playerId, roomId, levelId)
           .catch(error =>
@@ -959,27 +991,18 @@ export class ManagerGateway {
       )
     }
  
-    if (event.event === 'seat.released' && event.data.player?.playerId) {
+    if (fromNodeSocket && event.event === 'seat.released' && event.data.player?.playerId) {
       const levelId =
         typeof event.data.levelId === 'number' && event.data.levelId > 0
           ? event.data.levelId
           : undefined
+      const loc = this.runtime.rooms.getPlayerLocation(event.data.player.playerId)
+      if (loc && event.data.roomId && loc.roomId !== event.data.roomId) return false
+      if (fromNodeSocket && event.data.roomId) this.runtime.performance.notePlayerLeft(event.data.player.playerId, event.data.roomId, levelId)
       this.runtime.seating.noteSeatReleased(event.data.player.playerId, levelId)
     }
-    if (
-      event.event === 'spotlight.changed' &&
-      event.data.player?.playerId &&
-      typeof event.data.levelId === 'number'
-    ) {
-      // Hall-wide stage effect: recorded here, fanned back out through the
-      // audience snapshot to every room rendering the level.
-      this.runtime.seating.noteSpotlightChanged(
-        event.data.levelId,
-        event.data.player.playerId,
-        event.data.active === true
-      )
-    }
-    if (event.event === 'player.leave' && event.data.player?.playerId) {
+    if (fromNodeSocket && event.event === 'player.leave' && event.data.player?.playerId) {
+      if (fromNodeSocket && event.data.roomId) this.runtime.performance.notePlayerLeft(event.data.player.playerId, event.data.roomId)
       this.runtime.seating.notePlayerLeft(event.data.player.playerId)
     }
     this.recordAppliedEvent(event)

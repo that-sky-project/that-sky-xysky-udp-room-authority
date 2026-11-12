@@ -7,6 +7,10 @@ export interface ManagerConfig {
   port: number;
   allocatePath: string;
   logLevel: string;
+  performanceDurationMs: number;
+  performancePreparationMs: number;
+  performanceQueueLimit: number;
+  audienceReactionTtlMs: number;
   maxRooms: number;
   candidateRoomLimit: number;
   staleRoomMs: number;
@@ -55,6 +59,8 @@ const configSchema = z
     logging: z
       .object({ level: z.string().trim().min(1).default("info") })
       .default({}),
+    audienceReaction: z.object({ ttlMs: positiveInt(2000) }).default({}),
+    performance: z.object({ durationMs: positiveInt(300_000), preparationMs: positiveInt(15_000), queueLimit: positiveInt(1000).pipe(z.number().max(10000)) }).default({}),
     rooms: z
       .object({
         max_rooms: positiveInt(100_000),
@@ -126,6 +132,10 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     port: parsed.port,
     allocatePath: parsed.allocate_path,
     logLevel: parsed.logging.level,
+    performanceDurationMs: parsed.performance.durationMs,
+    performancePreparationMs: parsed.performance.preparationMs,
+    performanceQueueLimit: parsed.performance.queueLimit,
+    audienceReactionTtlMs: parsed.audienceReaction.ttlMs,
     maxRooms: parsed.rooms.max_rooms,
     candidateRoomLimit: parsed.rooms.candidate_room_limit,
     staleRoomMs: parsed.rooms.stale_room_ms,

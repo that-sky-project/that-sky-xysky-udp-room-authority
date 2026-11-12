@@ -2,6 +2,14 @@ host: 0.0.0.0
 port: 1131
 allocate_path: /allocate
 
+performance:
+  preparationMs: 15000 # authoritative warm-up window; separate from broadcast duration
+  durationMs: 300000 # QWD authoritative duration; no client deadline compensation
+  queueLimit: 1000 # bounded FIFO; maximum 10000
+
+audienceReaction:
+  ttlMs: 2000 # next normal 1Hz frame plus network/application ACK margin; no replay after deadline
+
 logging:
   # pino level: fatal | error | warn | info | debug | trace
   level: info

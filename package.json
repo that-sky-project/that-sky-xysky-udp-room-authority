@@ -13,7 +13,9 @@
     "start": "node dist/runtime/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "verify:seating": "npm run build && node scripts/verify-seating.mjs",
-    "verify:snapshot": "npm run build && node scripts/verify-snapshot-round.mjs"
+    "verify:snapshot": "npm run build && node scripts/verify-snapshot-round.mjs",
+    "verify:performance": "npm run build && node scripts/verify-performance.mjs",
+    "verify:audience-reaction": "npm run build && node scripts/verify-audience-reaction.mjs"
   },
   "dependencies": {
     "lru-cache": "^11.0.2",

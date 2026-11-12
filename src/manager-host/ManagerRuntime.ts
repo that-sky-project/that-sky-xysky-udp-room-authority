@@ -5,6 +5,8 @@ import { PendingRequestMap } from './PendingRequestMap.js'
 import { PolicyEngine } from './PolicyEngine.js'
 import { ReservationTracker } from './ReservationTracker.js'
 import { ReservationService } from './ReservationService.js'
+import { PerformanceService } from './PerformanceService.js'
+import { AudienceReactionService } from './AudienceReactionService.js'
 import { RequestRouter } from './RequestRouter.js'
 import { RoomCache } from './RoomCache.js'
 import { SeatAllocator } from './SeatAllocator.js'
@@ -24,6 +26,8 @@ export interface ManagerRuntime {
   metrics: MetricsRegistry
   events: DebugEventLog
   seating: ReservationService
+  performance: PerformanceService
+  audienceReactions: AudienceReactionService
 }
 export const createManagerRuntime = (
   config: ManagerConfig,
@@ -121,7 +125,12 @@ export const createManagerRuntime = (
     coordinator,
     logger
   )
+  const performance = new PerformanceService(rooms, seating, coordinator, { durationMs: config.performanceDurationMs, preparationMs: config.performancePreparationMs, queueLimit: config.performanceQueueLimit }, logger)
+  seating.setPerformanceService(performance)
+  const audienceReactions = new AudienceReactionService(rooms, performance, coordinator, { ttlMs: config.audienceReactionTtlMs }, logger)
   return {
+    audienceReactions,
+    performance,
     nodes,
     rooms,
     pending,

@@ -6,6 +6,12 @@ import { asProtocolVersion } from '../types/branded.js'
 import type {
   IManagerCommand,
   INodeAck,
+  AudienceReactionDelivery,
+  PerformanceState,
+  PerformanceDecision,
+  PerformanceDelivery,
+  PerformanceGap,
+  PerformanceCommand,
   RoomAssignment,
   RoomSnapshot
 } from '../types/contracts.js'
@@ -136,12 +142,6 @@ export class CrossCoordinator {
       removed?: string[] | undefined
       /** Payload carries every remote seat; the node may drop unlisted silhouettes. */
       full?: boolean | undefined
-      /** The level's performance session, when someone is on stage. */
-      spotlightSession?: {
-        sessionId: string
-        performerId: string
-        startedAt: number
-      } | null | undefined
     },
     signal?: AbortSignal
   ): Promise<INodeAck> {
@@ -177,13 +177,31 @@ export class CrossCoordinator {
             spotlight: seat.spotlight ?? false
           })),
           removed: snapshot.removed ?? [],
-          full: snapshot.full ?? false,
-          spotlightSession: snapshot.spotlightSession ?? null
+          full: snapshot.full ?? false
         }
       },
       command => transport.send(command),
       signal
     )
+  }
+  public async audienceReaction (room: RoomSnapshot, data: AudienceReactionDelivery, signal?: AbortSignal): Promise<INodeAck> {
+    const transport = this.nodes.getTransport(room.nodeId)
+    if (!transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
+      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'reaction destination unavailable')
+    }
+    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd: 'audience.reaction', data }, command => transport.send(command), signal)
+  }
+  public async performance (
+    room: RoomSnapshot,
+    cmd: PerformanceCommand,
+    data: PerformanceState | PerformanceDecision | PerformanceDelivery | PerformanceGap,
+    signal?: AbortSignal
+  ): Promise<INodeAck> {
+    const transport = this.nodes.getTransport(room.nodeId)
+    if (!transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
+      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'performance destination unavailable')
+    }
+    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd, data }, command => transport.send(command), signal)
   }
   public async levelAudience (
     room: RoomSnapshot,
