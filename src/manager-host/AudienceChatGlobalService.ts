@@ -216,6 +216,16 @@ export class AudienceChatGlobalService {
           delivery = { room: { ...room }, levelId, pending: { ...state }, appliedRevision: -1,
             busy: false, retryAt: 0, abort: new AbortController() }
           this.deliveries.set(key, delivery)
+        } else if (state.enabled && !delivery.pending?.enabled && delivery.appliedRevision < state.revision) {
+          // The room lost this level while an unsent close tombstone (or a
+          // revision bumped during the outage window) was parked on the
+          // delivery — e.g. a node outage swept its player locations. The
+          // level is hosted here again, so that close is obsolete: re-project
+          // the enabled countdown instead of delivering a stale close. When
+          // the close was already applied, advanceLevel's next second tick
+          // re-queues through queueState.
+          delivery.pending = { ...state }
+          delivery.retryAt = 0
         }
       }
     }
