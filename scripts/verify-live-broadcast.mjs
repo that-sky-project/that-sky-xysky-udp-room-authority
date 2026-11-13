@@ -95,12 +95,12 @@ test('content ACK must be applied with exact epoch stream event sequence; FIFO r
 });
 test('capability refresh stable IDs monotonic revisions and exact expiration; reconnect rotates ID without replay', async () => {
   const f = fixture(); await f.start(); const first = f.cap();
-  f.advance(2000); f.service.tick(); await drain(); const next = f.cap();
-  assert.equal(next.capabilityId, first.capabilityId); assert.ok(next.revision > first.revision); assert.equal(next.expiresAtMs, 1007000);
+  f.advance(10000); f.service.tick(); await drain(); const next = f.cap();
+  assert.equal(next.capabilityId, first.capabilityId); assert.ok(next.revision > first.revision); assert.equal(next.expiresAtMs, 1040000);
   f.sender(async (room, cmd, data) => cmd.endsWith('deliver') ? { code: 0 } : ack(cmd, data)); f.service.handle(f.event('old')); await drain();
   f.service.reconnectNode('n-a'); await drain(); assert.notEqual(f.cap().capabilityId, next.capabilityId); assert.ok(f.cap().revision > next.revision);
   assert.equal(f.service.stats().pending, 0); assert.equal(f.service.handle(f.event('forged', { capabilityId: next.capabilityId })), false); f.close();
-  const g = fixture(); await g.start(); const expired = g.cap(); g.advance(5000);
+  const g = fixture(); await g.start(); const expired = g.cap(); g.advance(30000);
   assert.equal(g.service.handle(g.event('expired', { capabilityId: expired.capabilityId })), false);
   g.service.tick(); await drain(); assert.equal(g.cap().capabilityId, expired.capabilityId);
   assert.equal(g.service.handle(g.event('renewed')), true); g.close();
