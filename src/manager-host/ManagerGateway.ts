@@ -1,9 +1,9 @@
+import { applyNodeEvent } from './NodeEventApplication.js'
 import { ManagerHttpApi } from './ManagerHttpApi.js'
 import {
   createServer,
   type IncomingMessage,
-  type Server,
-  type ServerResponse
+  type Server
 } from 'node:http'
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer, type RawData } from 'ws'
@@ -18,20 +18,15 @@ import { HeartbeatMonitor } from './HeartbeatMonitor.js'
 import { MetricsRegistry, registerManagerMetrics } from './MetricsRegistry.js'
 import {
   asNodeId,
-  asPlayerId,
   asProtocolVersion,
   asRoomId,
-  asUnixMs,
-  type PlayerId
+  asUnixMs
 } from '../types/branded.js'
 import {
-  AllocationRequestSchema,
-  BatchRoomLookupSchema,
   NodeAckSchema,
   NodeEventSchema,
   type IManagerCommand,
-  type INodeEvent,
-  type RoomLookup
+  type INodeEvent
 } from '../types/contracts.js'
 import { ErrorCode, HermesError, isHermesError } from '../types/errors.js'
 
@@ -567,7 +562,7 @@ export class ManagerGateway {
       const parsed = NodeEventSchema.parse(raw)
       const event: INodeEvent = {
         ...parsed,
-        data: { ...parsed.data, nodeId: state.nodeId }
+        data: { ...parsed.data, nodeId: state.nodeId, connectedAt: asUnixMs(state.connectedAt) }
       }
 
       if (this.rejectsRoomIdConflict(event, ws)) return
@@ -652,72 +647,8 @@ export class ManagerGateway {
     return true
   }
 
-  private applyNodeEvent (event: INodeEvent): boolean {
-    if (event.data.roomId && event.event !== 'room.created') {
-      const owner = this.runtime.rooms.getRoom(event.data.roomId)
-      if (owner && owner.nodeId !== event.data.nodeId) return false
-    }
-    this.runtime.nodes.applyEvent(event)
-    if (!this.runtime.moves.ingest(event)) return false
-    this.runtime.rooms.applyNodeEvent(event)
-    if (
-      event.data.player?.playerId &&
-      (event.event === 'player.join' || event.event === 'player.leave')
-    ) {
-      this.runtime.reservations.confirm(event.data.player.playerId)
-    }
-    this.recordAppliedEvent(event)
-    return true
-  }
+  private applyNodeEvent(event: INodeEvent): boolean { return applyNodeEvent(this.runtime, event) }
 
-  private recordAppliedEvent (event: INodeEvent): void {
-    const roomId = event.data.roomId as string | undefined
-    if (!roomId) return
-
-    if (event.event === 'player.join' || event.event === 'player.leave') {
-      const playerId = event.data.player?.playerId as string | undefined
-      if (!playerId) return
-      this.runtime.events.record({
-        category: 'player',
-        event: event.event,
-        message: `${
-          event.event === 'player.join' ? 'joined' : 'left'
-        } room ${roomId}`,
-        roomId,
-        nodeId: event.data.nodeId,
-        playerIds: [playerId],
-        data: { level: event.data.player?.level }
-      })
-      return
-    }
-
-    if (event.event === 'room.created' || event.event === 'room.destroyed') {
-      this.runtime.events.record({
-        category: 'room',
-        event: event.event,
-        message: `${
-          event.event === 'room.created' ? 'room created' : 'room destroyed'
-        }: ${roomId}`,
-        roomId,
-        nodeId: event.data.nodeId,
-        data: {
-          udpHost: event.data.udpHost,
-          udpPort: event.data.port,
-          players:
-            typeof event.data.players === 'number'
-              ? event.data.players
-              : undefined,
-          version: event.data.version
-        }
-      })
-    }
-  }
-
-  /**
-   * Room view for one player, shared by the single and batch lookup routes.
-   * Returns null when the player is unknown or their room is already gone;
-   * "not in a room" is a normal state for a client that has not been placed yet.
-   */
   private rejectUpgrade (socket: Duplex, status: number, message: string): void {
     socket.write(
       `HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(

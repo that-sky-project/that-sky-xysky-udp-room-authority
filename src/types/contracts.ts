@@ -23,6 +23,12 @@ import {
 } from './branded.js'
 
 const stringId = z.string().min(1).max(128)
+// Node ConnectionSession uses positive numeric ids. Normalize only validated
+// numeric ids; do not coerce null, booleans or arbitrary objects into identities.
+const sessionId = z.union([
+  stringId,
+  z.number().int().positive().safe().transform(value => String(value))
+])
 const commandId = z.number().int().positive().transform(asCommandId)
 const port = z.number().int().min(1).max(65535).transform(asPort)
 const unixMs = z.number().int().nonnegative().transform(asUnixMs)
@@ -44,7 +50,7 @@ export const PlayerSchema = z
     nickname: z.string().min(1).max(64).optional(),
     region: z.string().min(1).max(32).transform(asRegion).optional(),
     level: z.number().int().min(0).max(0xffffffff).optional(),
-    sessionId: stringId.optional(),
+    sessionId: sessionId.optional(),
     lvSeq: z.number().int().nonnegative().optional(),
     metadata: z.record(z.unknown()).optional()
   })
@@ -124,7 +130,7 @@ export const NodeEventSchema = z
                 z
                   .object({
                     playerId: stringId.transform(asPlayerId),
-                    sessionId: stringId.optional(),
+                    sessionId: sessionId.optional(),
                     lvSeq: z.number().int().nonnegative().optional(),
                     status: z.enum(['ACTIVE', 'MOVING']).optional(),
                     levelId: z.number().int().nonnegative().optional(),
@@ -157,7 +163,7 @@ export const NodeEventSchema = z
         rooms: z.array(RoomSnapshotSchema).max(5000).optional(),
         version: z.number().int().nonnegative().optional(),
         connectedAt: unixMs.optional(),
-        sessionId: stringId.optional(),
+        sessionId: sessionId.optional(),
         lvSeq: z.number().int().nonnegative().optional(),
         physicalPlayers: z.number().int().min(0).max(8).optional(),
         activePlayers: z.number().int().min(0).max(8).optional(),

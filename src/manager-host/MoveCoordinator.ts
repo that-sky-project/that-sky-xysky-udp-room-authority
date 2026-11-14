@@ -148,11 +148,9 @@ export class MoveCoordinator {
       if (tx && this.active(tx)) {
         if (event.event === 'move.result' && !event.data.accepted && this.matchesEvent(tx, event, 'source')) {
           const ids = event.data.failedPlayerIds?.length ? event.data.failedPlayerIds : tx.plannedIds
-          const failed = [...new Set(ids)].filter(id => tx.plannedIds.includes(id) && !tx.failed.has(id))
-          for (const id of failed) tx.failed.add(id)
+          const failed = this.transactions.reject(tx, ids)
           if (failed.length) this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, failed)
-          if (tx.failed.size === tx.plannedIds.length) tx.status = 'failed'
-          else this.completeIfResolved(tx)
+          this.completeIfResolved(tx)
         }
         if (event.event === 'reservation.expired' && this.matchesEvent(tx, event, 'target')) {
           for (const id of event.data.admittedPlayerIds ?? []) if (tx.plannedIds.includes(id)) this.markArrived(tx, id)
@@ -245,7 +243,7 @@ export class MoveCoordinator {
       this.onMoveOutcome?.(tx.reason, 'committed'); this.completeIfResolved(tx)
       this.record({ category: 'move', event: 'move.committed', message: `${tx.reason}: ${tx.sourceRoomId} -> ${tx.targetRoomId}`, roomId: tx.targetRoomId, playerIds: [...tx.plannedIds], data: { moveId: tx.moveId, reason: tx.reason, committedAt: tx.committedAt, deliveryDeadline: tx.deliveryDeadline } })
     } else {
-      tx.status = 'failed'
+      this.transactions.fail(tx)
       if (this.telemetry.reservation(tx.targetRoomId as RoomId, tx.moveId)) this.queueCancel(tx.targetRoomId as RoomId, tx.moveId, [...tx.plannedIds])
       const room = this.rooms.getRoom(tx.targetRoomId as RoomId)
       if (room) {
