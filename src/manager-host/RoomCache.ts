@@ -6,7 +6,7 @@ import type {
   RoomId,
   UnixMs
 } from '../types/branded.js'
-import { asUnixMs } from '../types/branded.js'
+import { asPlayerId, asRoomId, asUnixMs } from '../types/branded.js'
 import type { INodeEvent, RoomSnapshot } from '../types/contracts.js'
 export interface PlayerLocation {
   playerId: PlayerId
@@ -241,6 +241,25 @@ export class RoomCache {
     }
     if (event.event === 'room.telemetry' && event.data.roomId) {
       this.awaitingTelemetry.delete(event.data.roomId)
+      // Locations are otherwise only tracked on player.join — without this
+      // refresh, a node disconnect longer than the suspect sweep (grace_ms)
+      // deletes every location, and nothing restores them until each client
+      // re-joins the room. That kept broadcast/chat targets dead until map
+      // re-entry. Telemetry only lists sessions still active on the node, so
+      // re-tracking cannot resurrect a departed player.
+      const roster = event.data.players
+      if (Array.isArray(roster)) {
+        for (const player of roster) {
+          if (!player?.playerId) continue
+          const levelId = Number(player.levelId ?? 0)
+          this.trackPlayer(
+            asPlayerId(player.playerId as string),
+            event.data.nodeId as NodeId,
+            asRoomId(event.data.roomId as string),
+            levelId > 0 ? levelId : undefined
+          )
+        }
+      }
     }
     if (event.event === 'room.destroyed' && event.data.roomId) {
       this.deleteRoom(event.data.roomId)

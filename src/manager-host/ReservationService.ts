@@ -1,12 +1,13 @@
 import type { Logger } from '../infra/logger/logger.js'
 import type { PlayerId, RoomId } from '../types/branded.js'
-import type { IAllocationRequest } from '../types/contracts.js'
+import type { IAllocationRequest, RoomSnapshot } from '../types/contracts.js'
 import { ErrorCode, HermesError } from '../types/errors.js'
 import type { CrossCoordinator } from './CrossCoordinator.js'
 import type { RequestRouter } from './RequestRouter.js'
 import type { RoomCache } from './RoomCache.js'
 import {
   SeatAllocator,
+  SEATS_PER_BENCH,
   levelNeedsSeat,
   CONCERT_LEVEL_ID,
   type BenchRoom,
@@ -147,31 +148,139 @@ export class ReservationService {
       requestedLevel > 0
         ? requestedLevel
         : CONCERT_LEVEL_ID
-    const seat = this.allocator.allocate({ ...input, levelId })
-
     const companions = this.companionsOf(input)
+    const party = [input.playerId, ...companions]
+    if (party.length > SEATS_PER_BENCH) {
+      throw new HermesError(
+        ErrorCode.BAD_REQUEST,
+        'party does not fit on one bench of eight same-room seats'
+      )
+    }
+
+    // Bench↔room is 1:1 and one bench seats exactly one UDP room's players
+    // side by side. The bench that hosts the WHOLE party is chosen before any
+    // seat is claimed, so a party can never straddle benches or rooms, and
+    // seat claims can never mix two rooms onto one bench.
+    const bench = await this.benchForParty(levelId, party.length, input, signal)
+
+    // Re-reserve keeps the caller's existing seat when it is on the chosen
+    // bench; an explicit free seatId is honored; otherwise the lowest free
+    // seat on the chosen bench. Claims never leave the chosen bench.
+    let seat =
+      this.allocator.seatOf(levelId, input.playerId)?.benchId === bench.benchId
+        ? this.allocator.seatOf(levelId, input.playerId)
+        : undefined
+    if (!seat && input.playerId) {
+      for (const other of this.allocator.levels()) {
+        if (other !== levelId && this.allocator.seatOf(other, input.playerId)) {
+          this.allocator.release(other, input.playerId)
+        }
+      }
+    }
+    if (!seat && Number.isInteger(input.seatId) &&
+      this.allocator.isSeatFree(levelId, { benchId: bench.benchId, seatId: input.seatId as number })) {
+      seat = this.allocator.claimExact(levelId, input.playerId, {
+        benchId: bench.benchId,
+        seatId: input.seatId as number
+      })
+    }
+    if (!seat) {
+      seat = this.allocator.allocateOnBench(input.playerId, levelId, bench.benchId)
+    }
+    if (!seat) {
+      throw new HermesError(
+        ErrorCode.NO_CAPACITY,
+        'chosen bench cannot host the party'
+      )
+    }
+
     let group: Array<{ playerId: PlayerId } & Seated> = []
     if (companions.length > 0) {
-      const taken = this.allocator.allocateGroup({ ...input, levelId }, [
-        input.playerId,
-        ...companions
-      ])
+      // allocateGroup anchors on the first already-seaten member — the caller,
+      // just claimed on the chosen bench — so companions claim seats on the
+      // same bench of the same room.
+      const taken = this.allocator.allocateGroup({ ...input, levelId }, party)
       group = [...taken.entries()].map(([playerId, seated]) => ({
         playerId,
         ...seated
       }))
     }
 
-    const room = await this.roomForSeat(seat, input, signal)
-
     return {
       ...seat,
-      roomIp: room.host,
-      roomPort: room.port,
-      roomId: room.roomId,
+      roomIp: bench.room.host,
+      roomPort: bench.room.port,
+      roomId: bench.room.roomId,
       entityId: this.allocator.entityIndexOf(seat.benchId, seat.seatId),
       group
     }
+  }
+
+  /**
+   * Choose the bench (and therefore the UDP room, 1:1) that will host a whole
+   * reservation party. Order: explicit bench request → the caller's existing
+   * bench → any bound bench whose room can host the party → a fresh room
+   * bound to an unbound bench.
+   */
+  private async benchForParty (
+    levelId: number,
+    partySize: number,
+    input: ReserveInput,
+    signal?: AbortSignal
+  ): Promise<{ benchId: number; room: BenchRoom }> {
+    const roomCanHost = (roomId: RoomId): RoomSnapshot | undefined => {
+      const room = this.rooms.getRoom(roomId)
+      if (!room) return undefined
+      // RoomCache always fills players/capacity (defaults 0/8); the defaults
+      // keep partial snapshots hostable like an empty room instead of NaN.
+      const players = Number.isFinite(room.players) ? room.players : 0
+      const capacity = Number.isFinite(room.capacity) ? room.capacity : SEATS_PER_BENCH
+      return players + partySize <= capacity ? room : undefined
+    }
+    const benchHasRoom = (benchId: number, room: RoomSnapshot): boolean =>
+      this.allocator.freeOnBench(levelId, benchId) >= partySize
+
+    if (Number.isInteger(input.benchId) && (input.benchId as number) >= 0) {
+      const benchId = input.benchId as number
+      const bound = this.allocator.roomForBench(benchId)
+      if (bound) {
+        const room = roomCanHost(bound.roomId)
+        if (room && benchHasRoom(benchId, room)) return { benchId, room: bound }
+        if (room) {
+          throw new HermesError(
+            ErrorCode.NO_CAPACITY,
+            'requested bench cannot host the party'
+          )
+        }
+        // The bound room is gone (node reclaimed while the manager was down):
+        // rebind the bench to a room that exists, preserving the seat plan.
+      }
+      const room = await this.allocateRoomForBench(benchId, input, signal)
+      return { benchId, room }
+    }
+
+    const existing = this.allocator.seatOf(levelId, input.playerId)
+    if (existing) {
+      const bound = this.allocator.roomForBench(existing.benchId)
+      const room = bound && roomCanHost(bound.roomId)
+      if (bound && room && benchHasRoom(existing.benchId, room)) {
+        return { benchId: existing.benchId, room: bound }
+      }
+    }
+
+    for (let benchId = 0; benchId < this.allocator.benchCapacity; benchId += 1) {
+      const bound = this.allocator.roomForBench(benchId)
+      if (!bound) continue
+      const room = roomCanHost(bound.roomId)
+      if (room && benchHasRoom(benchId, room)) return { benchId, room: bound }
+    }
+
+    const benchId = this.allocator.nextUnboundBench()
+    if (benchId === undefined) {
+      throw new HermesError(ErrorCode.NO_CAPACITY, 'no unbound bench for a fresh room')
+    }
+    const room = await this.allocateRoomForBench(benchId, input, signal)
+    return { benchId, room }
   }
 
   private companionsOf (input: ReserveInput): PlayerId[] {
@@ -388,7 +497,13 @@ export class ReservationService {
           if (!currentRoom.has(playerId)) removed.push(playerId as string)
         }
 
-        const full = this.pendingFullSnapshots.has(roomId)
+        // No cache for this room means we have never told it anything we can
+        // still account for — manager (re)start or first appearance. Diffing
+        // against nothing produced empty `removed`, so nodes kept every
+        // silhouette from before the restart forever (the persistent ghost
+        // birds). A cache-less room always gets a full frame: the node drops
+        // every unlisted silhouette and the cache is rebuilt from truth.
+        const full = this.pendingFullSnapshots.has(roomId) || !this.snapshotCache.has(key)
         // A full snapshot carries EVERY remote seat, not the diff: the room's
         // cache is the thing that is suspect (send failed earlier, or the
         // room's own state was rebuilt), so diffing against it proves nothing.
@@ -504,6 +619,10 @@ export class ReservationService {
     for (const key of [...this.snapshotCache.keys()]) {
       if (key.startsWith(`${roomId}:`)) this.snapshotCache.delete(key)
     }
+    // The room is gone for good: release its bench binding too, or the bench
+    // stayed bound to a dead room forever and every later seater had to walk
+    // past it.
+    this.allocator.unbindRoom(roomId)
     return freed
   }
 
@@ -672,12 +791,17 @@ export class ReservationService {
     roomId: RoomId,
     snapshot: { udpHost: string; udpPort: number }
   ): Seated | undefined {
+    // Bench↔room is 1:1, so this room owns at most one bench; find it,
+    // skipping bindings whose host room has vanished (those are stale and get
+    // reclaimed below).
+    const roomAlive = this.rooms.getRoom(roomId)
     for (
       let benchId = 0;
-      benchId < this.allocator.benchCapacity;
+      roomAlive && benchId < this.allocator.benchCapacity;
       benchId += 1
     ) {
-      if (this.allocator.roomForBench(benchId)?.roomId !== roomId) continue
+      const bound = this.allocator.roomForBench(benchId)
+      if (bound?.roomId !== roomId) continue
       const seat = this.allocator.allocateOnBench(playerId, levelId, benchId)
       if (seat) return seat
     }
@@ -686,7 +810,11 @@ export class ReservationService {
       benchId < this.allocator.benchCapacity;
       benchId += 1
     ) {
-      if (this.allocator.roomForBench(benchId)) continue
+      const bound = this.allocator.roomForBench(benchId)
+      // Bindable: unbound, or bound only to a room that no longer exists —
+      // a dead binding is reclaimed rather than walked past forever.
+      const reclaimable = !bound || !this.rooms.getRoom(bound.roomId)
+      if (!reclaimable) continue
       // Bind BEFORE claiming: a snapshot round running concurrently reads
       // `roomForBench` to decide which rooms receive which seats. Claiming
       // first left a window where a seated player's bench had no host — the
@@ -698,7 +826,7 @@ export class ReservationService {
         roomId
       })
       this.log?.info(
-        { playerId, roomId, benchId },
+        { playerId, roomId, benchId, rebound: Boolean(bound) },
         "bench bound to the player's current room"
       )
       const seat = this.allocator.allocateOnBench(playerId, levelId, benchId)
@@ -715,26 +843,98 @@ export class ReservationService {
     playerId: PlayerId,
     roomId: RoomId,
     levelId: number,
+    seat?: { benchId: number; seatId: number } | undefined,
+    position?: [number, number, number] | undefined,
+    levelTime?: number | undefined,
     signal?: AbortSignal
   ): Promise<void> {
     if (levelNeedsSeat(levelId)) {
+      if (seat) {
+        // The node's roster reports where this player actually sits. Mirror it
+        // into the allocator without re-assigning: after a manager restart
+        // this rebuilds the whole hall with zero churn — no renumbered
+        // benches, no seat.assign storm, no renumbered entity projections.
+        this.rebuildSeat(playerId, roomId, levelId, seat, position, levelTime)
+        return
+      }
       await this.ensureSeated(playerId, roomId, levelId, signal)
       return
     }
-    const seat = this.allocator.latestSeatOf(playerId)
-    if (seat && levelNeedsSeat(seat.levelId)) {
+    const held = this.allocator.latestSeatOf(playerId)
+    if (held && levelNeedsSeat(held.levelId)) {
       if (this.pendingReleases.has(playerId)) return
       this.log?.info(
         {
           playerId,
           levelId,
-          seatLevel: seat.levelId,
-          benchId: seat.benchId,
-          seatId: seat.seatId
+          seatLevel: held.levelId,
+          benchId: held.benchId,
+          seatId: held.seatId
         },
         'player left the concert level; scheduling seat release'
       )
-      this.noteSeatReleased(playerId, seat.levelId)
+      this.noteSeatReleased(playerId, held.levelId)
+    }
+  }
+
+  /**
+   * Mirror a node-reported seat into the allocator. The node roster is the
+   * source of truth for who sits where (nodes survive manager restarts with
+   * their rosters intact), so telemetry rebuilds occupancy and bench bindings
+   * instead of re-deriving them.
+   */
+  private rebuildSeat (
+    playerId: PlayerId,
+    roomId: RoomId,
+    levelId: number,
+    seat: { benchId: number; seatId: number },
+    position?: [number, number, number] | undefined,
+    levelTime?: number | undefined
+  ): void {
+    this.cancelPendingRelease(playerId)
+    this.seated.set(playerId, { levelId, roomId })
+    const applied = this.allocator.claimExact(levelId, playerId, seat)
+    if (!applied) {
+      this.log?.warn(
+        { playerId, roomId, levelId, seat },
+        'telemetry reported an out-of-range seat'
+      )
+      this.seated.delete(playerId)
+      return
+    }
+    const room = this.rooms.getRoom(roomId)
+    if (room) {
+      const bound = this.allocator.roomForBench(seat.benchId)
+      if (!bound || bound.roomId !== roomId ||
+        bound.host !== room.udpHost || bound.port !== room.udpPort) {
+        this.allocator.bindBenchRoom(seat.benchId, {
+          host: room.udpHost,
+          port: room.udpPort,
+          roomId
+        })
+      }
+    }
+    if (position && position.every(v => Number.isFinite(v))) {
+      this.allocator.setPosition(
+        levelId,
+        playerId,
+        [position[0], position[1], position[2]],
+        Number.isFinite(levelTime) ? (levelTime as number) : Date.now() / 1000,
+        roomId
+      )
+    } else {
+      // Remember the room even without a position so a lost bench binding can
+      // be rebound from this seat's own telemetry.
+      const known = this.allocator
+        .snapshot(levelId)
+        .find(entry => entry.playerId === playerId)
+      this.allocator.setPosition(
+        levelId,
+        playerId,
+        known?.position ?? [0, 0, 0],
+        known?.levelTime ?? Date.now() / 1000,
+        roomId
+      )
     }
   }
 
@@ -791,16 +991,6 @@ export class ReservationService {
       entityId: this.allocator.entityIndexOf(seat.benchId, seat.seatId),
       roomMembers
     }
-  }
-
-  private async roomForSeat (
-    seat: Seated,
-    input: ReserveInput,
-    signal?: AbortSignal
-  ): Promise<BenchRoom> {
-    const bound = this.allocator.roomForBench(seat.benchId)
-    if (bound && this.rooms.getRoom(bound.roomId)) return bound
-    return this.allocateRoomForBench(seat.benchId, input, signal)
   }
 
   private async allocateRoomForBench (

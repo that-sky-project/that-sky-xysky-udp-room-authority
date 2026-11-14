@@ -34,6 +34,7 @@ import {
   type RoomLookup
 } from '../types/contracts.js'
 import { ErrorCode, HermesError, isHermesError } from '../types/errors.js'
+import { CONCERT_LEVEL_ID, EVENT_LEVELS } from './SeatAllocator.js'
 
 interface NodeConnectionState {
   nodeId: ReturnType<typeof asNodeId>
@@ -499,14 +500,34 @@ export class ManagerGateway {
         const request = ReserveRequestSchema.parse(
           JSON.parse(await this.readBody(req, 16 * 1024))
         )
+        // The account layer forwards the client's snake_case companion lists
+        // verbatim; camelCase stays accepted for direct callers.
         const companions = [
           ...new Set([
-            ...(request.recentPlayerUuids ?? []),
-            ...(request.allPlayerUuids ?? [])
+            ...(request.recentPlayerUuids ?? request.recent_player_uuids ?? []),
+            ...(request.allPlayerUuids ?? request.all_player_uuids ?? [])
           ])
         ].map(asPlayerId)
+        // The client speaks in activity event ids (default 8 = Aurora concert);
+        // an unknown event id is rejected so the miss is visible.
+        const levelId = request.levelId ?? request.level ??
+          (request.eventId !== undefined
+            ? EVENT_LEVELS.get(request.eventId)
+            : CONCERT_LEVEL_ID)
+        if (!levelId) {
+          throw new HermesError(
+            ErrorCode.BAD_REQUEST,
+            `unknown reserve event id ${request.eventId}`
+          )
+        }
         const result = await this.runtime.seating.reserve(
-          { ...request, group: companions },
+          {
+            playerId: request.playerId,
+            levelId,
+            benchId: request.benchId,
+            seatId: request.seatId,
+            group: companions
+          },
           AbortSignal.timeout(this.config.commandTimeoutMs)
         )
         this.writeJson(res, 200, {
@@ -715,8 +736,14 @@ export class ManagerGateway {
     if (!this.runtime.nodes.getTransport(nodeId)) {
       return
     }
-    this.runtime.liveBroadcasts.forgetNode(nodeId)
-    this.runtime.audienceChatGlobal.forgetNode(nodeId)
+    // Broadcast capabilities and chat-global projections deliberately survive a
+    // node disconnect: the node keeps its lease (fail-closed at the deadline)
+    // and QWD keeps the destinations — sends fail into the existing retryAt
+    // loop and resume once the node reconnects. Forgetting here rotated
+    // capabilityIds and dropped countdown projections on every公网 WSS blip,
+    // which killed the in-game broadcast state and the global-chat countdown
+    // until players re-entered the map. Ephemeral reaction fanout may still be
+    // forgotten: a one-shot effect must not replay after a reconnect.
     this.runtime.audienceReactions.forgetNode(nodeId)
     this.runtime.nodes.unregister(nodeId)
     this.runtime.rooms.markNodeSuspected(nodeId)
@@ -1011,8 +1038,18 @@ export class ManagerGateway {
         if (!player?.playerId) continue
         const levelId = Number(player.levelId ?? 0)
         if (fromNodeSocket && !this.runtime.moves.hasTelemetryGap(roomId)) this.runtime.performance.notePlayerSeen(player.playerId, roomId, levelId)
+        // Nodes report where each player actually sits; the seating service
+        // mirrors that verbatim instead of re-deriving seats (which churned
+        // every bench and re-projected the hall after a manager restart).
+        const seat = Number.isInteger(player.benchId) && Number.isInteger(player.seatId)
+          ? { benchId: Number(player.benchId), seatId: Number(player.seatId) }
+          : undefined
+        const position = Array.isArray(player.position) && player.position.every(Number.isFinite)
+          ? [player.position[0], player.position[1], player.position[2]] as [number, number, number]
+          : undefined
+        const levelTime = typeof player.stateAt === 'number' ? player.stateAt / 1000 : undefined
         this.runtime.seating
-          .notePlayerLevel(player.playerId, roomId, levelId)
+          .notePlayerLevel(player.playerId, roomId, levelId, seat, position, levelTime)
           .catch(error =>
             this.log.debug(
               { err: error, playerId: player.playerId, roomId, levelId },

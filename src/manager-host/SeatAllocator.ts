@@ -15,6 +15,16 @@ export const SEATED_LEVELS: ReadonlySet<number> = new Set([
   AURORA_HALL_LEVEL
 ])
 export const CONCERT_LEVEL_ID = AURORA_CONCERT_LEVEL
+/**
+ * Client activity event ids (the `event_id` field of the reserve request, the
+ * account layer forwards it verbatim and defaults it to 8) -> the seated level
+ * that event opens. The Aurora concert entry is the default reserve event.
+ * Extend when a new seated activity ships; an unknown event id is rejected so
+ * the miss is visible instead of silently seating players in the wrong hall.
+ */
+export const EVENT_LEVELS: ReadonlyMap<number, number> = new Map([
+  [8, AURORA_CONCERT_LEVEL]
+])
 export const levelNeedsSeat = (levelId: number): boolean =>
   SEATED_LEVELS.has(Number(levelId))
 export interface BenchRoom {
@@ -48,11 +58,77 @@ export class SeatAllocator {
     private readonly benchCount: number = BENCH_COUNT,
     private readonly seatsPerBench: number = SEATS_PER_BENCH
   ) {}
+  /**
+   * Bench↔room is 1:1: one bench renders eight side-by-side seats and those
+   * eight players must all belong to one UDP room (and one room owns at most
+   * one bench — room capacity is 8). Binding over an existing room binding
+   * releases the room's previous bench so the invariant can never drift back
+   * into mixed benches.
+   */
   public bindBenchRoom (benchId: number, room: BenchRoom): void {
+    for (const [other, bound] of this.benchRooms) {
+      if (other !== benchId && bound.roomId === room.roomId) {
+        this.benchRooms.delete(other)
+      }
+    }
     this.benchRooms.set(benchId, { ...room })
   }
   public roomForBench (benchId: number): BenchRoom | undefined {
     return this.benchRooms.get(benchId)
+  }
+  public benchOfRoom (roomId: RoomId): number | undefined {
+    for (const [benchId, bound] of this.benchRooms) {
+      if (bound.roomId === roomId) return benchId
+    }
+    return undefined
+  }
+  public nextUnboundBench (): number | undefined {
+    for (let benchId = 0; benchId < this.benchCount; benchId += 1) {
+      if (!this.benchRooms.has(benchId)) return benchId
+    }
+    return undefined
+  }
+  /** Drop every binding held by a room that is gone for good. */
+  public unbindRoom (roomId: RoomId): number[] {
+    const freed: number[] = []
+    for (const [benchId, bound] of this.benchRooms) {
+      if (bound.roomId !== roomId) continue
+      this.benchRooms.delete(benchId)
+      freed.push(benchId)
+    }
+    return freed
+  }
+  /**
+   * Claim one exact seat for a player, replacing whatever the allocator
+   * believed about them and any stale claimant of that seat. Used when the
+   * node's own roster (telemetry) reports where a player actually sits: the
+   * node is authoritative and the allocator must mirror it without churn.
+   */
+  public claimExact (
+    levelId: number,
+    playerId: PlayerId,
+    seat: Seat
+  ): Seated | undefined {
+    const wanted = this.normalize(seat)
+    if (!wanted) return undefined
+    for (const [otherLevel, seating] of this.byLevel) {
+      const existing = seating.get(playerId)
+      if (existing && (otherLevel !== levelId ||
+        existing.benchId !== wanted.benchId || existing.seatId !== wanted.seatId)) {
+        this.release(otherLevel, playerId)
+      }
+    }
+    for (const [owner, owned] of this.byLevel.get(levelId) ?? []) {
+      if (owner !== playerId && owned.benchId === wanted.benchId &&
+        owned.seatId === wanted.seatId) {
+        // A stale allocator entry (manager restart, lost release). The node
+        // roster cannot double-book a seat; the claimant's real seat arrives
+        // with their own telemetry.
+        this.release(levelId, owner)
+      }
+    }
+    this.claim(levelId, playerId, wanted)
+    return { ...wanted, levelId }
   }
   /** Drop a bench binding so a later attempt can reclaim it. */
   public unbindBenchRoom (benchId: number): void {
@@ -60,6 +136,19 @@ export class SeatAllocator {
   }
   public get benchCapacity (): number {
     return this.benchCount
+  }
+  /** Free seats on one bench for the level (the party must fit on ONE bench). */
+  public freeOnBench (levelId: number, benchId: number): number {
+    if (!Number.isInteger(benchId) || benchId < 0 || benchId >= this.benchCount) return 0
+    let free = 0
+    for (let seatId = 0; seatId < this.seatsPerBench; seatId += 1) {
+      if (this.isFree(levelId, { benchId, seatId })) free += 1
+    }
+    return free
+  }
+  public isSeatFree (levelId: number, seat: Seat): boolean {
+    const wanted = this.normalize(seat)
+    return Boolean(wanted && this.isFree(levelId, wanted))
   }
   public allocateOnBench (
     playerId: PlayerId,
@@ -284,7 +373,9 @@ export class SeatAllocator {
   private flatSeat (benchId: number, seatId: number): number {
     return benchId * this.seatsPerBench + seatId
   }
-  private normalize (request: ReserveRequest): Seat | undefined {
+  private normalize (
+    request: Pick<ReserveRequest, 'benchId' | 'seatId'>
+  ): Seat | undefined {
     const { benchId, seatId } = request
     if (typeof benchId !== 'number' || typeof seatId !== 'number')
       return undefined

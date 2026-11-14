@@ -70,7 +70,15 @@ export class LiveBroadcastService {
       if (previous !== undefined && previous !== name) throw new Error('conflicting live broadcast player name')
       this.playerNames.set(id, name)
     }
-    this.options = { capabilityTtlMs: options.capabilityTtlMs ?? 5000, refreshMs: options.refreshMs ?? 2000,
+    // The capability lease must cover transient node↔QWD WebSocket blips: a
+    // 5s lease combined with revoke-on-disconnect made the in-game broadcast
+    // state disappear under公网 WSS jitter and required a map re-entry to
+    // restore. Nodes keep leases across short blips (they expire them
+    // fail-closed at their own deadline), so QWD only needs to keep refreshing
+    // the same capabilityId across reconnects — a 30s lease with a 10s refresh
+    // gives ~3 refresh attempts of margin while every outage still clears
+    // within one TTL window.
+    this.options = { capabilityTtlMs: options.capabilityTtlMs ?? 30_000, refreshMs: options.refreshMs ?? 10_000,
       eventTtlMs: options.eventTtlMs ?? 3000, idleMs: options.idleMs ?? 5000,
       maxStreamsPerLevel: options.maxStreamsPerLevel ?? 7, perRoomLimit: options.perRoomLimit ?? 32,
       globalLimit: options.globalLimit ?? 512, concurrency: options.concurrency ?? 8, dedupLimit: options.dedupLimit ?? 8192 }

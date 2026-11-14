@@ -420,6 +420,9 @@ export interface INodeEvent {
 export interface PlayerTelemetry {
   playerId: PlayerId
   levelId?: number | undefined
+  /** Node roster seat facts: the manager rebuilds seating from these verbatim. */
+  benchId?: number | undefined
+  seatId?: number | undefined
   position?: [number, number, number] | undefined
   velocity?: number | undefined
   stateAt?: UnixMs | undefined
@@ -533,12 +536,19 @@ export type BatchRoomLookup = z.infer<typeof BatchRoomLookupSchema>
 export const ReserveRequestSchema = z
   .object({
     playerId: stringId.transform(asPlayerId),
-    levelId: z.number().int().nonnegative(),
+    // The account layer (XYSKY-main /service/reservation/api/v1/reserve) sends
+    // the client's activity `event_id` (default 8) and snake_case companion
+    // uuid lists — it never sends levelId. Both spellings are accepted and
+    // the route maps eventId -> levelId via EVENT_LEVELS.
+    levelId: z.number().int().nonnegative().optional(),
+    eventId: z.number().int().nonnegative().optional(),
     benchId: z.number().int().nonnegative().optional(),
     seatId: z.number().int().min(0).max(7).optional(),
     level: z.number().int().min(0).max(0xffffffff).optional(),
     recentPlayerUuids: z.array(stringId).max(8).optional(),
-    allPlayerUuids: z.array(stringId).max(8).optional()
+    allPlayerUuids: z.array(stringId).max(8).optional(),
+    recent_player_uuids: z.array(stringId).max(8).optional(),
+    all_player_uuids: z.array(stringId).max(8).optional()
   })
   .strict()
 
