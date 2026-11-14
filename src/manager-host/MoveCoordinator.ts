@@ -55,6 +55,9 @@ export class MoveCoordinator {
     { signature: string; cycles: number }
   >()
   private readonly suppressedPlans = new Map<string, string>()
+  /** Rooms that received an isolation group recently — not isolation sources
+   *  again until the arrivals' clients finish syncing their level. */
+  private readonly recentIsolationArrivals = new Map<RoomId, number>()
   private readonly pendingCancels = new Map<
     string,
     { roomId: RoomId; moveId: string; playerIds: string[] }
@@ -341,13 +344,19 @@ export class MoveCoordinator {
       if (event.event === 'player.leave') {
         for (const tx of this.transactions.values()) {
           if (
-            tx.status === 'committed' &&
+            (tx.status === 'committed' || tx.status === 'prepared') &&
             tx.sourceRoomId === event.data.roomId &&
             tx.playerIds.includes(event.data.player.playerId as string)
           ) {
             if (!tx.leftPlayers.includes(event.data.player.playerId as string))
               tx.leftPlayers.push(event.data.player.playerId as string)
+            // Completion only flips a committed transaction: a fast client can
+            // join/leave while the executor is still in flight ('prepared'),
+            // and the executor's own commit overwrite would clobber an early
+            // 'completed'. Counts accumulate either way; expireTransactions
+            // re-checks them before declaring a committed move unresolved.
             if (
+              tx.status === 'committed' &&
               tx.leftPlayers.length === tx.playerIds.length &&
               tx.joinedPlayers.length === tx.playerIds.length
             ) {
@@ -392,7 +401,7 @@ export class MoveCoordinator {
       if (event.event === 'player.join' && event.data.roomId) {
         for (const tx of this.transactions.values()) {
           if (
-            tx.status === 'committed' &&
+            (tx.status === 'committed' || tx.status === 'prepared') &&
             tx.targetRoomId === event.data.roomId &&
             tx.playerIds.includes(event.data.player.playerId as string)
           ) {
@@ -401,6 +410,7 @@ export class MoveCoordinator {
             )
               tx.joinedPlayers.push(event.data.player.playerId as string)
             if (
+              tx.status === 'committed' &&
               tx.leftPlayers.length === tx.playerIds.length &&
               tx.joinedPlayers.length === tx.playerIds.length
             ) {
@@ -593,6 +603,22 @@ export class MoveCoordinator {
         this.transactionsForPlayer(plan.playerIds).length > 0
       )
         continue
+      // Same execution-time capacity guard as the isolation path: the plan's
+      // occupancy is telemetry-stale, RoomCache players is event-driven. A
+      // doomed move here produced the same stuck-MOVING/timeout outcome.
+      if (target.capacity - target.players < plan.playerIds.length) {
+        this.log?.warn(
+          {
+            sourceRoomId: plan.sourceRoomId,
+            targetRoomId: plan.targetRoomId,
+            targetPlayers: target.players,
+            targetCapacity: target.capacity,
+            movePlayers: plan.playerIds.length
+          },
+          'move skipped: target room has no capacity at execution time'
+        )
+        continue
+      }
       if (
         this.planSuppressed(
           plan.sourceRoomId,
@@ -732,6 +758,21 @@ export class MoveCoordinator {
         continue
       }
       if (tx.status === 'committed') {
+        // A fast client can complete its join/leave while the executor was
+        // still in flight, so the counts were accumulated under 'prepared' and
+        // the completion check never fired on an event. Re-check here before
+        // declaring a committed move unresolved.
+        if (
+          tx.leftPlayers.length === tx.playerIds.length &&
+          tx.joinedPlayers.length === tx.playerIds.length
+        ) {
+          tx.status = 'completed'
+          this.telemetry.releaseReservation(
+            tx.targetRoomId as RoomId,
+            tx.moveId
+          )
+          continue
+        }
         if (now - tx.createdAt > timeoutMs * 2) {
           tx.status = 'failed'
           this.telemetry.releaseReservation(
@@ -791,6 +832,30 @@ export class MoveCoordinator {
       this.recordSkippedLevelPlan(plan, 'target_busy')
       return false
     }
+    // Execution-time capacity guard against the planner's stale occupancy:
+    // the planner reads telemetry, which lags the target node's real player
+    // count by up to a telemetry interval. Moving into a room that filled in
+    // that window sent the client to a full room — the join was rejected
+    // ("room player limit reached"), the client bounced, and the source
+    // session sat in MOVING until the move timeout killed it. RoomCache
+    // players is event-driven (the target node's player.join), so it is the
+    // freshest capacity signal available at commit time.
+    const freeSlots = target.capacity - target.players
+    if (freeSlots < plan.playerIds.length) {
+      this.log?.warn(
+        {
+          sourceRoomId: plan.sourceRoomId,
+          targetRoomId: plan.targetRoomId,
+          levelId: plan.levelId,
+          targetPlayers: target.players,
+          targetCapacity: target.capacity,
+          movePlayers: plan.playerIds.length
+        },
+        'level isolation skipped: target room has no capacity at execution time'
+      )
+      this.recordSkippedLevelPlan(plan, 'target_full')
+      return false
+    }
     const sourcePlayers = this.telemetry.listRoom(
       plan.sourceRoomId as RoomId,
       now
@@ -834,6 +899,13 @@ export class MoveCoordinator {
     })
     if (outcome.ok) {
       this.transactions.set(moveId, { ...tx, status: 'committed' })
+      // The target room now holds a freshly-moved group whose bonded
+      // companions may still be syncing their level client-side. Re-isolating
+      // a minority out of it immediately produced room ping-pong (the group's
+      // level player moved right back to the room the group came from), so
+      // give arrivals a settle window before this room is an isolation source
+      // again.
+      this.recentIsolationArrivals.set(target.roomId, now)
       this.onMoveOutcome?.(plan.reason, 'committed')
       this.log?.info(
         {
@@ -1098,8 +1170,21 @@ export class MoveCoordinator {
       if (tx.createdAt >= cycleNow) continue
       if (tx.sourceRoomId === roomId || tx.targetRoomId === roomId) return true
     }
+    // A room that just received an isolation group is still settling (bonded
+    // companions' clients sync their level after the move); treating it as an
+    // isolation source in that window bounced the group's level player right
+    // back to the room the group came from.
+    const arrivedAt = this.recentIsolationArrivals.get(roomId as RoomId)
+    if (arrivedAt !== undefined) {
+      if (cycleNow - arrivedAt > this.isolationArrivalCooldownMs) {
+        this.recentIsolationArrivals.delete(roomId as RoomId)
+      } else {
+        return true
+      }
+    }
     return false
   }
+  private readonly isolationArrivalCooldownMs = 15_000
   private roomSignature (players: PlayerTelemetry[]): string {
     return players
       .map(player => `${player.playerId}:${player.levelId ?? '?'}`)

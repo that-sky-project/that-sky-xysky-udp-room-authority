@@ -39,7 +39,10 @@ interface RoomLevelGroup {
 }
 const DEFAULT_OPTIONS: LevelIsolationOptions = {
   minLevelPlayers: 1,
-  maxPlayersPerMove: 8,
+  // Must stay <= the node executor's per-move group cap (movePlayersAtomic
+  // rejects groups larger than 7 with move_group_too_large): an 8-player plan
+  // failed wholesale at commit and fell back to single-player migrations.
+  maxPlayersPerMove: 7,
   sparseRoomThreshold: 2,
   levelChangeCooldownMs: 6_000,
   joinSettleMs: 4_000,
