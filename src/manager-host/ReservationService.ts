@@ -65,11 +65,17 @@ const sameSeat = (a: CachedSeat, b: CachedSeat): boolean => {
 
 const DEFAULT_SEAT_RELEASE_GRACE_MS = 15_000
 
-export interface ReserveResult extends Seated {
+export interface ReserveResult {
+  levelId: number
+  /** Seat fields are present for seated venues (需要座位) and omitted for hall
+   *  venues (无需座位) — the TCP layer drops undefined fields, so hall clients
+   *  simply receive no bench_id/seat_id. */
+  benchId?: number
+  seatId?: number
+  entityId?: number
   roomIp: string
   roomPort: number
   roomId: RoomId
-  entityId: number
   group: Array<{ playerId: PlayerId } & Seated>
 }
 
@@ -155,6 +161,30 @@ export class ReservationService {
         ErrorCode.BAD_REQUEST,
         'party does not fit on one bench of eight same-room seats'
       )
+    }
+
+    if (!levelNeedsSeat(levelId)) {
+      // 无需座位 venue: room routing only. No bench/seat is claimed, so the
+      // response carries room fields only and the client enters without a
+      // seat; cross-room silhouettes are projected from telemetry instead.
+      const reply = await this.router.allocate(
+        { playerId: input.playerId, level: levelId },
+        signal
+      )
+      if (reply.code !== ErrorCode.OK || !reply.data || !('udpHost' in reply.data)) {
+        const message =
+          reply.data && 'message' in reply.data
+            ? String(reply.data.message)
+            : 'no room available'
+        throw new HermesError(reply.code || ErrorCode.NO_CAPACITY, message)
+      }
+      return {
+        levelId,
+        roomIp: reply.data.udpHost,
+        roomPort: reply.data.udpPort,
+        roomId: reply.data.roomId,
+        group: []
+      }
     }
 
     // Bench↔room is 1:1 and one bench seats exactly one UDP room's players

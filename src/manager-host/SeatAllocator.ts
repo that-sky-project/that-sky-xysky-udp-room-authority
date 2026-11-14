@@ -52,8 +52,16 @@ export const levelNeedsSeat = (levelId: number): boolean =>
  * register a mapping here when a future activity ships with its own event id.
  */
 export function eventLevel (eventId: number): number | undefined {
-  if (eventId === 8) return defaultSeatedLevel()
+  // 0 = the client is not (yet) in a reservation event: open the first
+  // configured seated venue. 8 is the concert reserve default.
+  if (eventId === 8 || eventId === 0) return defaultSeatedLevel()
   return undefined
+}
+
+/** True when the level is a configured audience venue (seated or hall). */
+export function isAudienceVenue (levelId: number): boolean {
+  const id = Number(levelId)
+  return seatedLevelSet.has(id) || hallLevelSet.has(id)
 }
 export interface BenchRoom {
   host: string

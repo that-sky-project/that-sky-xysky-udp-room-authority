@@ -34,7 +34,7 @@ import {
   type RoomLookup
 } from '../types/contracts.js'
 import { ErrorCode, HermesError, isHermesError } from '../types/errors.js'
-import { defaultSeatedLevel, eventLevel } from './SeatAllocator.js'
+import { defaultSeatedLevel, eventLevel, isAudienceVenue } from './SeatAllocator.js'
 
 interface NodeConnectionState {
   nodeId: ReturnType<typeof asNodeId>
@@ -519,6 +519,12 @@ export class ManagerGateway {
           throw new HermesError(
             ErrorCode.BAD_REQUEST,
             `unknown reserve event id ${request.eventId}`
+          )
+        }
+        if (!isAudienceVenue(levelId)) {
+          throw new HermesError(
+            ErrorCode.BAD_REQUEST,
+            `level ${levelId} is not a configured audience venue`
           )
         }
         const result = await this.runtime.seating.reserve(
