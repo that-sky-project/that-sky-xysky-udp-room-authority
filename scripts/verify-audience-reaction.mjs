@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { AudienceReactionService } from '../dist/manager-host/AudienceReactionService.js';
 import { PerformanceService } from '../dist/manager-host/PerformanceService.js';
 import { RoomCache } from '../dist/manager-host/RoomCache.js';
-import { CONCERT_LEVEL_ID as LEVEL, AURORA_HALL_LEVEL as OTHER } from '../dist/manager-host/SeatAllocator.js';
+import { defaultSeatedLevel } from '../dist/manager-host/SeatAllocator.js';
+const LEVEL = defaultSeatedLevel();
+const OTHER = 1559613961; // hall venue (无需座位) — see qwd config audience.hall_levels
 import { NodeEventSchema } from '../dist/types/contracts.js';
 const drain = async () => { for (let n = 0; n < 15; n++) await new Promise(resolve => setImmediate(resolve)); };
 const ack = data => ({ code: 0, data: { authorityEpoch: data.authorityEpoch, eventId: data.eventId, eventSeq: data.eventSeq, applied: true } });

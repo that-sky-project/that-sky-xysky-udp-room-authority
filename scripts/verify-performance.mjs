@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { PerformanceService } from '../dist/manager-host/PerformanceService.js';
 import { RoomCache } from '../dist/manager-host/RoomCache.js';
 import { NodeEventSchema, PERFORMANCE_MAX_PAYLOAD_BYTES } from '../dist/types/contracts.js';
-import { CONCERT_LEVEL_ID as LEVEL, AURORA_HALL_LEVEL as HALL } from '../dist/manager-host/SeatAllocator.js';
+import { defaultSeatedLevel } from '../dist/manager-host/SeatAllocator.js';
+const LEVEL = defaultSeatedLevel();
+const HALL = 1559613961; // hall venue (无需座位) — see qwd config audience.hall_levels
 const ackFor = ({ cmd, data }) => ({ code: 0, data: cmd === 'performance.state'
   ? { authorityEpoch: data.authorityEpoch, revision: data.revision, applied: true }
   : cmd === 'performance.deliver' ? { eventCursor: data.eventSeq, buffered: false }

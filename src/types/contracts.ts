@@ -539,7 +539,7 @@ export const ReserveRequestSchema = z
     // The account layer (XYSKY-main /service/reservation/api/v1/reserve) sends
     // the client's activity `event_id` (default 8) and snake_case companion
     // uuid lists — it never sends levelId. Both spellings are accepted and
-    // the route maps eventId -> levelId via EVENT_LEVELS.
+    // the route maps eventId -> levelId via eventLevel()/defaultSeatedLevel().
     levelId: z.number().int().nonnegative().optional(),
     eventId: z.number().int().nonnegative().optional(),
     benchId: z.number().int().nonnegative().optional(),

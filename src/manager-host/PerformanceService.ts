@@ -101,13 +101,19 @@ export class PerformanceService {
   private eligible (playerId: string, levelId: number, roomId?: RoomId, nodeId?: NodeId): boolean {
     const loc = this.rooms.getPlayerLocation(asPlayerId(playerId))
     const live = this.livePlayers.get(asPlayerId(playerId))
+    // Seat membership only applies to seated venues (需要座位); hall venues
+    // (无需座位) run the barn and audience features on presence alone.
+    const seat = levelNeedsSeat(levelId) && this.seating.seatFor(asPlayerId(playerId), levelId)
     return Boolean(loc && live && live.levelId === levelId && live.roomId === loc.roomId && live.nodeId === loc.nodeId && loc.leavingAt === undefined && loc.level === levelId &&
       (!roomId || loc.roomId === roomId) && (!nodeId || loc.nodeId === nodeId) &&
-      this.rooms.getRoom(loc.roomId)?.nodeId === loc.nodeId && !this.rooms.isNodeSuspected(loc.nodeId) && this.seating.seatFor(asPlayerId(playerId), levelId))
+      this.rooms.getRoom(loc.roomId)?.nodeId === loc.nodeId && !this.rooms.isNodeSuspected(loc.nodeId) &&
+      (!levelNeedsSeat(levelId) || Boolean(seat)))
   }
-  /** Read-only audience membership; independent of performance.current and queue. */
+  /** Read-only audience membership; independent of performance.current and queue.
+   *  Hall venues (无需座位) qualify on presence alone — eligible() already
+   *  requires a seat only for seated venues. */
   public isAudienceSource (playerId: PlayerId, levelId: number, roomId: RoomId, nodeId: NodeId): boolean {
-    return levelNeedsSeat(levelId) && !this.rooms.isNodeSuspected(nodeId) && this.eligible(playerId, levelId, roomId, nodeId)
+    return !this.rooms.isNodeSuspected(nodeId) && this.eligible(playerId, levelId, roomId, nodeId)
   }
   public audienceRooms (levelId: number): RoomSnapshot[] {
     const targets = new Map<RoomId, RoomSnapshot>()

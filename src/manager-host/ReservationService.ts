@@ -9,7 +9,7 @@ import {
   SeatAllocator,
   SEATS_PER_BENCH,
   levelNeedsSeat,
-  CONCERT_LEVEL_ID,
+  defaultSeatedLevel,
   type BenchRoom,
   type Seated
 } from './SeatAllocator.js'
@@ -147,7 +147,7 @@ export class ReservationService {
       Number.isInteger(requestedLevel) &&
       requestedLevel > 0
         ? requestedLevel
-        : CONCERT_LEVEL_ID
+        : defaultSeatedLevel()
     const companions = this.companionsOf(input)
     const party = [input.playerId, ...companions]
     if (party.length > SEATS_PER_BENCH) {

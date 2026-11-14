@@ -12,6 +12,16 @@ liveBroadcast:
   maxStreamsPerLevel: 7 # conservative policy reserves one piano playback slot
   # Fixed defaults: capability lease 5000ms, refresh 2000ms, event TTL 3000ms, stream idle 5000ms.
 
+  # ---------------------------------------------------------------------------
+  # Audience venues. Nodes fully trust these ids: seat assignment, barn state,
+  # and the live-broadcast button levels all derive from the union of both
+  # lists. Every id must be a real venue map — barn packets sent for an
+  # ordinary map drop the client's connection.
+  # ---------------------------------------------------------------------------
+audience:
+  seated_levels: [ 263580627 ] # levels that get seat assignment (bench/seatId, 需要座位)
+  hall_levels: [ 1559613961, 2779731386, 47024056, 4011385311, 1661095040, 2093785354, 3530028462 ] # levels that run the barn without seats (cross-room silhouettes, 无需座位)
+
 audienceReaction:
   ttlMs: 2000 # next normal 1Hz frame plus network/application ACK margin; no replay after deadline
 

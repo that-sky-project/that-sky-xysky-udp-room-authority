@@ -13,6 +13,8 @@ export interface ManagerConfig {
   performanceQueueLimit: number;
   audienceReactionTtlMs: number;
   audienceChatGlobalMaxSeconds: number;
+  audienceSeatedLevels: number[];
+  audienceHallLevels: number[];
   liveBroadcastAllowedPlayerUuids: string[];
   liveBroadcastPlayerNames: Record<string, string>;
   liveBroadcastMaxStreamsPerLevel: number;
@@ -91,6 +93,10 @@ const configSchema = z
     }).strict().default({}),
     audienceReaction: z.object({ ttlMs: positiveInt(2000) }).default({}),
     audienceChatGlobal: z.object({ maxSeconds: positiveInt(86_400) }).strict().default({}),
+    audience: z.object({
+      seated_levels: z.array(z.number().int().min(1).max(0xffffffff)).max(64).default([263580627]).describe('Levels that get seat assignment. Must be real venue maps: nodes fully trust these ids and barn packets into an ordinary map drop the client.'),
+      hall_levels: z.array(z.number().int().min(1).max(0xffffffff)).max(64).default([1559613961]).describe('Levels that run the audience barn (cross-room silhouettes) without seat assignment. Must be real venue maps, same client-drop rule.')
+    }).strict().default({}),
     performance: z.object({ durationMs: positiveInt(300_000), preparationMs: positiveInt(15_000), queueLimit: positiveInt(1000).pipe(z.number().max(10000)) }).default({}),
     rooms: z
       .object({
@@ -140,7 +146,7 @@ const configSchema = z
         merge_pressure_threshold: floatFrom(0.25),
         minimum_gain: floatFrom(0.15),
         level_isolation_min_level_players: positiveInt(1),
-        level_isolation_max_players: positiveInt(8),
+        level_isolation_max_players: positiveInt(7), // node executor rejects groups > 7 (move_group_too_large)
         level_isolation_sparse_room_threshold: positiveInt(2),
         level_change_cooldown_ms: positiveInt(6000),
         join_settle_ms: positiveInt(4000),
@@ -168,6 +174,8 @@ export const loadConfig = (configFile: string = path.resolve(process.cwd(), "con
     performanceQueueLimit: parsed.performance.queueLimit,
     audienceReactionTtlMs: parsed.audienceReaction.ttlMs,
     audienceChatGlobalMaxSeconds: parsed.audienceChatGlobal.maxSeconds,
+    audienceSeatedLevels: parsed.audience.seated_levels,
+    audienceHallLevels: parsed.audience.hall_levels,
     liveBroadcastAllowedPlayerUuids: [...new Set(parsed.liveBroadcast.allowedPlayerUuids.map(entry => entry.playerId))],
     liveBroadcastPlayerNames: Object.fromEntries(parsed.liveBroadcast.allowedPlayerUuids.filter(entry => entry.name !== null).map(entry => [entry.playerId, entry.name!])),
     liveBroadcastMaxStreamsPerLevel: parsed.liveBroadcast.maxStreamsPerLevel,

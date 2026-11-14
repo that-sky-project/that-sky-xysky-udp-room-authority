@@ -11,7 +11,7 @@ import { LiveBroadcastService } from './LiveBroadcastService.js'
 import { AudienceChatGlobalService } from './AudienceChatGlobalService.js'
 import { RequestRouter } from './RequestRouter.js'
 import { RoomCache } from './RoomCache.js'
-import { SeatAllocator } from './SeatAllocator.js'
+import { audienceLevelIds, configureSeatLevels, SeatAllocator } from './SeatAllocator.js'
 import { MoveCoordinator } from './MoveCoordinator.js'
 import { MetricsRegistry } from './MetricsRegistry.js'
 import type { ManagerConfig } from '../config/index.js'
@@ -38,6 +38,10 @@ export const createManagerRuntime = (
   logger?: Logger
 ): ManagerRuntime => {
   const metrics = new MetricsRegistry()
+  // Seat vs hall venue lists come from config; every gating helper
+  // (levelNeedsSeat, isAudienceLevel) and the live-broadcast button levels
+  // derive from this single registration.
+  configureSeatLevels({ seated: config.audienceSeatedLevels, hall: config.audienceHallLevels })
   const events = new DebugEventLog(config.debugLogBufferSize)
   const nodes = new NodeRegistry({
     circuitOpenMs: config.nodeCircuitOpenMs,
@@ -136,7 +140,8 @@ export const createManagerRuntime = (
   const liveBroadcasts = new LiveBroadcastService(rooms, performance, coordinator, {
     allowedPlayerUuids: config.liveBroadcastAllowedPlayerUuids,
     playerNames: config.liveBroadcastPlayerNames,
-    maxStreamsPerLevel: config.liveBroadcastMaxStreamsPerLevel
+    maxStreamsPerLevel: config.liveBroadcastMaxStreamsPerLevel,
+    levels: audienceLevelIds()
   }, logger)
   return {
     audienceChatGlobal,

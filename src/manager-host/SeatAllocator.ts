@@ -8,25 +8,53 @@ export interface Seat {
 export interface Seated extends Seat {
   levelId: number
 }
-export const AURORA_CONCERT_LEVEL = 263580627
-export const AURORA_HALL_LEVEL = 1559613961
-export const SEATED_LEVELS: ReadonlySet<number> = new Set([
-  AURORA_CONCERT_LEVEL,
-  AURORA_HALL_LEVEL
-])
-export const CONCERT_LEVEL_ID = AURORA_CONCERT_LEVEL
 /**
- * Client activity event ids (the `event_id` field of the reserve request, the
- * account layer forwards it verbatim and defaults it to 8) -> the seated level
- * that event opens. The Aurora concert entry is the default reserve event.
- * Extend when a new seated activity ships; an unknown event id is rejected so
- * the miss is visible instead of silently seating players in the wrong hall.
+ * Venue lists come from config (`audience.seated_levels` / `hall_levels`)
+ * through {@link configureSeatLevels}, installed by the runtime at startup.
+ * The literals below are the fallback defaults so tools and tests work
+ * without configuration — there are no other named level constants.
  */
-export const EVENT_LEVELS: ReadonlyMap<number, number> = new Map([
-  [8, AURORA_CONCERT_LEVEL]
-])
+let seatedLevelSet: ReadonlySet<number> = new Set([263580627])
+let hallLevelSet: ReadonlySet<number> = new Set([1559613961])
+
+/** Install the configured seated/hall venue lists (uint32 level ids). */
+export function configureSeatLevels ({
+  seated = [],
+  hall = []
+}: { seated?: readonly number[]; hall?: readonly number[] } = {}): void {
+  const clean = (ids: readonly number[]): ReadonlySet<number> =>
+    new Set(ids.filter(id => Number.isInteger(id) && id > 0))
+  if (seated.length > 0) seatedLevelSet = clean(seated)
+  if (hall.length > 0) hallLevelSet = clean(hall)
+}
+
+/** Venues that run the audience barn — seats or not (seated ∪ hall). */
+export function audienceLevelIds (): number[] {
+  return [...new Set([...seatedLevelSet, ...hallLevelSet])]
+}
+
+/** The venue a bare reserve (client event id 8) opens: the first seated.
+ *  Never undefined — the seated set starts with one entry and
+ *  {@link configureSeatLevels} rejects empty lists. */
+export function defaultSeatedLevel (): number {
+  return [...seatedLevelSet][0]!
+}
+
+/** True only for levels that get seat assignment (需要座位). */
 export const levelNeedsSeat = (levelId: number): boolean =>
-  SEATED_LEVELS.has(Number(levelId))
+  seatedLevelSet.has(Number(levelId))
+
+/**
+ * Resolve the client's `event_id` (the account layer forwards it verbatim) to
+ * the seated level it opens. Event 8 — the client's reserve default — opens
+ * the first configured seated venue. An unknown event id is rejected so the
+ * miss is visible instead of silently seating players in the wrong hall;
+ * register a mapping here when a future activity ships with its own event id.
+ */
+export function eventLevel (eventId: number): number | undefined {
+  if (eventId === 8) return defaultSeatedLevel()
+  return undefined
+}
 export interface BenchRoom {
   host: string
   port: number

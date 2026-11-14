@@ -34,7 +34,7 @@ import {
   type RoomLookup
 } from '../types/contracts.js'
 import { ErrorCode, HermesError, isHermesError } from '../types/errors.js'
-import { CONCERT_LEVEL_ID, EVENT_LEVELS } from './SeatAllocator.js'
+import { defaultSeatedLevel, eventLevel } from './SeatAllocator.js'
 
 interface NodeConnectionState {
   nodeId: ReturnType<typeof asNodeId>
@@ -508,12 +508,13 @@ export class ManagerGateway {
             ...(request.allPlayerUuids ?? request.all_player_uuids ?? [])
           ])
         ].map(asPlayerId)
-        // The client speaks in activity event ids (default 8 = Aurora concert);
-        // an unknown event id is rejected so the miss is visible.
+        // The client speaks in activity event ids (default 8 = the configured
+        // first seated venue); an unknown event id is rejected so the miss is
+        // visible.
         const levelId = request.levelId ?? request.level ??
           (request.eventId !== undefined
-            ? EVENT_LEVELS.get(request.eventId)
-            : CONCERT_LEVEL_ID)
+            ? eventLevel(request.eventId)
+            : defaultSeatedLevel())
         if (!levelId) {
           throw new HermesError(
             ErrorCode.BAD_REQUEST,

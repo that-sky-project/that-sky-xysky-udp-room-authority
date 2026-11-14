@@ -3,6 +3,7 @@ import type { NodeId, PlayerId, RoomId } from '../types/branded.js'
 import { asPlayerId } from '../types/branded.js'
 import type { INodeAck, INodeEvent, LiveBroadcastCapability, LiveBroadcastCommand, LiveBroadcastDelivery, RoomSnapshot } from '../types/contracts.js'
 import { LiveBroadcastPublishSchema, LiveBroadcastSyncSchema, PlayerUuidSchema } from '../types/contracts.js'
+import { audienceLevelIds } from './SeatAllocator.js'
 import type { AudienceMembership } from './AudienceReactionService.js'
 import type { RoomCache } from './RoomCache.js'
 import type { Logger } from '../infra/logger/logger.js'
@@ -10,6 +11,9 @@ import type { Logger } from '../infra/logger/logger.js'
 export interface LiveBroadcastOptions {
   allowedPlayerUuids: string[]
   playerNames?: Record<string, string>
+  /** Venue level ids that carry the live-broadcast button; defaults to the
+   *  configured audience level union (seated ∪ hall). */
+  levels?: number[]
   clock?: () => number
   capabilityTtlMs?: number
   refreshMs?: number
@@ -34,13 +38,13 @@ interface Destination {
   ackRevision: number; refreshAt: number; retryAt: number; busy: boolean
   abort: AbortController; queue: Pending[]
 }
-const LEVELS = [263580627, 1559613961]
 const sameRoom = (a: RoomSnapshot, b: RoomSnapshot): boolean => a.roomId === b.roomId && a.nodeId === b.nodeId && a.udpHost === b.udpHost && a.udpPort === b.udpPort
 
 /** Independent ordinary live streams. The seven-stream policy reserves one playback slot for piano. */
 export class LiveBroadcastService {
   private readonly clock: () => number
-  private readonly options: Required<Omit<LiveBroadcastOptions, 'clock' | 'allowedPlayerUuids' | 'playerNames'>>
+  private readonly options: Required<Omit<LiveBroadcastOptions, 'clock' | 'allowedPlayerUuids' | 'playerNames' | 'levels'>>
+  private readonly levels: number[]
   private readonly allowed: PlayerId[]
   private readonly playerNames = new Map<PlayerId, string>()
   private readonly destinations = new Map<string, Destination>()
@@ -84,6 +88,9 @@ export class LiveBroadcastService {
       globalLimit: options.globalLimit ?? 512, concurrency: options.concurrency ?? 8, dedupLimit: options.dedupLimit ?? 8192 }
     for (const [name, value] of Object.entries(this.options)) if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`invalid live broadcast ${name}`)
     if (this.options.maxStreamsPerLevel > 7 || this.options.refreshMs >= this.options.capabilityTtlMs) throw new Error('invalid live broadcast capacity or refresh interval')
+    // Button venues default to the configured audience union (seated ∪ hall).
+    this.levels = [...new Set(options.levels ?? audienceLevelIds())].filter(id => Number.isInteger(id) && id > 0)
+    if (this.levels.length === 0) throw new Error('invalid live broadcast levels: no audience venues configured')
   }
   public displayName (playerId: string): string | undefined {
     const parsed = PlayerUuidSchema.safeParse(playerId)
@@ -103,7 +110,7 @@ export class LiveBroadcastService {
   private fingerprint (room: RoomSnapshot, allowed: string[]): string { return JSON.stringify([room.nodeId, room.udpHost, room.udpPort, allowed]) }
   private refresh (now: number): void {
     const current = new Set<string>()
-    for (const levelId of LEVELS) for (const candidate of this.membership.audienceRooms(levelId)) {
+    for (const levelId of this.levels) for (const candidate of this.membership.audienceRooms(levelId)) {
       const room = this.rooms.getRoom(candidate.roomId)
       if (!room || !sameRoom(room, candidate)) continue
       const key = this.key(room.roomId, levelId)
@@ -139,7 +146,7 @@ export class LiveBroadcastService {
     }
     if (event.event !== 'liveBroadcast.publish') return false
     const parsed = LiveBroadcastPublishSchema.safeParse(d)
-    if (!parsed.success || !d.roomId || !d.player || !LEVELS.includes(parsed.data.levelId)) return this.reject()
+    if (!parsed.success || !d.roomId || !d.player || !this.levels.includes(parsed.data.levelId)) return this.reject()
     const now = this.clock()
     const lease = this.destinations.get(this.key(d.roomId, parsed.data.levelId))?.capability
     // A late upload cannot renew its own expired authorization. Periodic tick/sync issues the next lease.
