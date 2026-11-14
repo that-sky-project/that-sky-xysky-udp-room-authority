@@ -6,22 +6,13 @@ import { asProtocolVersion } from '../types/branded.js'
 import type {
   IManagerCommand,
   INodeAck,
-  AudienceReactionDelivery,
-  AudienceChatGlobalState,
-  LiveBroadcastCapability,
-  LiveBroadcastDelivery,
-  LiveBroadcastCommand,
-  PerformanceState,
-  PerformanceDecision,
-  PerformanceDelivery,
-  PerformanceGap,
-  PerformanceCommand,
   RoomAssignment,
   RoomSnapshot
 } from '../types/contracts.js'
 import { ErrorCode, HermesError } from '../types/errors.js'
 export interface CrossCoordinatorOptions {
   commandTimeoutMs: number
+  reservationTtlMs?: number
 }
 export type RedirectReason =
   | 'merge'
@@ -43,6 +34,12 @@ const destinationUuidText = (roomId: string): string | undefined => {
   if (!Number.isSafeInteger(numeric) || numeric > 0xffffffffffff)
     return undefined
   return `00000000-0000-4000-8000-${numeric.toString(16).padStart(12, '0')}`
+}
+export interface SourceParticipantSnapshot {
+  playerId: PlayerId
+  sessionId?: string | undefined
+  levelId?: number | undefined
+  lvSeq?: number | undefined
 }
 export interface RedirectPlan {
   playerId: PlayerId
@@ -83,233 +80,25 @@ export class CrossCoordinator {
           roomId: room.roomId,
           playerId,
           expectedVersion: room.version,
-          ttlMs: this.options.commandTimeoutMs
+          ttlMs: this.options.reservationTtlMs ?? 30_000
         }
-      },
-      command => transport.send(command),
-      signal
-    )
-  }
-  public async seatPlayer (
-    room: RoomSnapshot,
-    seat: {
-      playerId: PlayerId
-      levelId: number
-      benchId: number
-      seatId: number
-      entityId: number
-      roomMembers?: Array<{ benchId: number; seatId: number }> | undefined
-    },
-    signal?: AbortSignal
-  ): Promise<INodeAck> {
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (
-      !transport ||
-      !transport.writable ||
-      !this.nodes.isAvailableForCommand(room.nodeId)
-    ) {
-      throw new HermesError(
-        ErrorCode.NODE_UNAVAILABLE,
-        'target node is not writable',
-        { nodeId: room.nodeId }
-      )
-    }
-    const data: Record<string, unknown> = {
-      roomId: room.roomId,
-      playerId: seat.playerId,
-      levelId: seat.levelId,
-      benchId: seat.benchId,
-      seatId: seat.seatId,
-      entityId: seat.entityId
-    }
-    if (seat.roomMembers?.length) data.roomMembers = seat.roomMembers
-    return this.sendToNode(
-      room.nodeId,
-      { v: asProtocolVersion(1), cmd: 'seat.assign', data },
-      command => transport.send(command),
-      signal
-    )
-  }
-  public async audienceSnapshot (
-    room: RoomSnapshot,
-    snapshot: {
-      levelId: number
-      seats: Array<{
-        playerId: PlayerId
-        entityId: number
-        benchId: number
-        seatId: number
-        position: [number, number, number] | null
-        levelTime: number
-        spotlight?: boolean | undefined
-      }>
-      removed?: string[] | undefined
-      /** Payload carries every remote seat; the node may drop unlisted silhouettes. */
-      full?: boolean | undefined
-    },
-    signal?: AbortSignal
-  ): Promise<INodeAck> {
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (
-      !transport ||
-      !transport.writable ||
-      !this.nodes.isAvailableForCommand(room.nodeId)
-    ) {
-      throw new HermesError(
-        ErrorCode.NODE_UNAVAILABLE,
-        'target node is not writable',
-        { nodeId: room.nodeId }
-      )
-    }
-    return this.sendToNode(
-      room.nodeId,
-      {
-        v: asProtocolVersion(1),
-        cmd: 'audience.snapshot',
-        data: {
-          roomId: room.roomId,
-          levelId: snapshot.levelId,
-          seats: snapshot.seats.map(seat => ({
-            playerId: seat.playerId,
-            entityId: seat.entityId,
-            benchId: seat.benchId,
-            seatId: seat.seatId,
-            position: seat.position,
-            levelTime: seat.levelTime,
-            // Hall-wide stage state: the receiving node flips the entity into
-            // the spotlight render path (type 0xE + stage extra).
-            spotlight: seat.spotlight ?? false
-          })),
-          removed: snapshot.removed ?? [],
-          full: snapshot.full ?? false
-        }
-      },
-      command => transport.send(command),
-      signal
-    )
-  }
-  public async chatGlobal (room: RoomSnapshot, data: AudienceChatGlobalState, signal?: AbortSignal): Promise<INodeAck> {
-    const current = this.rooms.getRoom(room.roomId)
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (!current || current.nodeId !== room.nodeId || current.udpHost !== room.udpHost || current.udpPort !== room.udpPort ||
-      !transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'audience chat-global destination unavailable')
-    }
-    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd: 'audience.chatGlobal', data: { ...data, roomId: room.roomId } }, command => transport.send(command), signal)
-  }
-  public async audienceReaction (room: RoomSnapshot, data: AudienceReactionDelivery, signal?: AbortSignal): Promise<INodeAck> {
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (!transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'reaction destination unavailable')
-    }
-    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd: 'audience.reaction', data }, command => transport.send(command), signal)
-  }
-  public async liveBroadcast (room: RoomSnapshot, cmd: LiveBroadcastCommand, data: LiveBroadcastCapability | LiveBroadcastDelivery, signal?: AbortSignal): Promise<INodeAck> {
-    const current = this.rooms.getRoom(room.roomId)
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (!current || current.nodeId !== room.nodeId || current.udpHost !== room.udpHost || current.udpPort !== room.udpPort ||
-      !transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'live broadcast destination unavailable')
-    }
-    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd, data: { ...data, roomId: room.roomId } }, command => transport.send(command), signal)
-  }
-  public async performance (
-    room: RoomSnapshot,
-    cmd: PerformanceCommand,
-    data: PerformanceState | PerformanceDecision | PerformanceDelivery | PerformanceGap,
-    signal?: AbortSignal
-  ): Promise<INodeAck> {
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (!transport?.writable || !this.nodes.isAvailableForCommand(room.nodeId)) {
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'performance destination unavailable')
-    }
-    return this.sendToNode(room.nodeId, { v: asProtocolVersion(1), cmd, data }, command => transport.send(command), signal)
-  }
-  public async levelAudience (
-    room: RoomSnapshot,
-    payload: {
-      levelId: number
-      players: Array<{
-        playerId: PlayerId
-        roomId: RoomId
-        position: [number, number, number] | null
-        levelTime: number
-      }>
-      removed?: string[] | undefined
-    },
-    signal?: AbortSignal
-  ): Promise<INodeAck> {
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (
-      !transport ||
-      !transport.writable ||
-      !this.nodes.isAvailableForCommand(room.nodeId)
-    ) {
-      throw new HermesError(
-        ErrorCode.NODE_UNAVAILABLE,
-        'target node is not writable',
-        { nodeId: room.nodeId }
-      )
-    }
-    return this.sendToNode(
-      room.nodeId,
-      {
-        v: asProtocolVersion(1),
-        cmd: 'level.audience',
-        data: {
-          roomId: room.roomId,
-          levelId: payload.levelId,
-          players: payload.players.map(player => ({
-            playerId: player.playerId,
-            roomId: player.roomId,
-            position: player.position,
-            levelTime: player.levelTime
-          })),
-          removed: payload.removed ?? []
-        }
-      },
-      command => transport.send(command),
-      signal
-    )
-  }
-  public async seatRelease (
-    room: RoomSnapshot,
-    playerId: PlayerId,
-    signal?: AbortSignal
-  ): Promise<INodeAck> {
-    const transport = this.nodes.getTransport(room.nodeId)
-    if (
-      !transport ||
-      !transport.writable ||
-      !this.nodes.isAvailableForCommand(room.nodeId)
-    ) {
-      throw new HermesError(
-        ErrorCode.NODE_UNAVAILABLE,
-        'target node is not writable',
-        { nodeId: room.nodeId }
-      )
-    }
-    return this.sendToNode(
-      room.nodeId,
-      {
-        v: asProtocolVersion(1),
-        cmd: 'seat.release',
-        data: { roomId: room.roomId, playerId }
       },
       command => transport.send(command),
       signal
     )
   }
   public async redirectPlayers (
-    plan: RedirectPlan & { playerIds: PlayerId[]; moveId?: string },
+    plan: RedirectPlan & {
+      playerIds: PlayerId[]; moveId?: string; sourceNodeId?: NodeId;
+      sourceConnectedAt?: number; expectedParticipants?: SourceParticipantSnapshot[];
+      reservationToken?: string | undefined
+    },
     signal?: AbortSignal
   ): Promise<INodeAck> {
     const firstPlayerId = plan.playerIds[0]
     if (!firstPlayerId)
       throw new HermesError(ErrorCode.BAD_REQUEST, 'move has no players')
-    const sourceNodeId =
-      this.rooms.getPlayerLocation(firstPlayerId)?.nodeId ??
-      this.rooms.getRoom(plan.fromRoomId)?.nodeId
+    const sourceNodeId = plan.sourceNodeId ?? this.rooms.getRoom(plan.fromRoomId)?.nodeId
     if (!sourceNodeId)
       throw new HermesError(ErrorCode.NOT_FOUND, 'player location is unknown', {
         playerId: firstPlayerId,
@@ -327,6 +116,15 @@ export class CrossCoordinator {
         { nodeId: sourceNodeId }
       )
     }
+    if (plan.sourceConnectedAt !== undefined && transport.connectedAt !== plan.sourceConnectedAt) {
+      throw new HermesError(ErrorCode.STALE_PLAN, 'source connection changed during prepare')
+    }
+    for (const playerId of plan.playerIds) {
+      const location = this.rooms.getPlayerLocation(playerId)
+      if (!location || location.roomId !== plan.fromRoomId || location.nodeId !== sourceNodeId || location.leavingAt !== undefined) {
+        throw new HermesError(ErrorCode.STALE_PLAN, 'source participant location changed during prepare')
+      }
+    }
     return this.sendToNode(
       sourceNodeId,
       {
@@ -340,7 +138,10 @@ export class CrossCoordinator {
           toRoomUuid: destinationUuidText(plan.to.roomId),
           udpHost: plan.to.udpHost,
           udpPort: plan.to.udpPort,
-          reason: plan.reason
+          reason: plan.reason,
+          expiresAt: plan.to.expiresAt,
+          ...(plan.expectedParticipants ? { expectedParticipants: plan.expectedParticipants } : {}),
+          ...(plan.reservationToken ? { reservationToken: plan.reservationToken } : {})
         }
       },
       command => transport.send(command),

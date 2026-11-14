@@ -8,19 +8,18 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "dev": "tsc -p tsconfig.json && node --watch dist/runtime/main.js",
+    "dev": "tsc -p tsconfig.json && node --enable-source-maps --watch dist/runtime/main.js",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/runtime/main.js",
+    "start": "node --enable-source-maps dist/runtime/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify:seating": "npm run build && node scripts/verify-seating.mjs",
-    "verify:snapshot": "npm run build && node scripts/verify-snapshot-round.mjs",
-    "verify:performance": "npm run build && node scripts/verify-performance.mjs",
-    "verify:audience-reaction": "npm run build && node scripts/verify-audience-reaction.mjs",
-    "verify:live-broadcast": "npm run build && node scripts/verify-live-broadcast.mjs"
+    "verify:core-contracts": "npm run build && node --test scripts/verify-core-contracts.mjs",
+    "test": "npm run build && node --enable-source-maps --test scripts/*.test.mjs scripts/verify-core-contracts.mjs",
+    "test:lifecycle": "npm run build && node --enable-source-maps --test scripts/logger-lifecycle.test.mjs scripts/pending-lifecycle.test.mjs"
   },
   "dependencies": {
     "lru-cache": "^11.0.2",
     "pino": "^9.5.0",
+    "pino-pretty": "^13.2.0",
     "ws": "^8.21.3",
     "yaml": "^2.8.1",
     "zod": "^3.24.1"

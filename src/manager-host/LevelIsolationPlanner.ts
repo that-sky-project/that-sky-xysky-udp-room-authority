@@ -1,5 +1,6 @@
 import type { RoomSnapshot } from '../types/contracts.js'
 import type { Logger } from '../infra/logger/logger.js'
+import type { PlanningContext } from './MovePlanner.js'
 import type { StoredTelemetry, TelemetryStore } from './TelemetryStore.js'
 export interface LevelIsolationPlan {
   playerIds: string[]
@@ -44,8 +45,8 @@ const DEFAULT_OPTIONS: LevelIsolationOptions = {
   // failed wholesale at commit and fell back to single-player migrations.
   maxPlayersPerMove: 7,
   sparseRoomThreshold: 2,
-  levelChangeCooldownMs: 6_000,
-  joinSettleMs: 4_000,
+  levelChangeCooldownMs: 8_000,
+  joinSettleMs: 6_000,
   protectedLevels: []
 }
 export class LevelIsolationPlanner {
@@ -53,6 +54,9 @@ export class LevelIsolationPlanner {
   private readonly protectedLevels: Set<number>
   public constructor (options: Partial<LevelIsolationOptions> = {}) {
     this.options = { ...DEFAULT_OPTIONS, ...options }
+    if (!Number.isInteger(this.options.maxPlayersPerMove) || this.options.maxPlayersPerMove < 1 || this.options.maxPlayersPerMove > 7) {
+      throw new RangeError('maxPlayersPerMove must be between 1 and 7')
+    }
     this.protectedLevels = new Set(
       (options.protectedLevels ?? DEFAULT_OPTIONS.protectedLevels).filter(
         id => Number.isInteger(id) && id > 0
@@ -63,7 +67,8 @@ export class LevelIsolationPlanner {
     rooms: RoomSnapshot[],
     telemetry: TelemetryStore,
     now = Date.now(),
-    log?: Logger
+    log?: Logger,
+    context: PlanningContext = {}
   ): LevelIsolationPlan[] {
     const plans: LevelIsolationPlan[] = []
     const claimedPlayers = new Set<string>()
@@ -71,10 +76,16 @@ export class LevelIsolationPlanner {
     let budget = this.options.maxPlayersPerMove * Math.max(1, rooms.length)
     const occupancy = new Map<string, number>()
     const byRoom = new Map<string, StoredTelemetry[]>()
+    // Index once: TelemetryStore.listRoom used to scan every player for each room.
+    for (const player of telemetry.list()) {
+      const players = byRoom.get(player.roomId) ?? []
+      players.push(player)
+      byRoom.set(player.roomId, players)
+    }
     for (const room of rooms) {
-      const players = telemetry.listRoom(room.roomId, now)
+      const players = byRoom.get(room.roomId) ?? []
       byRoom.set(room.roomId, players)
-      occupancy.set(room.roomId, players.length)
+      occupancy.set(room.roomId, context.effectivePlayersOf?.(room) ?? Math.max(room.players, players.length))
     }
     const levelsByRoom = new Map<string, Set<number>>()
     for (const [roomId, players] of byRoom) {
@@ -91,6 +102,8 @@ export class LevelIsolationPlanner {
     for (const room of rooms) {
       if (budget <= 0) break
       let players = byRoom.get(room.roomId) ?? []
+      if (room.draining || players.length > 8 || this.hasUnsettled(players, now) ||
+          context.isCandidateRoom?.(room, 'source', now) === false) continue
       let forcedGroups: RoomLevelGroup[] = []
       const protectedPlayers =
         this.protectedLevels.size > 0
@@ -111,14 +124,15 @@ export class LevelIsolationPlanner {
         if (!source) break
         if (!forced && source.players.length < this.options.minLevelPlayers)
           break
-        const movable = source.players.filter(
+        const movable = this.filterByAffinity(source.players.filter(
           p => !claimedPlayers.has(p.playerId as string)
-        )
+        ), players, claimedPlayers)
         if (movable.length === 0) {
+          // Defer a conflicting bond, but still permit unrelated coherent groups.
           if (forced) continue
-          break
+          groups = groups.filter(group => group !== source)
+          continue
         }
-        if (!forced) this.expandBonded(movable, players, claimedPlayers)
         let picked:
           | { target: RoomSnapshot; selected: StoredTelemetry[] }
           | undefined
@@ -131,7 +145,8 @@ export class LevelIsolationPlanner {
           byRoom,
           movable,
           now,
-          !forced
+          !forced,
+          context
         )) {
           const cap = Math.max(
             0,
@@ -207,7 +222,8 @@ export class LevelIsolationPlanner {
       new Set(),
       budget,
       now,
-      log
+      log,
+      context
     )
     return plans
   }
@@ -222,7 +238,8 @@ export class LevelIsolationPlanner {
     usedSources: Set<string>,
     budget: number,
     now: number,
-    log?: Logger
+    log?: Logger,
+    context: PlanningContext = {}
   ): void {
     const threshold = this.options.sparseRoomThreshold
     const sparseByLevel = new Map<
@@ -261,13 +278,16 @@ export class LevelIsolationPlanner {
       for (const source of sparseRooms) {
         if (budget <= 0) break
         const currentOcc = occupancy.get(source.roomId) ?? 0
-        if (currentOcc > threshold || usedTargets.has(source.roomId)) continue
+        const sourceRoom = rooms.find(room => room.roomId === source.roomId)
+        if (!sourceRoom || context.isCandidateRoom?.(sourceRoom, 'source', now) === false ||
+            currentOcc > threshold || usedTargets.has(source.roomId)) continue
         const target = (targetByLevel.get(levelId) ?? [])
           .filter(
             t =>
               t.roomId !== source.roomId &&
               !usedTargets.has(t.roomId) &&
               !usedSources.has(t.roomId) &&
+              context.isCandidateRoom?.(rooms.find(room => room.roomId === t.roomId)!, 'target', now) !== false &&
               t.occ < t.cap
           )
           .sort((a, b) => b.occ - a.occ)[0]
@@ -338,8 +358,8 @@ export class LevelIsolationPlanner {
     capacity: number,
     maxCount: number
   ): StoredTelemetry[] {
-    if (capacity <= 0 || maxCount <= 0) return []
-    const limit = Math.min(capacity, maxCount, candidates.length)
+    if (capacity <= 0 || maxCount <= 0 || candidates.length > 8) return []
+    const limit = Math.min(capacity, maxCount, candidates.length, 7)
     if (limit <= 0) return []
     const index = new Map<string, number>()
     candidates.forEach((p, i) => index.set(p.playerId as string, i))
@@ -409,23 +429,29 @@ export class LevelIsolationPlanner {
     claimed: Set<string>
   ): StoredTelemetry[] {
     const candidateIds = new Set(candidates.map(p => p.playerId as string))
-    return candidates.filter(player => {
-      for (const other of allRoomPlayers) {
-        if (other.playerId === player.playerId) continue
-        if (
-          candidateIds.has(other.playerId as string) ||
-          claimed.has(other.playerId as string)
-        )
-          continue
-        if (other.levelId !== player.levelId) continue
-        const affinity = Math.max(
-          player.affinity?.[other.playerId as string] ?? 0,
-          other.affinity?.[player.playerId as string] ?? 0
-        )
-        if (affinity >= 0.9) return false
+    // Reject an entire connected component when any hard-bond mate is outside
+    // the coherent level/settled candidate set. Never expand across levels.
+    const blocked = new Set<string>()
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const player of candidates) {
+        const id = player.playerId as string
+        if (blocked.has(id)) continue
+        for (const other of allRoomPlayers) {
+          if (other.playerId === player.playerId) continue
+          const affinity = Math.max(player.affinity?.[other.playerId as string] ?? 0,
+            other.affinity?.[id] ?? 0)
+          if (affinity >= 0.9 && (!candidateIds.has(other.playerId as string) ||
+              claimed.has(other.playerId as string) || blocked.has(other.playerId as string))) {
+            blocked.add(id)
+            changed = true
+            break
+          }
+        }
       }
-      return true
-    })
+    }
+    return candidates.filter(player => !blocked.has(player.playerId as string))
   }
   private newestChangeAt (players: StoredTelemetry[]): number {
     let newest = 0
@@ -445,36 +471,14 @@ export class LevelIsolationPlanner {
     const levelCutoff = now - this.options.levelChangeCooldownMs
     const joinCutoff = now - this.options.joinSettleMs
     return (
+      now - player.receivedAt <= 10_000 &&
+      player.receivedAt <= now &&
       (player.levelChangedAt ?? 0) <= levelCutoff &&
       (player.roomJoinedAt ?? 0) <= joinCutoff
     )
   }
   private hasUnsettled (players: StoredTelemetry[], now: number): boolean {
     return players.some(player => !this.isSettled(player, now))
-  }
-  private expandBonded (
-    movable: StoredTelemetry[],
-    roomPlayers: StoredTelemetry[],
-    claimed: Set<string>
-  ): void {
-    const included = new Set(movable.map(player => player.playerId as string))
-    const queue = [...movable]
-    while (queue.length > 0) {
-      const player = queue.pop()
-      if (!player) break
-      for (const other of roomPlayers) {
-        const otherId = other.playerId as string
-        if (included.has(otherId) || claimed.has(otherId)) continue
-        const affinity = Math.max(
-          player.affinity?.[otherId] ?? 0,
-          other.affinity?.[player.playerId as string] ?? 0
-        )
-        if (affinity < 0.9) continue
-        included.add(otherId)
-        movable.push(other)
-        queue.push(other)
-      }
-    }
   }
   private pickSourceGroup (
     groups: RoomLevelGroup[]
@@ -495,10 +499,12 @@ export class LevelIsolationPlanner {
     byRoom: Map<string, StoredTelemetry[]>,
     sourcePlayers: StoredTelemetry[],
     now: number,
-    allowMixed = true
+    allowMixed = true,
+    context: PlanningContext = {}
   ): RoomSnapshot[] {
     const isUsable = (room: RoomSnapshot): boolean => {
-      if (room.roomId === sourceRoomId || room.draining) return false
+      if (room.roomId === sourceRoomId || room.draining ||
+          context.isCandidateRoom?.(room, 'target', now) === false) return false
       if ((occupancy.get(room.roomId) ?? 0) >= room.capacity) return false
       if (this.hasProtected(byRoom.get(room.roomId) ?? [])) return false
       return !this.hasUnsettled(byRoom.get(room.roomId) ?? [], now)

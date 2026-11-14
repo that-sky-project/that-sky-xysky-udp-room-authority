@@ -5,18 +5,12 @@ import { ErrorCode, HermesError } from '../types/errors.js'
 
 interface PendingEntry {
   resolve: (ack: INodeAck) => void
-  reject: (error: Error) => void
+  reject: (error: unknown) => void
   timeout: NodeJS.Timeout
-  abortListener?: (() => void) | undefined
-  /**
-   * Node the command was addressed to.
-   *
-   * Command ids come from one global counter, so matching an ack on the id
-   * alone lets any node answer a command that was sent to a different node —
-   * a bug or a malicious node would then be taken as the truth about someone
-   * else's rooms and players.
-   */
+  removeAbortListener?: (() => void) | undefined
   nodeId?: string | undefined
+  sent: boolean
+  ack?: INodeAck | undefined
 }
 
 export interface PendingRequestOptions {
@@ -27,107 +21,107 @@ export interface PendingRequestOptions {
 export class PendingRequestMap {
   private readonly pending = new Map<CommandId, PendingEntry>()
   private sequence = 1
+  private closedError: Error | undefined
 
   public constructor (private readonly options: PendingRequestOptions) {}
 
   public nextId (): CommandId {
-    const id = this.sequence
-    this.sequence =
-      this.sequence >= Number.MAX_SAFE_INTEGER ? 1 : this.sequence + 1
-    return asCommandId(id)
+    // Do not reuse a live command id when the global sequence wraps.
+    while (true) {
+      const id = asCommandId(this.sequence)
+      this.sequence = this.sequence >= Number.MAX_SAFE_INTEGER ? 1 : this.sequence + 1
+      if (!this.pending.has(id)) return id
+    }
   }
 
-  public async send<TData> (
+  public send<TData> (
     command: Omit<IManagerCommand<TData>, 'id'>,
     sender: (command: IManagerCommand<TData>) => Promise<void>,
     signal?: AbortSignal,
     nodeId?: string
   ): Promise<INodeAck> {
+    if (this.closedError) return Promise.reject(this.closedError)
+    if (signal?.aborted) return Promise.reject(this.abortError())
     if (this.pending.size >= this.options.maxPending) {
-      throw new HermesError(
-        ErrorCode.NO_CAPACITY,
-        'too many pending node commands'
-      )
+      return Promise.reject(new HermesError(ErrorCode.NO_CAPACITY, 'too many pending node commands'))
     }
-
-    const fullCommand: IManagerCommand<TData> = {
-      ...command,
-      id: this.nextId()
-    }
-    const ackPromise = this.wait(fullCommand.id, signal, nodeId)
-
-    try {
-      await sender(fullCommand)
-      return await ackPromise
-    } catch (error) {
-      this.reject(
-        fullCommand.id,
-        error instanceof Error ? error : new Error(String(error))
-      )
-      throw error
-    }
+    const fullCommand: IManagerCommand<TData> = { ...command, id: this.nextId() }
+    // A single public promise owns both the send and ACK. Its deadline stays
+    // active even if an ACK arrives before the transport's send callback. No
+    // hidden rejected ACK promise, and abort/timeout never await a stuck sender.
+    return new Promise<INodeAck>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.reject(fullCommand.id, new HermesError(ErrorCode.NODE_TIMEOUT, 'node command timed out', { id: fullCommand.id }))
+      }, this.options.timeoutMs)
+      timeout.unref?.()
+      const entry: PendingEntry = { resolve, reject, timeout, nodeId, sent: false }
+      this.pending.set(fullCommand.id, entry)
+      if (signal) {
+        const onAbort = (): void => { this.reject(fullCommand.id, this.abortError(fullCommand.id)) }
+        signal.addEventListener('abort', onAbort, { once: true })
+        entry.removeAbortListener = () => signal.removeEventListener('abort', onAbort)
+        if (signal.aborted) onAbort()
+      }
+      // Attach rejection handling immediately, including synchronous sender
+      // throws and failures that happen after this command already timed out.
+      void Promise.resolve().then(() => {
+        if (this.pending.get(fullCommand.id) !== entry) return
+        return sender(fullCommand)
+      }).then(() => {
+        if (this.pending.get(fullCommand.id) !== entry) return
+        entry.sent = true
+        if (entry.ack) this.complete(fullCommand.id, entry, entry.ack)
+      }, error => {
+        const current = this.pending.get(fullCommand.id)
+        if (current !== entry) return
+        this.remove(fullCommand.id, entry)
+        entry.reject(error)
+      })
+    })
   }
 
-  /**
-   * Resolve a command from a node's ack.
-   *
-   * An ack whose id belongs to a command addressed to another node is rejected
-   * and left pending, so the real node's answer still has a chance to arrive.
-   */
+  /** A node-bound command requires the authenticated source, including when omitted. */
   public resolve (ack: INodeAck, fromNodeId?: string): boolean {
     const entry = this.pending.get(ack.id)
-    if (!entry) return false
-    if (entry.nodeId !== undefined && fromNodeId !== undefined && entry.nodeId !== fromNodeId) {
-      return false
-    }
-    clearTimeout(entry.timeout)
-    entry.abortListener?.()
-    this.pending.delete(ack.id)
-    entry.resolve(ack)
+    if (!entry || entry.ack) return false
+    if (entry.nodeId !== undefined && entry.nodeId !== fromNodeId) return false
+    entry.ack = ack
+    if (entry.sent) this.complete(ack.id, entry, ack)
     return true
   }
 
   public reject (id: CommandId, error: Error): boolean {
     const entry = this.pending.get(id)
     if (!entry) return false
-    clearTimeout(entry.timeout)
-    entry.abortListener?.()
-    this.pending.delete(id)
+    this.remove(id, entry)
     entry.reject(error)
     return true
   }
 
-  public size (): number {
-    return this.pending.size
+  public rejectAll (error: Error): void {
+    for (const id of this.pending.keys()) this.reject(id, error)
   }
 
-  private wait (id: CommandId, signal?: AbortSignal, nodeId?: string): Promise<INodeAck> {
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pending.delete(id)
-        reject(
-          new HermesError(ErrorCode.NODE_TIMEOUT, 'node command timed out', {
-            id
-          })
-        )
-      }, this.options.timeoutMs)
-      timeout.unref?.()
+  public close (error: Error = new HermesError(ErrorCode.NODE_UNAVAILABLE, 'node command channel stopped')): void {
+    if (this.closedError) return
+    this.closedError = error
+    this.rejectAll(error)
+  }
 
-      let abortListener: (() => void) | undefined
-      if (signal) {
-        const onAbort = (): void => {
-          this.reject(
-            id,
-            new HermesError(ErrorCode.NODE_TIMEOUT, 'node command aborted', {
-              id
-            })
-          )
-        }
-        signal.addEventListener('abort', onAbort, { once: true })
-        abortListener = () => signal.removeEventListener('abort', onAbort)
-      }
+  public size (): number { return this.pending.size }
 
-      this.pending.set(id, { resolve, reject, timeout, abortListener, nodeId })
-    })
+  private abortError (id?: CommandId): Error {
+    return new HermesError(ErrorCode.NODE_TIMEOUT, 'node command aborted', { id })
+  }
+
+  private remove (id: CommandId, entry: PendingEntry): void {
+    clearTimeout(entry.timeout)
+    entry.removeAbortListener?.()
+    this.pending.delete(id)
+  }
+
+  private complete (id: CommandId, entry: PendingEntry, ack: INodeAck): void {
+    this.remove(id, entry)
+    entry.resolve(ack)
   }
 }

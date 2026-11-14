@@ -13,8 +13,9 @@ npm-debug.log*
 Thumbs.db
 
 scripts/*
-!scripts/verify-performance.mjs
-!scripts/verify-audience-reaction.mjs
-!scripts/verify-live-broadcast.mjs
+!scripts/simulate-merge.mjs
+!scripts/verify-core-contracts.mjs
+!scripts/lifecycle-bootstrap-fixture.mjs
+!scripts/*.test.mjs
 
 .vscode/

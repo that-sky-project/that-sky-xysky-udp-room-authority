@@ -49,13 +49,22 @@ npm run build
 npm start          # 运行 dist/runtime/main.js
 ```
 
-开发模式（重建 + 监听）：
+开发模式会先编译一次，再监听编译后的 JavaScript。修改 TypeScript 后仍需重新编译，监听器不会自动编译源码。
 
 ```bash
 npm run dev
 ```
 
 仅类型检查（不产出）：`npm run typecheck`。
+
+### 当前功能边界
+
+QWD 与 UDP 节点现在只实现普通 **8 人房间**。千人房观众系统、座位、长凳、跨房剪影、
+演出、直播、观众反应及观众全体聊天已删除，不留功能开关，也不提供无座位替代系统。
+`POST /reserve` 与 `POST /audience/chat-global` 返回普通的路由不存在响应。
+
+`room.reserve` 仍用于普通分配与迁移的容量预留，它不是已删除的活动预约。
+未修改的账号后端可能在 `/reserve` 失败后回退；这不代表活动预约成功，也不保证客户端的活动 UI 行为。
 
 ### 集群模拟
 
@@ -83,6 +92,7 @@ allocate_path: /allocate
 
 logging:
   level: info
+  pretty: true # false 输出结构化 JSON
 
 rooms:
   max_rooms: 100000
@@ -120,7 +130,8 @@ debug:
 | --- | --- | --- |
 | `host` / `port` | `0.0.0.0` / `1131` | HTTP + WebSocket 监听地址 |
 | `allocate_path` | `/allocate` | 房间分配的 HTTP 路径 |
-| `logging.level` | `info` | Pino 日志级别 |
+| `logging.level` | `info` | `fatal`、`error`、`warn`、`info`、`debug`、`trace` 或 `silent` |
+| `logging.pretty` | `true` | Pino 可读格式；`false` 输出 JSON；重定向时不强制 ANSI 颜色 |
 | `rooms.max_rooms` | `100000` | 房间快照缓存容量 |
 | `rooms.candidate_room_limit` | `256` | 每次分配扫描的最大房间数 |
 | `rooms.stale_room_ms` | `120000` | 房间快照空闲多久后丢弃 |

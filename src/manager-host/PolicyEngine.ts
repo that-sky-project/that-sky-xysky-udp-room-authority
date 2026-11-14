@@ -36,10 +36,12 @@ export class PolicyEngine {
     nodeHealth: Map<string, NodeHealth>,
     effectivePlayersOf: (room: RoomSnapshot) => number = room => room.players,
     levelsOf: (room: RoomSnapshot) => ReadonlySet<number> = () =>
-      new Set<number>()
+      new Set<number>(),
+    isCandidate: (room: RoomSnapshot) => boolean = () => true
   ): RoomSelection | undefined {
     let best: RoomSelection | undefined
     for (const room of rooms) {
+      if (!isCandidate(room)) continue
       const effectivePlayers = effectivePlayersOf(room)
       if (
         room.draining ||

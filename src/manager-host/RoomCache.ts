@@ -14,6 +14,8 @@ export interface PlayerLocation {
   roomId: RoomId
   updatedAt: UnixMs
   level?: number | undefined
+  sessionId?: string | undefined
+  lvSeq?: number | undefined
   leavingAt?: number | undefined
 }
 export interface RoomCacheOptions {
@@ -25,6 +27,7 @@ export interface CandidateRoomQuery {
   region?: Region | undefined
   preferredFillTarget: number
   limit: number
+  filter?: ((room: RoomSnapshot) => boolean) | undefined
 }
 export class RoomCache {
   private static readonly ALL_REGIONS = '__all__'
@@ -40,6 +43,8 @@ export class RoomCache {
   >()
   private readonly suspectNodes = new Map<NodeId, number>()
   private readonly nodeGraceMs: number
+  private candidateFilter: ((room: RoomSnapshot) => boolean) | undefined
+  public setCandidateFilter (filter: (room: RoomSnapshot) => boolean): void { this.candidateFilter = filter }
   public constructor (options: RoomCacheOptions) {
     this.nodeGraceMs = options.nodeGraceMs ?? 10_000
     this.rooms = new LRUCache<RoomId, RoomSnapshot>({
@@ -77,6 +82,7 @@ export class RoomCache {
     this.rooms.delete(roomId)
     this.removeRoomIndex(roomId)
     this.awaitingTelemetry.delete(roomId)
+    for (const [id, location] of this.playerLocations) if (location.roomId === roomId) this.playerLocations.delete(id)
   }
   public getRoom (roomId: RoomId): RoomSnapshot | undefined {
     return this.rooms.get(roomId)
@@ -154,6 +160,8 @@ export class RoomCache {
           const room = this.rooms.get(roomId)
           if (!room || room.draining || room.players >= room.capacity) continue
           if (this.suspectNodes.has(room.nodeId)) continue
+          if (this.candidateFilter && !this.candidateFilter(room)) continue
+          if (query.filter && !query.filter(room)) continue
           seen.add(roomId)
           results.push(room)
           if (results.length >= query.limit) return results
@@ -166,16 +174,27 @@ export class RoomCache {
     playerId: PlayerId,
     nodeId: NodeId,
     roomId: RoomId,
-    level?: number
+    level?: number,
+    sessionId?: string,
+    lvSeq?: number
   ): void {
     const previous = this.playerLocations.get(playerId)
+    if (previous?.roomId === roomId && previous.sessionId === sessionId && previous.lvSeq !== undefined && lvSeq !== undefined && ((lvSeq - previous.lvSeq + 256) & 255) >= 128) return
+    const sameIdentity = previous?.roomId === roomId && (sessionId === undefined || previous.sessionId === sessionId)
     this.playerLocations.set(playerId, {
       playerId,
       nodeId,
       roomId,
       updatedAt: asUnixMs(Date.now()),
-      level: level !== undefined && level > 0 ? level : previous?.level
+      level: level !== undefined ? (level > 0 ? level : undefined) : (sameIdentity ? previous?.level : undefined),
+      sessionId: sessionId ?? (previous?.roomId === roomId ? previous.sessionId : undefined),
+      lvSeq: lvSeq ?? (previous?.roomId === roomId ? previous.lvSeq : undefined)
     })
+  }
+  public removePlayer (playerId: PlayerId, expectedRoomId: RoomId, expectedSessionId?: string): boolean {
+    const current = this.playerLocations.get(playerId)
+    if (!current || current.roomId !== expectedRoomId || (expectedSessionId !== undefined && current.sessionId !== undefined && current.sessionId !== expectedSessionId)) return false
+    return this.playerLocations.delete(playerId)
   }
   public untrackPlayer (playerId: PlayerId, roomId?: RoomId): void {
     const current = this.playerLocations.get(playerId)
@@ -236,30 +255,9 @@ export class RoomCache {
     return result
   }
   public applyNodeEvent (event: INodeEvent): void {
+    if (event.event === 'room.telemetry') return // RoomTelemetryService owns acceptance and commits all views.
     if (event.data.rooms) {
       for (const room of event.data.rooms) this.upsertRoom(room)
-    }
-    if (event.event === 'room.telemetry' && event.data.roomId) {
-      this.awaitingTelemetry.delete(event.data.roomId)
-      // Locations are otherwise only tracked on player.join — without this
-      // refresh, a node disconnect longer than the suspect sweep (grace_ms)
-      // deletes every location, and nothing restores them until each client
-      // re-joins the room. That kept broadcast/chat targets dead until map
-      // re-entry. Telemetry only lists sessions still active on the node, so
-      // re-tracking cannot resurrect a departed player.
-      const roster = event.data.players
-      if (Array.isArray(roster)) {
-        for (const player of roster) {
-          if (!player?.playerId) continue
-          const levelId = Number(player.levelId ?? 0)
-          this.trackPlayer(
-            asPlayerId(player.playerId as string),
-            event.data.nodeId as NodeId,
-            asRoomId(event.data.roomId as string),
-            levelId > 0 ? levelId : undefined
-          )
-        }
-      }
     }
     if (event.event === 'room.destroyed' && event.data.roomId) {
       this.deleteRoom(event.data.roomId)
@@ -301,7 +299,9 @@ export class RoomCache {
         event.data.player.playerId,
         event.data.nodeId,
         event.data.roomId,
-        event.data.player.level
+        event.data.player.level,
+        event.data.player.sessionId ?? event.data.sessionId,
+        event.data.player.lvSeq ?? event.data.lvSeq
       )
       this.bumpPlayers(event.data.roomId, 1, event.data.version)
     }
@@ -313,6 +313,11 @@ export class RoomCache {
       this.untrackPlayer(event.data.player.playerId, event.data.roomId)
       this.bumpPlayers(event.data.roomId, -1, event.data.version)
     }
+  }
+  public acceptTelemetryRoom (room: RoomSnapshot): boolean {
+    if (!this.upsertRoom(room)) return false
+    this.awaitingTelemetry.delete(room.roomId)
+    return true
   }
   private bumpPlayers (roomId: RoomId, delta: number, version?: number): void {
     if (this.awaitingTelemetry.has(roomId)) return

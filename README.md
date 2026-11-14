@@ -53,13 +53,27 @@ npm run build
 npm start          # runs dist/runtime/main.js
 ```
 
-For development with rebuild + watch:
+For development, `npm run dev` compiles once and watches the emitted JavaScript.
+Rebuild after TypeScript changes; the watcher does not compile TypeScript for you.
 
 ```bash
 npm run dev
 ```
 
 Type-check only (no emit): `npm run typecheck`.
+
+### Supported scope
+
+QWD and the UDP nodes now implement ordinary **eight-player rooms only**.
+The thousand-player audience system, seats, silhouettes, performances, live
+broadcasts, audience reactions and audience-wide chat have been removed. There
+is no feature toggle or seat-free replacement. `POST /reserve` and
+`POST /audience/chat-global` return the normal route-not-found response.
+
+`room.reserve` still reserves ordinary room capacity for allocation and
+migration. It is unrelated to the removed activity reservation. An unchanged
+account backend may fall back after `/reserve` fails; that fallback is not a
+successful activity reservation or a guarantee of client UI behavior.
 
 ### Cluster simulation
 
@@ -88,6 +102,7 @@ allocate_path: /allocate
 
 logging:
   level: info
+  pretty: true # false emits structured JSON
 
 rooms:
   max_rooms: 100000
@@ -125,7 +140,8 @@ debug:
 | --- | --- | --- |
 | `host` / `port` | `0.0.0.0` / `1131` | HTTP + WebSocket listen address |
 | `allocate_path` | `/allocate` | HTTP path for room allocation |
-| `logging.level` | `info` | Pino log level |
+| `logging.level` | `info` | `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent` |
+| `logging.pretty` | `true` | Human-readable Pino formatting; `false` emits JSON; ANSI colors are not forced when redirected |
 | `rooms.max_rooms` | `100000` | Room snapshot cache capacity |
 | `rooms.candidate_room_limit` | `256` | Max rooms scanned per allocation |
 | `rooms.stale_room_ms` | `120000` | Drop a room snapshot after this idle time |

@@ -2,35 +2,10 @@ host: 0.0.0.0
 port: 1131
 allocate_path: /allocate
 
-performance:
-  preparationMs: 15000 # authoritative warm-up window; separate from broadcast duration
-  durationMs: 300000 # QWD authoritative duration; no client deadline compensation
-  queueLimit: 1000 # bounded FIFO; maximum 10000
-
-liveBroadcast:
-  allowedPlayerUuids: [ "" ] # displayName:UUID or UUID; authorization uses UUID only
-  maxStreamsPerLevel: 7 # conservative policy reserves one piano playback slot
-  # Fixed defaults: capability lease 5000ms, refresh 2000ms, event TTL 3000ms, stream idle 5000ms.
-
-  # ---------------------------------------------------------------------------
-  # Audience venues. Nodes fully trust these ids: seat assignment, barn state,
-  # and the live-broadcast button levels all derive from the union of both
-  # lists. Every id must be a real venue map — barn packets sent for an
-  # ordinary map drop the client's connection.
-  # ---------------------------------------------------------------------------
-audience:
-  seated_levels: [ 263580627 ] # levels that get seat assignment (bench/seatId, 需要座位)
-  hall_levels: [ 1559613961, 2779731386, 47024056, 4011385311, 1661095040, 2093785354, 3530028462 ] # levels that run the barn without seats (cross-room silhouettes, 无需座位)
-
-audienceReaction:
-  ttlMs: 2000 # next normal 1Hz frame plus network/application ACK margin; no replay after deadline
-
-audienceChatGlobal:
-  maxSeconds: 86400 # maximum accepted operator-requested global-chat window per level
-
 logging:
-  # pino level: fatal | error | warn | info | debug | trace
+  # pino level: fatal | error | warn | info | debug | trace | silent
   level: info
+  pretty: true # readable console output; false emits structured JSON
 
 # ---------------------------------------------------------------------------
 # Room cache
@@ -74,7 +49,9 @@ nodes:
 # ---------------------------------------------------------------------------
 assignment:
   ttl_ms: 30000 # lifetime of a RoomAssignment returned to a caller
-  reservation_shadow_ttl_ms: 10000 # lifetime of a local shadow hold before the node confirms
+  reservation_shadow_ttl_ms: 10000 # tentative local hold until node acknowledgement
+  request_timeout_ms: 10000 # total allocation request deadline across all candidates
+  max_attempts: 8
 
 # ---------------------------------------------------------------------------
 # Node command channel
@@ -87,15 +64,23 @@ commands:
 # Cross-room moves (merge / rebalance)
 # ---------------------------------------------------------------------------
 move:
-  budget_per_cycle: 8 # max moves started per planning cycle
+  budget_per_cycle: 8 # successful player budget per planning cycle (not number of moves)
   # A room must keep the same roster/level signature for this many consecutive
   # planning cycles before it may be a move source or target. Transients are
   # filtered by observation instead of a wall-clock room cooldown.
-  confirmation_cycles: 2
+  confirmation_cycles: 3
   # Extra gain penalty per spatial-cluster mate a partial migration leaves
   # behind; higher values make the planner move whole clusters.
   cluster_split_penalty: 0.05
-  transaction_timeout_ms: 15000 # abort a move transaction that does not complete in time
+  prepare_timeout_ms: 15000 # manager prepare/commit phase deadline
+  arrival_timeout_ms: 30000 # target arrival/source leave resolution deadline
+  reservation_ttl_ms: 35000 # target capacity lease; separate from command timeout
+  retry_base_ms: 2000
+  retry_max_ms: 30000
+  max_attempts: 8 # bounded planning/cancellation work
+  max_cycle_ms: 2000 # stop launching additional moves after this cycle budget
+  arrival_cooldown_ms: 15000
+  remigrate_cooldown_ms: 20000
   state_ema_half_life_ms: 3000 # smoothing half-life for velocity-derived signals (anti-thrash)
   distance_radius: 30 # length scale for proximity = exp(-dist/radius); GAME UNITS, calibrate
   cluster_radius: 12 # same-level players within this distance form a move cluster
@@ -111,14 +96,14 @@ move:
   # runs that level and otherwise an empty room. Mixed rooms are never used as a
   # target, so migrations converge.
   level_isolation_min_level_players: 1 # a level group this small is still moved out
-  level_isolation_max_players: 8 # max players moved by a single plan
+  level_isolation_max_players: 7 # native Move group bound; room capacity remains 8
   level_isolation_sparse_room_threshold: 2 # rooms with ≤ this many players are merged if same level
   # Per-player settling windows. A player who just changed level, or just
   # joined a room (in-game "join friend" teleport / cross-room move), is still
   # loading and is excluded from level grouping and migration decisions until
   # the window passes. The room itself stays usable for its other players.
-  level_change_cooldown_ms: 6000
-  join_settle_ms: 4000
+  level_change_cooldown_ms: 8000
+  join_settle_ms: 6000
   # Temporary quarantine for a specific map (level id). While a player is on
   # this level nobody in their room is migrated or merged, and allocation keeps
   # players of other levels out of that room. If another level still intrudes

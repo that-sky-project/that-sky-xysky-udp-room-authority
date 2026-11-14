@@ -4,14 +4,8 @@ import { NodeRegistry } from './NodeRegistry.js'
 import { PendingRequestMap } from './PendingRequestMap.js'
 import { PolicyEngine } from './PolicyEngine.js'
 import { ReservationTracker } from './ReservationTracker.js'
-import { ReservationService } from './ReservationService.js'
-import { PerformanceService } from './PerformanceService.js'
-import { AudienceReactionService } from './AudienceReactionService.js'
-import { LiveBroadcastService } from './LiveBroadcastService.js'
-import { AudienceChatGlobalService } from './AudienceChatGlobalService.js'
 import { RequestRouter } from './RequestRouter.js'
 import { RoomCache } from './RoomCache.js'
-import { audienceLevelIds, configureSeatLevels, SeatAllocator } from './SeatAllocator.js'
 import { MoveCoordinator } from './MoveCoordinator.js'
 import { MetricsRegistry } from './MetricsRegistry.js'
 import type { ManagerConfig } from '../config/index.js'
@@ -27,21 +21,12 @@ export interface ManagerRuntime {
   moves: MoveCoordinator
   metrics: MetricsRegistry
   events: DebugEventLog
-  seating: ReservationService
-  performance: PerformanceService
-  audienceReactions: AudienceReactionService
-  liveBroadcasts: LiveBroadcastService
-  audienceChatGlobal: AudienceChatGlobalService
 }
 export const createManagerRuntime = (
   config: ManagerConfig,
   logger?: Logger
 ): ManagerRuntime => {
   const metrics = new MetricsRegistry()
-  // Seat vs hall venue lists come from config; every gating helper
-  // (levelNeedsSeat, isAudienceLevel) and the live-broadcast button levels
-  // derive from this single registration.
-  configureSeatLevels({ seated: config.audienceSeatedLevels, hall: config.audienceHallLevels })
   const events = new DebugEventLog(config.debugLogBufferSize)
   const nodes = new NodeRegistry({
     circuitOpenMs: config.nodeCircuitOpenMs,
@@ -72,16 +57,26 @@ export const createManagerRuntime = (
     protectedLevels: config.protectedLevels
   })
   const coordinator = new CrossCoordinator(nodes, rooms, pending, {
-    commandTimeoutMs: config.commandTimeoutMs
+    commandTimeoutMs: config.commandTimeoutMs,
+    reservationTtlMs: config.assignmentTtlMs
   })
-  const moves = new MoveCoordinator(
+  const moves: MoveCoordinator = new MoveCoordinator(
     rooms,
     nodes,
     pending,
     coordinator,
     {
       moveBudgetPerCycle: config.moveBudgetPerCycle,
-      moveTransactionTimeoutMs: config.moveTransactionTimeoutMs,
+      prepareTimeoutMs: config.movePrepareTimeoutMs,
+      arrivalTimeoutMs: config.moveArrivalTimeoutMs,
+      reservationTtlMs: config.moveReservationTtlMs,
+      retryBaseMs: config.moveRetryBaseMs,
+      retryMaxMs: config.moveRetryMaxMs,
+      maxAttempts: config.moveMaxAttempts,
+      maxCycleMs: config.moveMaxCycleMs,
+      arrivalCooldownMs: config.moveArrivalCooldownMs,
+      remigrateCooldownMs: config.moveRemigrateCooldownMs,
+      effectivePlayersOf: room => moves.effectivePlayers(room) + reservations.count(room.roomId),
       confirmationCycles: config.moveConfirmationCycles,
       stateEmaHalfLifeMs: config.moveStateEmaHalfLifeMs,
       planner: {
@@ -110,6 +105,7 @@ export const createManagerRuntime = (
     () => metrics.inc('qwd_telemetry_gap_total'),
     events
   )
+  rooms.setCandidateFilter(room => moves.isCandidateRoom(room, 'target'))
   const router = new RequestRouter(
     rooms,
     nodes,
@@ -120,34 +116,18 @@ export const createManagerRuntime = (
       nodeStaleMs: config.nodeStaleMs,
       assignmentTtlMs: config.assignmentTtlMs,
       candidateRoomLimit: config.candidateRoomLimit,
-      preferredFillTarget: config.preferredFillTarget
+      preferredFillTarget: config.preferredFillTarget,
+      requestTimeoutMs: config.allocationRequestTimeoutMs,
+      maxAttempts: config.allocationMaxAttempts,
+      retryBaseMs: config.moveRetryBaseMs,
+      retryMaxMs: config.moveRetryMaxMs
     },
     roomId => moves.telemetry.reserved(roomId),
     logger,
-    events
+    events,
+    room => moves.effectivePlayers(room) + reservations.count(room.roomId)
   )
-  const seating = new ReservationService(
-    new SeatAllocator(),
-    rooms,
-    router,
-    coordinator,
-    logger
-  )
-  const performance = new PerformanceService(rooms, seating, coordinator, { durationMs: config.performanceDurationMs, preparationMs: config.performancePreparationMs, queueLimit: config.performanceQueueLimit }, logger)
-  seating.setPerformanceService(performance)
-  const audienceReactions = new AudienceReactionService(rooms, performance, coordinator, { ttlMs: config.audienceReactionTtlMs }, logger)
-  const audienceChatGlobal = new AudienceChatGlobalService(rooms, coordinator, { maxSeconds: config.audienceChatGlobalMaxSeconds }, logger)
-  const liveBroadcasts = new LiveBroadcastService(rooms, performance, coordinator, {
-    allowedPlayerUuids: config.liveBroadcastAllowedPlayerUuids,
-    playerNames: config.liveBroadcastPlayerNames,
-    maxStreamsPerLevel: config.liveBroadcastMaxStreamsPerLevel,
-    levels: audienceLevelIds()
-  }, logger)
   return {
-    audienceChatGlobal,
-    liveBroadcasts,
-    audienceReactions,
-    performance,
     nodes,
     rooms,
     pending,
@@ -157,7 +137,6 @@ export const createManagerRuntime = (
     router,
     moves,
     metrics,
-    events,
-    seating
+    events
   }
 }

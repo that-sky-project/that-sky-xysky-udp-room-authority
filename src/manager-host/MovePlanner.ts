@@ -17,6 +17,11 @@ export interface MovePlan {
   gain: number
   reason: 'low_activity_merge' | 'player_rebalance'
 }
+export interface PlanningContext {
+  effectivePlayersOf?: (room: RoomSnapshot) => number
+  isCandidateRoom?: (room: RoomSnapshot, role: 'source' | 'target', now: number) => boolean
+}
+
 export interface MovePlannerOptions {
   distanceRadius: number
   clusterRadius: number
@@ -57,8 +62,8 @@ const DEFAULT_OPTIONS: MovePlannerOptions = {
   isolationPressureWeight: 0.6,
   stalePressureWeight: 0.4,
   clusterSplitPenalty: 0.05,
-  levelChangeCooldownMs: 6_000,
-  joinSettleMs: 4_000,
+  levelChangeCooldownMs: 8_000,
+  joinSettleMs: 6_000,
   protectedLevels: []
 }
 export class MovePlanner {
@@ -178,8 +183,10 @@ export class MovePlanner {
   public plan (
     rooms: RoomSnapshot[],
     byRoom: Map<string, StoredTelemetry[]>,
-    now = Date.now()
+    now = Date.now(),
+    context: PlanningContext = {}
   ): MovePlan[] {
+    const roomIndex = new Map(rooms.map(room => [room.roomId as string, room]))
     const activities = rooms.map(room =>
       this.activity(room, byRoom.get(room.roomId) ?? [], now)
     )
@@ -187,9 +194,9 @@ export class MovePlanner {
     for (const source of activities.filter(
       a => a.mergePressure >= this.options.mergePressureThreshold
     )) {
-      const sourceRoom = rooms.find(room => room.roomId === source.roomId)
+      const sourceRoom = roomIndex.get(source.roomId)
       const roomPlayers = byRoom.get(source.roomId) ?? []
-      if (!sourceRoom) continue
+      if (!sourceRoom || roomPlayers.length > 8 || context.isCandidateRoom?.(sourceRoom, 'source', now) === false) continue
       if (this.hasProtected(roomPlayers)) continue
       if (roomPlayers.some(player => !this.isSettled(player, now))) continue
       const sourcePlayers = roomPlayers.filter(
@@ -207,13 +214,15 @@ export class MovePlanner {
           byRoom,
           source,
           levelId,
-          now
+          now,
+          context,
+          roomIndex
         )
         if (!target) continue
         const targetPlayers = byRoom.get(target.roomId) ?? []
         const capacity = Math.max(
           0,
-          target.capacity - Math.max(target.players, targetPlayers.length)
+          target.capacity - (context.effectivePlayersOf?.(target) ?? Math.max(target.players, targetPlayers.length))
         )
         if (capacity <= 0) continue
         const targetActivity = this.activity(
@@ -258,7 +267,9 @@ export class MovePlanner {
     byRoom: Map<string, StoredTelemetry[]>,
     source: RoomActivity,
     levelId: number,
-    now: number
+    now: number,
+    context: PlanningContext,
+    roomIndex: Map<string, RoomSnapshot>
   ): RoomSnapshot | undefined {
     return activities
       .filter(
@@ -267,9 +278,10 @@ export class MovePlanner {
           candidate.activity > source.activity + 0.05
       )
       .sort((a, b) => b.activity - a.activity)
-      .map(candidate => rooms.find(room => room.roomId === candidate.roomId))
+      .map(candidate => roomIndex.get(candidate.roomId))
       .find(room => {
-        if (!room || room.capacity - room.players <= 0) return false
+        if (!room || context.isCandidateRoom?.(room, 'target', now) === false ||
+            room.capacity - (context.effectivePlayersOf?.(room) ?? room.players) <= 0) return false
         const targetPlayers = byRoom.get(room.roomId) ?? []
         if (this.hasProtected(targetPlayers)) return false
         if (targetPlayers.some(player => !this.isSettled(player, now)))
@@ -300,6 +312,8 @@ export class MovePlanner {
     const levelCutoff = now - this.options.levelChangeCooldownMs
     const joinCutoff = now - this.options.joinSettleMs
     return (
+      now - player.receivedAt <= 10_000 && player.receivedAt <= now &&
+      player.status !== 'MOVING' &&
       (player.levelChangedAt ?? 0) <= levelCutoff &&
       (player.roomJoinedAt ?? 0) <= joinCutoff
     )

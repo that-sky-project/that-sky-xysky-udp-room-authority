@@ -1,3 +1,4 @@
+import { ManagerHttpApi } from './ManagerHttpApi.js'
 import {
   createServer,
   type IncomingMessage,
@@ -7,6 +8,7 @@ import {
 import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer, type RawData } from 'ws'
 import { randomUUID } from 'node:crypto'
+import { ZodError } from 'zod'
 import { jsonStringify } from '../infra/ws/json.js'
 import type { Logger } from '../infra/logger/logger.js'
 import type { ManagerConfig } from '../config/index.js'
@@ -24,17 +26,14 @@ import {
 } from '../types/branded.js'
 import {
   AllocationRequestSchema,
-  AudienceChatGlobalRequestSchema,
   BatchRoomLookupSchema,
   NodeAckSchema,
   NodeEventSchema,
-  ReserveRequestSchema,
   type IManagerCommand,
   type INodeEvent,
   type RoomLookup
 } from '../types/contracts.js'
 import { ErrorCode, HermesError, isHermesError } from '../types/errors.js'
-import { defaultSeatedLevel, eventLevel, isAudienceVenue } from './SeatAllocator.js'
 
 interface NodeConnectionState {
   nodeId: ReturnType<typeof asNodeId>
@@ -83,15 +82,15 @@ export class ManagerGateway {
   private server: Server | undefined
   private nodeServer: WebSocketServer | undefined
   private readonly heartbeat: HeartbeatMonitor
+  private readonly http: ManagerHttpApi
   private readonly metrics: MetricsRegistry
   private graceSweepTimer: NodeJS.Timeout | undefined
-  /** Periodic hall-wide seating push, so every node can render the whole audience. */
-  private audienceSnapshotTimer: NodeJS.Timeout | undefined
-  private performanceTimer: NodeJS.Timeout | undefined
-  /** Per-room telemetry sequence guard: rejects stale/duplicate snapshots. */
-  private readonly telemetrySeq = new Map<string, number>()
-  /** Rate limit for the sequence-regression warning, per room. */
-  private readonly telemetryStaleWarnAt = new Map<string, number>()
+  private starting: Promise<void> | undefined
+  private stopping = false
+  private shutdown: Promise<void> | undefined
+  private readonly abort = new AbortController()
+  private readonly tasks = new Set<Promise<void>>()
+  private readonly connections = new Set<Duplex>()
   /** In-flight outbound commands, so an ack can be logged with its command name. */
   private readonly outbound = new Map<
     number,
@@ -111,6 +110,10 @@ export class ManagerGateway {
     private readonly log: Logger
   ) {
     this.metrics = runtime.metrics
+    this.http = new ManagerHttpApi(config, runtime, log, this.metrics, {
+      signal: this.abort.signal, isStopping: () => this.stopping,
+      refreshMetrics: () => this.refreshGauges(), applyEvent: event => this.applyNodeEvent(event)
+    })
     registerManagerMetrics(this.metrics, log)
     this.heartbeat = new HeartbeatMonitor(
       {
@@ -122,90 +125,128 @@ export class ManagerGateway {
     )
   }
 
-  public async start (): Promise<void> {
-    if (this.server) return
+  public start (): Promise<void> {
+    if (this.stopping) return Promise.reject(new Error('manager gateway is stopping'))
+    this.starting ??= this.listen()
+    return this.starting
+  }
 
+  private async listen (): Promise<void> {
     const server = createServer((req, res) => {
-      this.handleHttp(req, res).catch(error =>
-        this.log.error({ err: error }, 'http handler error')
-      )
+      this.track(this.http.handle(req, res), 'http handler', () => res.destroy())
     })
     const nodeServer = new WebSocketServer({
       noServer: true,
       maxPayload: 512 * 1024,
       perMessageDeflate: false
     })
-    server.on('upgrade', (req, socket, head) =>
-      this.handleUpgrade(nodeServer, req, socket, head)
-    )
+    // Own partially-created resources too, so a listen failure can be drained.
+    this.server = server
+    this.nodeServer = nodeServer
+    server.on('connection', socket => {
+      this.connections.add(socket)
+      socket.once('close', () => this.connections.delete(socket))
+    })
+    server.on('upgrade', (req, socket, head) => {
+      try {
+        this.handleUpgrade(nodeServer, req, socket, head)
+      } catch (error) {
+        this.log.error({ err: error, task: 'node upgrade' }, 'node upgrade failed')
+        socket.destroy()
+      }
+    })
     server.on('error', error =>
       this.log.error({ err: error }, 'manager HTTP server error')
     )
+    nodeServer.on('error', error =>
+      this.log.error({ err: error }, 'manager WebSocket server error')
+    )
 
     await new Promise<void>((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(this.config.port, this.config.host, () => {
-        server.off('error', reject)
-        resolve()
-      })
+      const onClose = (): void => reject(new Error('manager startup cancelled'))
+      const cleanup = (): void => {
+        server.off('error', onError)
+        server.off('close', onClose)
+      }
+      const onError = (error: Error): void => { cleanup(); reject(error) }
+      server.once('error', onError)
+      server.once('close', onClose)
+      try {
+        server.listen(this.config.port, this.config.host, () => { cleanup(); resolve() })
+      } catch (error) {
+        cleanup()
+        reject(error)
+      }
     })
-
-    this.server = server
-    this.nodeServer = nodeServer
+    if (this.stopping) throw new Error('manager startup cancelled')
     this.heartbeat.start()
-    this.graceSweepTimer = setInterval(() => this.sweepSuspectedNodes(), 2_000)
+    this.graceSweepTimer = setInterval(() => {
+      if (this.stopping) return
+      try { this.sweepSuspectedNodes() } catch (error) {
+        this.log.error({ err: error, task: 'node grace sweep' }, 'node grace sweep failed')
+      }
+    }, 2_000)
     this.graceSweepTimer.unref?.()
-
-    this.performanceTimer = setInterval(() => {
-      this.runtime.performance.tick()
-      this.runtime.audienceReactions.tick()
-      this.runtime.liveBroadcasts.tick()
-      this.runtime.audienceChatGlobal.tick()
-    }, 100)
-    this.performanceTimer.unref?.()
-    this.audienceSnapshotTimer = setInterval(() => {
-      this.runtime.seating
-        .broadcastSnapshot()
-        .catch(error =>
-          this.log.debug({ err: error }, 'audience snapshot broadcast failed')
-        )
-    }, 1_000)
-    this.log.info('audience snapshot timer started (1000ms)')
-    this.audienceSnapshotTimer.unref?.()
-    this.log.info(
-      { host: this.config.host, port: this.config.port },
-      'manager gateway listening'
-    )
+    this.log.info({ host: this.config.host, port: this.config.port }, 'manager gateway listening')
   }
 
-  public async stop (): Promise<void> {
-    const server = this.server
-    const nodeServer = this.nodeServer
-    this.server = undefined
-    this.nodeServer = undefined
+  private track (operation: Promise<void>, task: string, failed?: () => void): void {
+    const pending = operation.catch(error => {
+      this.log.error({ err: error, task }, 'manager task failed')
+      failed?.()
+    }).finally(() => this.tasks.delete(pending))
+    this.tasks.add(pending)
+  }
 
+  public stop (): Promise<void> {
+    if (this.shutdown) return this.shutdown
+    this.stopping = true
+    this.abort.abort()
     this.heartbeat.stop()
-    if (this.performanceTimer) clearInterval(this.performanceTimer)
-    this.performanceTimer = undefined
-    this.runtime.liveBroadcasts.stop()
-    this.runtime.audienceChatGlobal.stop()
-    this.runtime.audienceReactions.stop()
-    this.runtime.performance.stop()
-    this.runtime.seating.stop()
     if (this.graceSweepTimer) clearInterval(this.graceSweepTimer)
     this.graceSweepTimer = undefined
-    if (this.audienceSnapshotTimer) clearInterval(this.audienceSnapshotTimer)
-    this.audienceSnapshotTimer = undefined
+    this.shutdown = this.drain()
+    return this.shutdown
+  }
 
+  private async drain (): Promise<void> {
+    const server = this.server
+    const nodeServer = this.nodeServer
+    this.runtime.router.stop()
+    this.runtime.pending.close(new HermesError(ErrorCode.NODE_UNAVAILABLE, 'manager is shutting down'))
+    const movesStopped = this.runtime.moves.stop()
+    this.runtime.reservations.stop()
+    const forced = setTimeout(() => {
+      this.log.warn({ sockets: this.connections.size, nodes: nodeServer?.clients.size ?? 0 }, 'forcing remaining manager connections closed')
+      for (const socket of nodeServer?.clients ?? []) socket.terminate()
+      for (const socket of this.connections) socket.destroy()
+    }, 5_000)
+    const closing: Promise<void>[] = [movesStopped]
     if (nodeServer) {
-      for (const socket of nodeServer.clients)
-        socket.close(1001, 'manager shutting down')
-      nodeServer.close()
+      closing.push(new Promise<void>((resolve, reject) => {
+        nodeServer.close(error => error ? reject(error) : resolve())
+        for (const socket of nodeServer.clients) socket.close(1001, 'manager shutting down')
+      }))
     }
     if (server) {
-      await new Promise<void>((resolve, reject) => {
-        server.close(error => (error ? reject(error) : resolve()))
-      })
+      closing.push(new Promise<void>((resolve, reject) => {
+        server.close(error => {
+          if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') reject(error)
+          else resolve()
+        })
+        server.closeIdleConnections()
+      }))
+    }
+    try {
+      const results = await Promise.allSettled(closing)
+      await Promise.all(this.tasks)
+      const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+      if (failures.length) throw new AggregateError(failures, 'manager gateway shutdown failed')
+    } finally {
+      clearTimeout(forced)
+      this.server = undefined
+      this.nodeServer = undefined
+      this.outbound.clear()
     }
   }
 
@@ -257,18 +298,7 @@ export class ManagerGateway {
     this.runtime.rooms.purgeDepartedPlayers()
     for (const { nodeId, rooms } of this.runtime.rooms.sweepSuspectedNodes()) {
       for (const room of rooms) {
-        this.runtime.liveBroadcasts.forgetRoom(asRoomId(room.roomId as string))
-        this.runtime.audienceChatGlobal.forgetRoom(asRoomId(room.roomId as string))
-        this.runtime.audienceReactions.forgetRoom(asRoomId(room.roomId as string))
-        this.runtime.performance.forgetRoom(asRoomId(room.roomId as string))
         this.runtime.moves.forgetRoom(room.roomId as string)
-        const freed = this.runtime.seating.forgetRoom(asRoomId(room.roomId as string))
-        if (freed > 0) {
-          this.log.warn(
-            { nodeId, roomId: room.roomId, freedSeats: freed },
-            'reclaimed seats from a dead node'
-          )
-        }
       }
       this.metrics.inc('qwd_node_reclaimed_total')
       this.log.warn(
@@ -299,300 +329,16 @@ export class ManagerGateway {
     this.handleNodeDisconnect(asNodeId(nodeId))
   }
 
-  private async handleHttp (
-    req: IncomingMessage,
-    res: ServerResponse
-  ): Promise<void> {
-    const method = req.method ?? 'GET'
-    let url: URL
-    try {
-      url = new URL(req.url ?? '/', 'http://manager.local')
-    } catch {
-      this.writeJson(res, 400, {
-        code: ErrorCode.BAD_REQUEST,
-        data: { message: 'invalid request URL' }
-      })
-      return
-    }
-
-    try {
-      if (method === 'POST' && url.pathname === this.config.allocatePath) {
-        await this.handleAllocationBody(
-          res,
-          await this.readBody(req, 16 * 1024)
-        )
-        return
-      }
-      if (method === 'POST' && url.pathname === '/telemetry') {
-        const parsed = NodeEventSchema.parse(
-          JSON.parse(await this.readBody(req, 128 * 1024))
-        )
-        if (parsed.event.startsWith('performance.') || parsed.event.startsWith('liveBroadcast.') || parsed.event === 'audience.reaction') throw new HermesError(ErrorCode.FORBIDDEN, 'audience events require a current node socket')
-        const nodeId =
-          parsed.data.nodeId ??
-          asNodeId(`http-${parsed.data.roomId ?? randomUUID()}`)
-        const event: INodeEvent = {
-          ...parsed,
-          data: { ...parsed.data, nodeId }
-        }
-        if (this.applyNodeEvent(event, false) && isPlanningEvent(event)) {
-          this.runtime.moves
-            .planAndExecute()
-            .catch(error => this.log.error({ err: error }, 'plan cycle error'))
-        }
-        this.writeJson(res, 200, { code: ErrorCode.OK })
-        return
-      }
-      if (method === 'POST' && url.pathname === '/audience/chat-global') {
-        this.requireDebugToken(req)
-        const idempotencyKeyHeader = req.headers['idempotency-key']
-        const idempotencyKey = typeof idempotencyKeyHeader === 'string' && idempotencyKeyHeader.trim().length > 0 && idempotencyKeyHeader.trim().length <= 128
-          ? idempotencyKeyHeader.trim()
-          : undefined
-        const body = AudienceChatGlobalRequestSchema.parse(
-          JSON.parse(await this.readBody(req, 16 * 1024))
-        )
-        const state = this.runtime.audienceChatGlobal.set(
-          body.levelId, body.enabled, body.seconds, idempotencyKey
-        )
-        this.writeJson(res, 200, { code: ErrorCode.OK, data: state })
-        return
-      }
-      if (method === 'GET' && url.pathname === '/healthz') {
-        const nodes = this.runtime.nodes.listHealth()
-        const healthy = nodes.filter(
-          node => node.connected && !node.draining
-        ).length
-        this.writeJson(res, healthy > 0 || nodes.length === 0 ? 200 : 503, {
-          status: healthy > 0 || nodes.length === 0 ? 'ok' : 'degraded',
-          nodes: { total: nodes.length, healthy },
-          rooms: this.runtime.rooms.listRooms().length,
-          uptimeMs: process.uptime() * 1000
-        })
-        return
-      }
-      if (method === 'GET' && url.pathname === '/metrics') {
-        this.refreshGauges()
-        res.writeHead(200, {
-          'content-type': 'text/plain; version=0.0.4; charset=utf-8'
-        })
-        res.end(this.metrics.render())
-        return
-      }
-      if (method === 'GET' && url.pathname === '/moves') {
-        this.writeJson(res, 200, { moves: this.runtime.moves.list() })
-        return
-      }
-      if (method === 'GET' && url.pathname === '/activity') {
-        const moves = this.runtime.moves
-        const rooms = moves
-          .activitySnapshot()
-          .map(activity => ({
-            activity,
-            players: moves.telemetry.listRoom(asRoomId(activity.roomId))
-          }))
-        this.writeJson(res, 200, { rooms })
-        return
-      }
-      if (method === 'GET' && url.pathname === '/debug/logs') {
-        this.requireDebugToken(req)
-        const rawLimit = Number(url.searchParams.get('limit') ?? '')
-        const rawSince = Number(url.searchParams.get('since') ?? '')
-        const page = this.runtime.events.list({
-          limit:
-            Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined,
-          since:
-            Number.isFinite(rawSince) && rawSince > 0 ? rawSince : undefined,
-          category: url.searchParams.get('category') ?? undefined,
-          roomId: url.searchParams.get('roomId') ?? undefined,
-          playerId: url.searchParams.get('playerId') ?? undefined
-        })
-        this.writeJson(res, 200, { code: ErrorCode.OK, data: page })
-        return
-      }
-      if (method === 'GET' && url.pathname === '/debug/allnode') {
-        this.requireDebugToken(req)
-        const nodes = this.runtime.nodes
-          .listHealth()
-          .map(({ nodeId: internalNodeId, ...node }) => ({
-            ...node,
-            rooms: this.runtime.rooms
-              .listRoomsByNode(internalNodeId)
-              .map(room => {
-                const { nodeId: _roomOwner, ...roomData } = room
-                const players = this.runtime.rooms
-                  .listPlayers(room.roomId)
-                  .map(location => ({
-                    playerId: location.playerId,
-                    updatedAt: location.updatedAt,
-                    telemetry:
-                      this.runtime.moves.telemetry.get(location.playerId) ??
-                      null
-                  }))
-                return { ...roomData, playerCount: players.length, players }
-              })
-          }))
-        this.writeJson(res, 200, { code: ErrorCode.OK, data: { nodes } })
-        return
-      }
-      if (method === 'POST' && url.pathname === '/debug/move') {
-        this.requireDebugToken(req)
-        const input = JSON.parse(await this.readBody(req, 32 * 1024)) as Record<
-          string,
-          unknown
-        >
-        const sourceRoomId =
-          typeof input.sourceRoomId === 'string' ? input.sourceRoomId : ''
-        const targetRoomId =
-          typeof input.targetRoomId === 'string' ? input.targetRoomId : ''
-        const playerIds = Array.isArray(input.playerIds)
-          ? input.playerIds.filter((id): id is string => typeof id === 'string')
-          : []
-        const moveInput: {
-          sourceRoomId: string
-          targetRoomId: string
-          playerIds: string[]
-          reason?: string
-        } = { sourceRoomId, targetRoomId, playerIds }
-        if (typeof input.reason === 'string') moveInput.reason = input.reason
-        const transaction = await this.runtime.moves.manualMove(moveInput)
-        this.writeJson(res, 200, { code: ErrorCode.OK, data: transaction })
-        return
-      }
-
-      const roomMatch =
-        method === 'GET'
-          ? /^\/players\/([^/]+)\/room$/.exec(url.pathname)
-          : undefined
-      if (roomMatch) {
-        const encodedPlayerId = roomMatch[1]
-        if (!encodedPlayerId)
-          throw new HermesError(ErrorCode.BAD_REQUEST, 'playerId is required')
-        const playerId = asPlayerId(decodeURIComponent(encodedPlayerId))
-
-        const data = this.lookupRoom(playerId)
-        if (!data)
-          throw new HermesError(
-            ErrorCode.NOT_FOUND,
-            'player is not in any known room',
-            { playerId }
-          )
-        this.writeJson(res, 200, { code: ErrorCode.OK, data })
-        return
-      }
-
-      if (method === 'POST' && url.pathname === '/players/rooms') {
-        const request = BatchRoomLookupSchema.parse(
-          JSON.parse(await this.readBody(req, 256 * 1024))
-        )
-        const rooms: Record<
-          string,
-          ReturnType<ManagerGateway['lookupRoom']>
-        > = {}
-        for (const playerId of request.playerIds) {
-          rooms[playerId] = this.lookupRoom(asPlayerId(playerId))
-        }
-        this.writeJson(res, 200, { code: ErrorCode.OK, data: { rooms } })
-        return
-      }
-
-      if (method === 'POST' && url.pathname === '/reserve') {
-        const request = ReserveRequestSchema.parse(
-          JSON.parse(await this.readBody(req, 16 * 1024))
-        )
-        // The account layer forwards the client's snake_case companion lists
-        // verbatim; camelCase stays accepted for direct callers.
-        const companions = [
-          ...new Set([
-            ...(request.recentPlayerUuids ?? request.recent_player_uuids ?? []),
-            ...(request.allPlayerUuids ?? request.all_player_uuids ?? [])
-          ])
-        ].map(asPlayerId)
-        // The client speaks in activity event ids (default 8 = the configured
-        // first seated venue); an unknown event id is rejected so the miss is
-        // visible.
-        const levelId = request.levelId ?? request.level ??
-          (request.eventId !== undefined
-            ? eventLevel(request.eventId)
-            : defaultSeatedLevel())
-        if (!levelId) {
-          throw new HermesError(
-            ErrorCode.BAD_REQUEST,
-            `unknown reserve event id ${request.eventId}`
-          )
-        }
-        if (!isAudienceVenue(levelId)) {
-          throw new HermesError(
-            ErrorCode.BAD_REQUEST,
-            `level ${levelId} is not a configured audience venue`
-          )
-        }
-        const result = await this.runtime.seating.reserve(
-          {
-            playerId: request.playerId,
-            levelId,
-            benchId: request.benchId,
-            seatId: request.seatId,
-            group: companions
-          },
-          AbortSignal.timeout(this.config.commandTimeoutMs)
-        )
-        this.writeJson(res, 200, {
-          code: ErrorCode.OK,
-          data: {
-            levelId: result.levelId,
-            benchId: result.benchId,
-            seatId: result.seatId,
-            entityId: result.entityId,
-            roomId: result.roomId,
-            roomIp: result.roomIp,
-            roomPort: result.roomPort,
-            group: result.group.map(({ playerId, ...seat }) => ({
-              playerId,
-              ...seat
-            }))
-          }
-        })
-        return
-      }
-
-      this.writeJson(res, 404, {
-        code: ErrorCode.NOT_FOUND,
-        data: { message: 'route not found' }
-      })
-    } catch (error) {
-      const tooLarge =
-        error instanceof HermesError && error.message.endsWith('body too large')
-      this.writeJson(
-        res,
-        tooLarge
-          ? 413
-          : isHermesError(error)
-            ? this.httpStatusForError(error)
-            : 500,
-        this.errorReply(error)
-      )
-    }
-  }
-
-  private httpStatusForError (error: HermesError): number {
-    switch (error.code) {
-      case ErrorCode.UNAUTHORIZED: return 401
-      case ErrorCode.FORBIDDEN: return 403
-      case ErrorCode.NOT_FOUND: return 404
-      case ErrorCode.CONFLICT: return 409
-      case ErrorCode.BAD_REQUEST: return 400
-      case ErrorCode.PAYLOAD_TOO_LARGE: return 413
-      default: return 400
-    }
-  }
-
   private handleUpgrade (
     nodeServer: WebSocketServer,
     req: IncomingMessage,
     socket: Duplex,
     head: Buffer
   ): void {
+    if (this.stopping) {
+      this.rejectUpgrade(socket, 503, 'manager is shutting down')
+      return
+    }
     let url: URL
     try {
       url = new URL(req.url ?? '/', 'http://manager.local')
@@ -690,10 +436,6 @@ export class ManagerGateway {
     this.runtime.nodes.register(transport)
     this.heartbeat.track(state.nodeId, ws)
     const restored = this.runtime.rooms.restoreNode(state.nodeId)
-    this.runtime.audienceReactions.forgetNode(state.nodeId)
-    this.runtime.audienceChatGlobal.reconnectNode(state.nodeId)
-    this.runtime.performance.reconnectNode(state.nodeId)
-    this.runtime.liveBroadcasts.reconnectNode(state.nodeId)
     if (restored) {
       this.log.info(
         { nodeId: state.nodeId },
@@ -717,11 +459,10 @@ export class ManagerGateway {
         restored
       }
     })
-    ws.on('message', (message, isBinary) =>
-      this.handleNodeMessage(ws, state, message, isBinary).catch(error =>
-        this.log.error({ err: error }, 'node message handler error')
-      )
-    )
+    ws.on('message', (message, isBinary) => {
+      if (this.stopping) return
+      this.track(this.handleNodeMessage(ws, state, message, isBinary), 'node message handler')
+    })
     ws.on('close', () => {
       closed = true
       this.heartbeat.untrack(state.nodeId, ws)
@@ -732,7 +473,9 @@ export class ManagerGateway {
         )
         return
       }
-      this.handleNodeDisconnect(state.nodeId)
+      try { this.handleNodeDisconnect(state.nodeId) } catch (error) {
+        this.log.error({ err: error, nodeId: state.nodeId }, 'node disconnect cleanup failed')
+      }
     })
     ws.on('error', error =>
       this.log.warn({ err: error, nodeId: state.nodeId }, 'node socket error')
@@ -743,24 +486,8 @@ export class ManagerGateway {
     if (!this.runtime.nodes.getTransport(nodeId)) {
       return
     }
-    // Broadcast capabilities and chat-global projections deliberately survive a
-    // node disconnect: the node keeps its lease (fail-closed at the deadline)
-    // and QWD keeps the destinations — sends fail into the existing retryAt
-    // loop and resume once the node reconnects. Forgetting here rotated
-    // capabilityIds and dropped countdown projections on every公网 WSS blip,
-    // which killed the in-game broadcast state and the global-chat countdown
-    // until players re-entered the map. Ephemeral reaction fanout may still be
-    // forgotten: a one-shot effect must not replay after a reconnect.
-    this.runtime.audienceReactions.forgetNode(nodeId)
     this.runtime.nodes.unregister(nodeId)
     this.runtime.rooms.markNodeSuspected(nodeId)
-    for (const roomId of this.telemetrySeq.keys()) {
-      const room = this.runtime.rooms.getRoom(asRoomId(roomId))
-      if (!room || room.nodeId === nodeId) {
-        this.telemetrySeq.delete(roomId)
-        this.telemetryStaleWarnAt.delete(roomId)
-      }
-    }
     this.log.warn(
       { nodeId, graceMs: this.config.nodeGraceMs },
       'node disconnected; state retained for grace window'
@@ -858,18 +585,21 @@ export class ManagerGateway {
               data?: { roomId?: unknown; seq?: unknown }
             })
           : undefined
-      this.log.warn(
-        {
-          err: error,
-          nodeId: state.nodeId,
-          event: envelope?.event,
-          roomId: envelope?.data?.roomId,
-          seq: envelope?.data?.seq
-        },
-        'invalid node message'
-      )
-      if (ws.readyState === WebSocket.OPEN)
-        ws.send(jsonStringify(this.errorReply(error)))
+      const expected = isHermesError(error) || error instanceof ZodError || error instanceof SyntaxError
+      const details = {
+        err: error,
+        nodeId: state.nodeId,
+        event: envelope?.event,
+        roomId: envelope?.data?.roomId,
+        seq: envelope?.data?.seq
+      }
+      if (expected) this.log.warn(details, 'invalid node message')
+      else this.log.error(details, 'node event processing failed')
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(jsonStringify(this.http.errorReply(error)), failure => {
+          if (failure) this.log.warn({ err: failure, nodeId: state.nodeId }, 'node error response failed')
+        })
+      }
     }
   }
 
@@ -922,177 +652,19 @@ export class ManagerGateway {
     return true
   }
 
-  private applyNodeEvent (event: INodeEvent, fromNodeSocket = true): boolean {
-    if (event.event.startsWith('liveBroadcast.')) return fromNodeSocket && this.runtime.liveBroadcasts.handle(event)
-    if (event.event === 'audience.reaction') return fromNodeSocket && this.runtime.audienceReactions.handle(event)
-    if (event.event.startsWith('performance.')) return fromNodeSocket && this.runtime.performance.handle(event)
+  private applyNodeEvent (event: INodeEvent): boolean {
     if (event.data.roomId && event.event !== 'room.created') {
       const owner = this.runtime.rooms.getRoom(event.data.roomId)
       if (owner && owner.nodeId !== event.data.nodeId) return false
     }
-    if (fromNodeSocket && event.event === 'room.destroyed' && event.data.roomId) {
-      this.runtime.liveBroadcasts.forgetRoom(event.data.roomId)
-      this.runtime.audienceChatGlobal.forgetRoom(event.data.roomId)
-      this.runtime.audienceReactions.forgetRoom(event.data.roomId)
-      this.runtime.performance.forgetRoom(event.data.roomId)
-      this.runtime.seating.forgetRoom(event.data.roomId)
-    }
-    if (event.event === 'room.created' && event.data.roomId) {
-      const existing = this.runtime.rooms.getRoom(event.data.roomId)
-      if (existing && existing.nodeId !== event.data.nodeId) {
-        this.telemetrySeq.delete(event.data.roomId as string)
-        this.telemetryStaleWarnAt.delete(event.data.roomId as string)
-        this.log.warn(
-          {
-            roomId: event.data.roomId,
-            previousNodeId: existing.nodeId,
-            nodeId: event.data.nodeId
-          },
-          'room id reused by a new node incarnation; telemetry sequence reset'
-        )
-        this.runtime.events.record({
-          category: 'telemetry',
-          event: 'telemetry.incarnation_reset',
-          message: `room ${event.data.roomId} moved to a new node incarnation; sequence reset`,
-          roomId: event.data.roomId as string,
-          nodeId: event.data.nodeId,
-          data: { previousNodeId: existing.nodeId }
-        })
-      }
-    }
-    if (event.event === 'room.destroyed' && event.data.roomId) {
-      this.telemetrySeq.delete(event.data.roomId as string)
-      this.telemetryStaleWarnAt.delete(event.data.roomId as string)
-    }
-    if (
-      event.event === 'room.telemetry' &&
-      event.data.roomId &&
-      typeof event.data.seq === 'number'
-    ) {
-      const roomKey = event.data.roomId as string
-      const last = this.telemetrySeq.get(roomKey)
-      if (last !== undefined && event.data.seq <= last) {
-        this.metrics.inc('qwd_telemetry_stale_total')
-        const at = Date.now()
-        this.runtime.events.record({
-          category: 'telemetry',
-          event: 'telemetry.seq_regressed',
-          message: `telemetry seq ${event.data.seq} <= last ${last}; frame dropped`,
-          roomId: roomKey,
-          nodeId: event.data.nodeId,
-          data: {
-            seq: event.data.seq,
-            lastSeq: last,
-            kind: event.data.kind ?? 'full',
-            baseSeq: event.data.baseSeq
-          }
-        })
-        if (at - (this.telemetryStaleWarnAt.get(roomKey) ?? 0) >= 30_000) {
-          this.telemetryStaleWarnAt.set(roomKey, at)
-          this.log.warn(
-            {
-              roomId: roomKey,
-              nodeId: event.data.nodeId,
-              seq: event.data.seq,
-              lastSeq: last,
-              kind: event.data.kind ?? 'full',
-              baseSeq: event.data.baseSeq
-            },
-            'telemetry sequence regressed; frame dropped'
-          )
-        }
-        return false
-      }
-      this.telemetrySeq.set(roomKey, event.data.seq)
-    }
-
     this.runtime.nodes.applyEvent(event)
+    if (!this.runtime.moves.ingest(event)) return false
     this.runtime.rooms.applyNodeEvent(event)
-    this.runtime.moves.ingest(event)
     if (
       event.data.player?.playerId &&
       (event.event === 'player.join' || event.event === 'player.leave')
     ) {
       this.runtime.reservations.confirm(event.data.player.playerId)
-    }
-    if (
-      event.event === 'player.join' &&
-      event.data.player?.playerId &&
-      event.data.roomId
-    ) {
-      const playerId = event.data.player.playerId
-      const roomId = asRoomId(event.data.roomId as string)
-      const levelId = Number(event.data.player.level ?? 0)
-      if (fromNodeSocket) this.runtime.performance.notePlayerSeen(playerId, roomId, levelId)
-      this.runtime.seating
-        .handlePlayerJoined(playerId, roomId, levelId)
-        .catch(error =>
-          this.log.debug(
-            { err: error, playerId, roomId, levelId },
-            'seat assignment on join failed'
-          )
-        )
-    }
-
-    if (
-      event.event === 'room.telemetry' &&
-      event.data.roomId &&
-      Array.isArray(event.data.players)
-    ) {
-      const roomId = asRoomId(event.data.roomId as string)
-      if (fromNodeSocket && !this.runtime.moves.hasTelemetryGap(roomId)) this.runtime.performance.noteRoomRoster(roomId, event.data.players.map(p => p.playerId), event.data.kind !== 'delta', event.data.removedPlayers)
-      for (const player of event.data.players) {
-        if (!player?.playerId) continue
-        const levelId = Number(player.levelId ?? 0)
-        if (fromNodeSocket && !this.runtime.moves.hasTelemetryGap(roomId)) this.runtime.performance.notePlayerSeen(player.playerId, roomId, levelId)
-        // Nodes report where each player actually sits; the seating service
-        // mirrors that verbatim instead of re-deriving seats (which churned
-        // every bench and re-projected the hall after a manager restart).
-        const seat = Number.isInteger(player.benchId) && Number.isInteger(player.seatId)
-          ? { benchId: Number(player.benchId), seatId: Number(player.seatId) }
-          : undefined
-        const position = Array.isArray(player.position) && player.position.every(Number.isFinite)
-          ? [player.position[0], player.position[1], player.position[2]] as [number, number, number]
-          : undefined
-        const levelTime = typeof player.stateAt === 'number' ? player.stateAt / 1000 : undefined
-        this.runtime.seating
-          .notePlayerLevel(player.playerId, roomId, levelId, seat, position, levelTime)
-          .catch(error =>
-            this.log.debug(
-              { err: error, playerId: player.playerId, roomId, levelId },
-              'seat assignment on level change failed'
-            )
-          )
-      }
-    }
-
-    if (
-      event.event === 'seat.occupied' &&
-      event.data.player?.playerId &&
-      event.data.position
-    ) {
-      this.runtime.seating.recordPosition(
-        Number(event.data.levelId ?? 0),
-        event.data.player.playerId,
-        event.data.position,
-        Number(event.data.levelTime ?? 0),
-        event.data.roomId ? asRoomId(event.data.roomId as string) : undefined
-      )
-    }
- 
-    if (fromNodeSocket && event.event === 'seat.released' && event.data.player?.playerId) {
-      const levelId =
-        typeof event.data.levelId === 'number' && event.data.levelId > 0
-          ? event.data.levelId
-          : undefined
-      const loc = this.runtime.rooms.getPlayerLocation(event.data.player.playerId)
-      if (loc && event.data.roomId && loc.roomId !== event.data.roomId) return false
-      if (fromNodeSocket && event.data.roomId) this.runtime.performance.notePlayerLeft(event.data.player.playerId, event.data.roomId, levelId)
-      this.runtime.seating.noteSeatReleased(event.data.player.playerId, levelId)
-    }
-    if (fromNodeSocket && event.event === 'player.leave' && event.data.player?.playerId) {
-      if (fromNodeSocket && event.data.roomId) this.runtime.performance.notePlayerLeft(event.data.player.playerId, event.data.roomId)
-      this.runtime.seating.notePlayerLeft(event.data.player.playerId)
     }
     this.recordAppliedEvent(event)
     return true
@@ -1141,90 +713,11 @@ export class ManagerGateway {
     }
   }
 
-  private async handleAllocationBody (
-    res: ServerResponse,
-    body: string
-  ): Promise<void> {
-    const abort = AbortSignal.timeout(this.config.commandTimeoutMs)
-    try {
-      const request = AllocationRequestSchema.parse(this.parseJsonBody(body))
-      this.writeJson(
-        res,
-        200,
-        await this.runtime.router.allocate(request, abort)
-      )
-    } catch (error) {
-      this.writeJson(res, 200, this.errorReply(error))
-    }
-  }
-
   /**
    * Room view for one player, shared by the single and batch lookup routes.
    * Returns null when the player is unknown or their room is already gone;
    * "not in a room" is a normal state for a client that has not been placed yet.
    */
-  private lookupRoom (playerId: PlayerId): RoomLookup | null {
-    const location = this.runtime.rooms.getPlayerLocation(playerId)
-    if (!location) return null
-
-    const room = this.runtime.rooms.getRoom(location.roomId)
-    if (!room) return null
-
-    const telemetry = this.runtime.moves.telemetry.get(playerId)
-    return {
-      playerId,
-      roomId: room.roomId,
-      udp: { host: room.udpHost, port: room.udpPort },
-      players: room.players,
-      capacity: room.capacity,
-      level: location.level ?? null,
-      levelId: telemetry?.levelId ?? null,
-      updatedAt: location.updatedAt
-    }
-  }
-
-  private requireDebugToken (req: IncomingMessage): void {
-    if (!this.config.debugApiToken) return
-    const bearer = req.headers.authorization?.startsWith('Bearer ')
-      ? req.headers.authorization.slice(7)
-      : undefined
-    const supplied = req.headers['x-debug-token'] ?? bearer
-    if (typeof supplied !== 'string' || supplied !== this.config.debugApiToken)
-      throw new HermesError(ErrorCode.UNAUTHORIZED, 'invalid debug API token')
-  }
-
-  private readBody (req: IncomingMessage, maxBytes: number): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const chunks: Buffer[] = []
-      let totalBytes = 0
-      let settled = false
-      const fail = (error: Error): void => {
-        if (settled) return
-        settled = true
-        reject(error)
-      }
-      req.on('data', (chunk: Buffer) => {
-        if (settled) return
-        totalBytes += chunk.byteLength
-        if (totalBytes > maxBytes) {
-          fail(new HermesError(ErrorCode.PAYLOAD_TOO_LARGE, 'request body too large'))
-          req.resume()
-          return
-        }
-        chunks.push(chunk)
-      })
-      req.once('end', () => {
-        if (settled) return
-        settled = true
-        resolve(Buffer.concat(chunks).toString('utf8'))
-      })
-      req.once('aborted', () =>
-        fail(new HermesError(ErrorCode.BAD_REQUEST, 'request aborted'))
-      )
-      req.once('error', error => fail(error))
-    })
-  }
-
   private rejectUpgrade (socket: Duplex, status: number, message: string): void {
     socket.write(
       `HTTP/1.1 ${status} ${message}\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(
@@ -1234,36 +727,5 @@ export class ManagerGateway {
     socket.destroy()
   }
 
-  private writeJson (res: ServerResponse, status: number, value: unknown): void {
-    if (res.writableEnded || res.destroyed) return
-    const body = jsonStringify(value)
-    res.writeHead(status, {
-      'content-type': 'application/json; charset=utf-8',
-      'content-length': Buffer.byteLength(body)
-    })
-    res.end(body)
-  }
 
-  private errorReply (error: unknown): {
-    code: number
-    data: { message: string }
-  } {
-    if (isHermesError(error))
-      return { code: error.code, data: { message: error.message } }
-    if (error instanceof Error)
-      return { code: ErrorCode.INTERNAL, data: { message: error.message } }
-    return { code: ErrorCode.INTERNAL, data: { message: String(error) } }
-  }
-
-  private parseJsonBody (body: string): unknown {
-    try {
-      return JSON.parse(body) as unknown
-    } catch (error) {
-      throw new HermesError(
-        ErrorCode.BAD_REQUEST,
-        'invalid allocation json body',
-        error
-      )
-    }
-  }
 }
