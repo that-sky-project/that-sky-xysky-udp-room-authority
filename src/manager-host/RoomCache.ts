@@ -84,6 +84,14 @@ export class RoomCache {
     this.awaitingTelemetry.delete(roomId)
     for (const [id, location] of this.playerLocations) if (location.roomId === roomId) this.playerLocations.delete(id)
   }
+  /** Transport liveness renews only the TTL of an already registered room.
+   *  Rejected business data must not mutate roster, capacity or version. */
+  public touchOwnedRoom (roomId: RoomId, nodeId: NodeId): boolean {
+    const room = this.rooms.get(roomId)
+    if (!room || room.nodeId !== nodeId) return false
+    this.rooms.set(roomId, room)
+    return true
+  }
   public getRoom (roomId: RoomId): RoomSnapshot | undefined {
     return this.rooms.get(roomId)
   }

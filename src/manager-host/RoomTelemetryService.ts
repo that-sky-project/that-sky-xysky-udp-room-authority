@@ -2,7 +2,19 @@ import type { NodeId, PlayerId, RoomId } from '../types/branded.js'
 import type { INodeEvent, PlayerTelemetry, RoomSnapshot } from '../types/contracts.js'
 import type { NodeRegistry } from './NodeRegistry.js'
 import type { RoomCache } from './RoomCache.js'
-import type { TelemetryStore } from './TelemetryStore.js'
+import { generationRejection, type TelemetryStore } from './TelemetryStore.js'
+
+export interface TelemetryRejection {
+  reason: string
+  seq: number
+  playerId?: string
+  view?: 'roster' | 'telemetry' | 'location'
+  previousLvSeq?: number
+  incomingLvSeq?: number
+  missingFields?: string[]
+  baseSeq?: number
+  expectedBaseSeq?: number
+}
 
 interface AcceptedRoster {
   seq: number
@@ -18,13 +30,17 @@ interface Options {
   onGap?: (() => void) | undefined
   onReset?: ((roomId: RoomId) => void) | undefined
   onAccepted?: (() => void) | undefined
+  /** Bounded event delivery is owned by the coordinator; retain only the last rejection here. */
+  onRejected?: ((roomId: RoomId, rejection: TelemetryRejection) => void) | undefined
+  /** A node still runs a build that does not report connection identities. */
+  onLegacyPlayer?: ((roomId: RoomId, playerId: string) => void) | undefined
   clock?: () => number
 }
 
 /** Single acceptance owner. All validation precedes writes to room/location/player indexes. */
 export class RoomTelemetryService {
   private readonly rosters = new Map<RoomId, AcceptedRoster>()
-  private readonly gaps = new Map<RoomId, { since: number; dropped: number }>()
+  private readonly gaps = new Map<RoomId, { since: number; dropped: number; rejection: TelemetryRejection }>()
   private readonly clock: () => number
 
   public constructor(private readonly options: Options) { this.clock = options.clock ?? Date.now }
@@ -33,6 +49,7 @@ export class RoomTelemetryService {
   public hasGap(roomId: RoomId): boolean { return this.gaps.has(roomId) }
   public gapIds(): RoomId[] { return [...this.gaps.keys()] }
   public gapCount(): number { return this.gaps.size }
+  public gapSnapshot(roomId: RoomId) { return this.gaps.get(roomId) }
   public forget(roomId: RoomId): void {
     this.rosters.delete(roomId)
     this.gaps.delete(roomId)
@@ -65,33 +82,63 @@ export class RoomTelemetryService {
     const seq = data.seq!
     const delta = data.kind === 'delta'
     if (seq < room.version || (previous && sameEpoch && seq <= previous.seq)) return false
-    if (delta && (!previous || !sameEpoch || this.gaps.has(roomId) || data.baseSeq !== previous.seq)) return this.reject(roomId)
+    const reject = (reason: string, detail: Omit<TelemetryRejection, 'reason' | 'seq'> = {}): false =>
+      this.reject(roomId, { reason, seq, ...detail })
+    if (delta && (!previous || !sameEpoch || this.gaps.has(roomId) || data.baseSeq !== previous.seq)) {
+      return reject('delta_gap', {
+        ...(typeof data.baseSeq === 'number' ? { baseSeq: data.baseSeq } : {}),
+        ...(previous ? { expectedBaseSeq: previous.seq } : {})
+      })
+    }
     const next = delta ? new Map(previous!.players) : new Map<string, PlayerTelemetry>()
     for (const id of data.removedPlayers ?? []) next.delete(id)
     const incoming = new Set<string>()
     const acceptedIncoming = new Map<string, PlayerTelemetry>()
-    for (const player of data.players) {
-      if (incoming.has(player.playerId) || player.sessionId === undefined ||
-          player.lvSeq === undefined || player.status === undefined) return this.reject(roomId)
+    for (const raw of data.players) {
+      if (incoming.has(raw.playerId)) return reject('duplicate_player', { playerId: raw.playerId })
+      // Rolling deployments still contain pre-repair nodes that never emit a
+      // connection identity. A stable uuid-derived pseudo-session keeps the
+      // generation ordering meaningful per player instead of bricking the room.
+      const missingFields = ['lvSeq', 'status'].filter(field =>
+        raw[field as 'lvSeq' | 'status'] === undefined)
+      if (missingFields.length) return reject('missing_identity', { playerId: raw.playerId, missingFields })
+      const player: PlayerTelemetry = {
+        ...raw,
+        sessionId: raw.sessionId ?? `legacy:${raw.playerId}`,
+        status: raw.status ?? 'ACTIVE'
+      }
+      if (raw.sessionId === undefined) {
+        this.options.onLegacyPlayer?.(roomId, raw.playerId)
+      }
       incoming.add(player.playerId)
       const location = rooms.getPlayerLocation(player.playerId)
       if (location && location.roomId !== roomId && location.leavingAt === undefined) {
         next.delete(player.playerId)
         continue
       }
-      const before = previous?.players.get(player.playerId) ?? telemetry.get(player.playerId)
-      if (before && before.sessionId === player.sessionId && before.lvSeq !== undefined && player.lvSeq !== undefined) {
-        const distance = (player.lvSeq - before.lvSeq + 256) & 255
-        if (distance >= 128 || (distance === 0 && before.levelId !== undefined && player.levelId !== undefined && before.levelId !== player.levelId)) return this.reject(roomId)
+      const stored = telemetry.get(player.playerId)
+      // These views can advance independently via lifecycle events. Every
+      // authoritative generation must approve before any indexed state changes.
+      const views: Array<[NonNullable<TelemetryRejection['view']>, PlayerTelemetry | undefined]> = [
+        ['roster', previous?.players.get(player.playerId)],
+        ['telemetry', stored?.roomId === roomId ? stored : undefined],
+        ['location', location?.roomId === roomId ? { playerId: player.playerId,
+          sessionId: location.sessionId, lvSeq: location.lvSeq, levelId: location.level } : undefined]
+      ]
+      for (const [view, before] of views) {
+        const reason = generationRejection(before, player)
+        if (reason) return reject(reason, { playerId: player.playerId, view,
+          ...(before?.lvSeq !== undefined ? { previousLvSeq: before.lvSeq } : {}),
+          ...(player.lvSeq !== undefined ? { incomingLvSeq: player.lvSeq } : {}) })
       }
       next.set(player.playerId, { ...player })
       acceptedIncoming.set(player.playerId, player)
     }
-    if (next.size > room.capacity || next.size > 8) return this.reject(roomId)
+    if (next.size > room.capacity || next.size > 8) return reject('invalid_capacity')
     const physical = data.physicalPlayers ?? Math.max(next.size, data.activePlayers ?? next.size)
     if (!Number.isInteger(physical) || physical < next.size || physical > room.capacity || physical > 8 ||
         (data.activePlayers !== undefined && data.activePlayers > physical) ||
-        (data.reservedSlots !== undefined && physical + data.reservedSlots > room.capacity)) return this.reject(roomId)
+        (data.reservedSlots !== undefined && physical + data.reservedSlots > room.capacity)) return reject('invalid_capacity')
 
     // No awaited work below: all views commit as one synchronous accepted update.
     if (!rooms.acceptTelemetryRoom({ ...room, players: physical, version: seq })) return false
@@ -119,9 +166,10 @@ export class RoomTelemetryService {
     return true
   }
 
-  private reject(roomId: RoomId): false {
+  private reject(roomId: RoomId, rejection: TelemetryRejection): false {
     const previous = this.gaps.get(roomId)
-    this.gaps.set(roomId, { since: previous?.since ?? this.clock(), dropped: (previous?.dropped ?? 0) + 1 })
+    this.gaps.set(roomId, { since: previous?.since ?? this.clock(), dropped: (previous?.dropped ?? 0) + 1, rejection })
+    this.options.onRejected?.(roomId, rejection)
     this.options.onReset?.(roomId)
     this.options.onGap?.()
     this.options.requestFull(roomId)

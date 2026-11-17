@@ -23,6 +23,9 @@ export interface PlanningContext {
   /** Mandatory level isolation bypasses ordinary arrival/remigration cooldowns,
    *  but still requires a healthy, idle source room. */
   isIsolationSourceRoom?: (room: RoomSnapshot, now: number) => boolean
+  /** Optional consolidation requires source confirmation even when isolation
+   *  receives all healthy rooms. This predicate must not advance confirmation. */
+  isOptionalSourceRoom?: (room: RoomSnapshot, now: number) => boolean
   /** Optional bounded diagnostic hook for planner-internal blockers. */
   onBlocked?: (roomId: string, reason: string, data?: Record<string, unknown>) => void
   /** Full physical roster of a room (incl. MOVING players). Hard bonds are

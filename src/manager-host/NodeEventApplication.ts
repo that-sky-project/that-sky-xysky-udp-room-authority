@@ -12,6 +12,7 @@ export function applyNodeEvent(runtime: ManagerRuntime, event: INodeEvent): bool
   // Even a rejected business snapshot can establish transport liveness, but it
   // cannot advance accepted roster/location/occupancy state or release a hold.
   runtime.nodes.applyEvent(event)
+  if (roomId && event.event !== 'room.destroyed') runtime.rooms.touchOwnedRoom(roomId, nodeId)
   if (!runtime.moves.ingest(event)) return false
   runtime.rooms.applyNodeEvent(event)
   if (event.data.player?.playerId && event.event === 'player.join') {

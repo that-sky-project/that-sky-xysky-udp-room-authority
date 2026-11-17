@@ -31,11 +31,11 @@ test('protected hard bond conflict defers intruder rather than breaking players'
   players[0].affinity = {}
   assert.equal(planner.plan(rooms, store(players), NOW).length, 1)
 })
-test('ordinary legitimate mixed target remains allowed when no clean target exists', () => {
+test('isolation waits for a clean same-level or empty target instead of perpetuating mixed rooms', () => {
   const rooms = [room('s', 3), room('t', 2)]
   const players = [player('s1', 's', 1), player('s2', 's', 1), player('s3', 's', 2), player('t1', 't', 2), player('t2', 't', 3)]
   const plans = new LevelIsolationPlanner(options).plan(rooms, store(players), NOW)
-  assert.ok(plans.some(p => p.sourceRoomId === 's' && p.targetRoomId === 't'))
+  assert.deepEqual(plans, [])
 })
 test('capacity includes snapshot occupants with missing telemetry and allocation/move holds', () => {
   const rooms = [room('s', 3), room('ghost', 8), room('held', 0), room('t', 0)]

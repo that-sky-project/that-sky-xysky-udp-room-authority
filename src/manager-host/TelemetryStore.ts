@@ -1,5 +1,15 @@
 import type { PlayerId, RoomId } from '../types/branded.js'
 import type { PlayerTelemetry } from '../types/contracts.js'
+/** u8 ordering applies only to the same explicit connection identity. */
+export function generationRejection (previous: PlayerTelemetry | undefined, input: PlayerTelemetry): 'old_generation' | 'conflicting_level' | undefined {
+  if (previous?.sessionId === undefined || input.sessionId === undefined ||
+      previous.sessionId !== input.sessionId || previous.lvSeq === undefined || input.lvSeq === undefined) return undefined
+  const distance = (input.lvSeq - previous.lvSeq + 256) & 255
+  if (distance >= 128) return 'old_generation'
+  if (distance === 0 && previous.levelId !== undefined && input.levelId !== undefined &&
+      previous.levelId !== input.levelId) return 'conflicting_level'
+  return undefined
+}
 export interface StoredTelemetry extends PlayerTelemetry {
   roomId: RoomId
   receivedAt: number
@@ -33,14 +43,7 @@ export class TelemetryStore {
     // connection identity. Missing identities must never be treated as the
     // same session (`undefined === undefined`) or a replacement connection can
     // be silently frozen at its predecessor's generation.
-    if (previous?.roomId === roomId && previous.sessionId !== undefined &&
-        input.sessionId !== undefined && previous.sessionId === input.sessionId &&
-        previous.lvSeq !== undefined && input.lvSeq !== undefined) {
-      const distance = (input.lvSeq - previous.lvSeq + 256) & 255
-      const conflictingLevel = distance === 0 && previous.levelId !== undefined &&
-        input.levelId !== undefined && input.levelId !== 0 && previous.levelId !== input.levelId
-      if (distance >= 128 || conflictingLevel) return previous
-    }
+    if (previous?.roomId === roomId && generationRejection(previous, input)) return previous
     const roomChanged = previous !== undefined && previous.roomId !== roomId
     const sessionChanged = previous !== undefined && input.sessionId !== undefined && previous.sessionId !== input.sessionId
     const base = sessionChanged ? undefined : previous
@@ -112,9 +115,8 @@ export class TelemetryStore {
   }
   public get (playerId: PlayerId): StoredTelemetry | undefined { return this.players.get(playerId) }
   public list (): StoredTelemetry[] { return [...this.players.values()] }
-  /** Every indexed observation for a room, including expired entries. Used only
-   *  for authoritative full-snapshot reconciliation and diagnostics; planners
-   *  must use a freshness-bounded view. */
+  /** Every indexed observation, retained until an authoritative removal. Use
+   *  this for bond closure and composition; only fresh observations may move. */
   public listKnownRoom (roomId: RoomId): StoredTelemetry[] {
     const result: StoredTelemetry[] = []
     for (const id of this.playersByRoom.get(roomId) ?? []) {

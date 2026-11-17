@@ -7,6 +7,7 @@ import { request } from 'node:http'
 import { LevelIsolationPlanner } from '../dist/manager-host/LevelIsolationPlanner.js'
 import { MovePlanner } from '../dist/manager-host/MovePlanner.js'
 import { TelemetryStore } from '../dist/manager-host/TelemetryStore.js'
+import { RoomTelemetryService } from '../dist/manager-host/RoomTelemetryService.js'
 import { RoomCache } from '../dist/manager-host/RoomCache.js'
 import { NodeRegistry } from '../dist/manager-host/NodeRegistry.js'
 import { PendingRequestMap } from '../dist/manager-host/PendingRequestMap.js'
@@ -166,6 +167,96 @@ test('unsettled visitors do not freeze isolation planning for the settled minori
   const plans = new LevelIsolationPlanner(options).plan(rooms, store(players), NOW)
   assert.equal(plans.length, 1, 'room is still planned despite the unsettled visitor')
   assert.equal(idsOf(plans).includes('v'), false)
+})
+
+test('real full/delta snapshot with a fifteen-minute frozen record still isolates fresh minority levels', () => {
+  let now = NOW - 900000
+  const rooms = new RoomCache({ maxRooms: 100, staleRoomMs: 600000 })
+  const nodes = new NodeRegistry({ circuitOpenMs: 10, failureThreshold: 5, backpressureLimitBytes: 1000 })
+  nodes.register({ nodeId: 'n', connectedAt: 10, protocolVersion: 1, writable: true, remoteAddress: '', async send () {}, close () {} })
+  rooms.upsertRoom({ ...room('s', 0), nodeId: 'n', version: 0 })
+  rooms.upsertRoom({ ...room('t1', 0), nodeId: 'n' })
+  rooms.upsertRoom({ ...room('t2', 0), nodeId: 'n' })
+  const telemetry = new TelemetryStore()
+  const service = new RoomTelemetryService({ rooms, nodes, telemetry, requestFull () {}, clock: () => now })
+  const observed = (playerId, levelId, extra = {}) => ({ playerId, sessionId: `s-${playerId}`, lvSeq: 1, status: 'ACTIVE', levelId, ...extra })
+  const frozen = observed('frozen', 1)
+  const core = [observed('core1', 1), observed('core2', 1), observed('a', 2), observed('b', 3)]
+  const frame = (seq, players, extra = {}) => ({ event: 'room.telemetry', data: { nodeId: 'n', roomId: 's', kind: 'full', seq, players, ...extra } })
+  assert.equal(service.accept(frame(1, [frozen, ...core]), 's'), true)
+  now = NOW
+  assert.equal(service.accept(frame(2, core, { kind: 'delta', baseSeq: 1 }), 's'), true)
+  assert.equal(telemetry.get('frozen').receivedAt, NOW - 900000)
+  const plans = new LevelIsolationPlanner(options).plan(rooms.listRooms(), telemetry, now)
+  assert.deepEqual(idsOf(plans), ['a', 'b'])
+  assert.equal(new Set(plans.map(plan => plan.targetRoomId)).size, 2)
+  assert.ok(plans.every(plan => plan.reason === 'level_isolation'))
+})
+
+test('stale unresolved bond mate survives age and blocks until authoritative full removal', () => {
+  let now = NOW - 900000, resyncs = 0
+  const rooms = new RoomCache({ maxRooms: 100, staleRoomMs: 600000 })
+  const nodes = new NodeRegistry({ circuitOpenMs: 10, failureThreshold: 5, backpressureLimitBytes: 1000 })
+  nodes.register({ nodeId: 'n', connectedAt: 10, protocolVersion: 1, writable: true, remoteAddress: '', async send () {}, close () {} })
+  rooms.upsertRoom({ ...room('s', 0), nodeId: 'n', version: 0 })
+  rooms.upsertRoom({ ...room('t', 0), nodeId: 'n' })
+  const telemetry = new TelemetryStore()
+  const service = new RoomTelemetryService({ rooms, nodes, telemetry, requestFull () { resyncs++ }, clock: () => now })
+  const observed = (playerId, levelId, extra = {}) => ({ playerId, sessionId: `s-${playerId}`, lvSeq: 1, status: 'ACTIVE', levelId, ...extra })
+  const mate = observed('b', 2, { affinity: { a: 1 }, status: 'MOVING' })
+  const core = [observed('a', 2), observed('c', 1), observed('d', 1), observed('e', 1)]
+  const frame = (seq, players, extra = {}) => ({ event: 'room.telemetry', data: { nodeId: 'n', roomId: 's', kind: 'full', seq, players, ...extra } })
+  service.accept(frame(1, [mate, ...core]), 's')
+  now = NOW
+  service.accept(frame(2, core, { kind: 'delta', baseSeq: 1 }), 's')
+  const planner = new LevelIsolationPlanner(options)
+  assert.deepEqual(planner.plan(rooms.listRooms(), telemetry, now), [])
+  now += 900000
+  service.accept(frame(3, core, { kind: 'delta', baseSeq: 2 }), 's')
+  assert.deepEqual(planner.plan(rooms.listRooms(), telemetry, now), [], 'another fifteen minutes never waives the bond')
+  assert.ok(telemetry.get('b'))
+  assert.equal(service.accept(frame(4, core), 's'), true)
+  assert.equal(telemetry.get('b'), undefined)
+  assert.deepEqual(idsOf(planner.plan(rooms.listRooms(), telemetry, now)), ['a'])
+  assert.equal(resyncs, 0)
+})
+
+test('full known stale or loading majority retains its level while a fresh settled minority isolates', () => {
+  for (const state of ['stale', 'loading']) {
+    const players = [player('a', 's', 2), ...['b', 'c', 'd'].map(id => player(id, 's', 1,
+      state === 'stale' ? { receivedAt: NOW - 900000 } : { roomJoinedAt: NOW - 1000 }))]
+    const plans = new LevelIsolationPlanner(options).plan([room('s', 4), room('t', 0)], store(players), NOW)
+    assert.deepEqual(idsOf(plans), ['a'], state)
+    assert.equal(plans[0].reason, 'level_isolation')
+  }
+})
+
+test('staggered bonded level changes wait six seconds for the last member and move complete transitive component', () => {
+  const telemetry = new TelemetryStore()
+  const base = NOW - 60000
+  const upsert = (id, levelId, at, extra = {}) => telemetry.upsert('s', { playerId: id, sessionId: `s-${id}`, lvSeq: levelId, status: 'ACTIVE', levelId, ...extra }, at)
+  for (const id of ['a', 'b', 'c', 'm1', 'm2', 'm3', 'm4']) upsert(id, 1, base)
+  upsert('a', 2, NOW, { affinity: { b: 1 } })
+  upsert('b', 2, NOW + 1000, { affinity: { c: 1 } })
+  upsert('c', 2, NOW + 2000)
+  const refresh = at => { for (const p of telemetry.list()) telemetry.upsert('s', p, at) }
+  const planner = new LevelIsolationPlanner(options)
+  const rooms = [room('s', 7), room('t', 0)]
+  refresh(NOW + 7999)
+  assert.deepEqual(planner.plan(rooms, telemetry, NOW + 7999), [])
+  refresh(NOW + 8000)
+  assert.deepEqual(idsOf(planner.plan(rooms, telemetry, NOW + 8000)), ['a', 'b', 'c'])
+})
+
+test('optional consolidation tries a fitting target after the fullest room cannot fit the bonded pair', () => {
+  const players = [player('a', 's', 1, { affinity: { b: 1 } }), player('b', 's', 1),
+    ...Array.from({ length: 7 }, (_, i) => player(`x${i}`, 'full', 1)),
+    ...Array.from({ length: 6 }, (_, i) => player(`y${i}`, 'fit', 1))]
+  const plans = new LevelIsolationPlanner(options).plan([room('s', 2), room('full', 7), room('fit', 6)], store(players), NOW)
+  assert.equal(plans.length, 1)
+  assert.deepEqual(idsOf(plans), ['a', 'b'])
+  assert.equal(plans[0].targetRoomId, 'fit')
+  assert.equal(plans[0].reason, 'level_consolidation')
 })
 
 // ---------------------------------------------------------------------------
@@ -384,6 +475,58 @@ test('stabilitySnapshot exposes per-room planner state', async () => {
 test('levelChangeCooldownMs default is 6000 in both planners', () => {
   assert.equal(new MovePlanner().levelChangeCooldownMs, 6000)
   assert.equal(new LevelIsolationPlanner().levelChangeCooldownMs, 6000)
+})
+
+test('mandatory isolation bypasses confirmation seven and unrelated room cooldowns', async () => {
+  const f = fixture({ confirmationCycles: 7 }, new DebugEventLog(100))
+  try {
+    const now = Date.now()
+    seed(f, 'a', 'p', 1, { affinity: { q: 1 } }, now)
+    seed(f, 'a', 'q', 1, {}, now)
+    for (const id of ['r', 's', 't']) seed(f, 'a', id, 2, {}, now)
+    f.rooms.upsertRoom(coordRoom('a', 5))
+    f.moves.recentArrivals.set('a', now)
+    f.moves.migratedPlayers.set('r', now)
+    const txs = await f.moves.planAndExecute()
+    const tx = txs.find(item => item.reason === 'level_isolation')
+    assert.ok(tx)
+    assert.deepEqual([...tx.plannedIds].sort(), ['p', 'q'])
+    assert.equal(tx.status, 'committed')
+  } finally { await f.cleanup() }
+})
+
+test('optional consolidation still waits for source confirmation seven', async () => {
+  const f = fixture({ confirmationCycles: 7 })
+  try {
+    const now = Date.now()
+    seed(f, 'a', 'p', 1, { affinity: { q: 1 } }, now)
+    seed(f, 'a', 'q', 1, {}, now)
+    f.rooms.trackPlayer('target', 'nb', 'b', 1, 's-target', 1)
+    f.moves.telemetry.upsert('b', { playerId: 'target', sessionId: 's-target', lvSeq: 1, levelId: 1, status: 'ACTIVE' }, now - 60000)
+    f.moves.telemetry.upsert('b', { playerId: 'target', sessionId: 's-target', lvSeq: 1, levelId: 1, status: 'ACTIVE' }, now)
+    f.rooms.upsertRoom(coordRoom('b', 6))
+    await f.moves.planAndExecute()
+    assert.equal(f.sent.some(command => command.cmd === 'move.prepare'), false)
+  } finally { await f.cleanup() }
+})
+
+test('source becoming stale or MOVING during prepare cancels before redirect', async () => {
+  for (const state of ['stale', 'MOVING']) {
+    const f = fixture()
+    try {
+      seed(f, 'a', 'p', 1)
+      f.onSend(command => {
+        if (command.cmd !== 'move.prepare') return
+        const item = f.moves.telemetry.get('p')
+        if (state === 'stale') item.receivedAt = Date.now() - 11000
+        else item.status = 'MOVING'
+      })
+      const tx = await f.moves.manualMove({ sourceRoomId: 'a', targetRoomId: 'b', playerIds: ['p'] })
+      assert.equal(tx.status, 'failed', state)
+      assert.equal(f.sent.some(command => command.cmd === 'move.commit'), false)
+      assert.ok(f.sent.some(command => command.cmd === 'move.cancel'))
+    } finally { await f.cleanup() }
+  }
 })
 
 // ---------------------------------------------------------------------------

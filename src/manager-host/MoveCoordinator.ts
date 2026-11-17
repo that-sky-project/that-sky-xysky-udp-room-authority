@@ -3,12 +3,10 @@ import { PlanningScheduler } from './PlanningScheduler.js'
 import { MoveCancellationQueue } from './MoveCancellationQueue.js'
 import { RoomTelemetryService } from './RoomTelemetryService.js'
 import { applyCapacityFacts } from './CapacityFacts.js'
-import { randomUUID } from 'node:crypto'
 import type { NodeId, PlayerId, RoomId } from '../types/branded.js'
-import { asProtocolVersion } from '../types/branded.js'
 import type { INodeEvent, PlayerTelemetry, RoomSnapshot } from '../types/contracts.js'
 import type { Logger } from '../infra/logger/logger.js'
-import type { CrossCoordinator, SourceParticipantSnapshot, RedirectReason } from './CrossCoordinator.js'
+import type { CrossCoordinator, RedirectReason } from './CrossCoordinator.js'
 import type { DebugEventInput, DebugEventLog } from './DebugEventLog.js'
 import type { NodeRegistry } from './NodeRegistry.js'
 import type { PendingRequestMap } from './PendingRequestMap.js'
@@ -55,6 +53,8 @@ export type PlanSkipReason =
   | 'plan_too_large'
   | 'isolation_no_target'
   | 'stale_observation'
+  | 'legacy_identity'
+  | 'telemetry_rejected'
 
 const SKIP_RATE_LIMIT_MS = 15_000
 
@@ -67,7 +67,6 @@ export class MoveCoordinator {
   private readonly transactions = new MoveTransactions()
   private readonly roomTelemetry: RoomTelemetryService
   private readonly roomStability = new Map<string, { signature: string; cycles: number; seq: number }>()
-  private readonly telemetryGap = new Map<string, { since: number; dropped: number }>()
   private readonly recentArrivals = new Map<string, number>()
   private readonly migratedPlayers = new Map<string, number>()
   private readonly cancellations: MoveCancellationQueue
@@ -77,7 +76,6 @@ export class MoveCoordinator {
   private readonly skipEvents = new Map<string, number>()
   private readonly lastSkipByRoom = new Map<string, { reason: PlanSkipReason; at: number }>()
   private stopPromise: Promise<void> | undefined
-  private moveSeq = 0
 
   public constructor (
     private readonly rooms: RoomCache, private readonly nodes: NodeRegistry,
@@ -94,6 +92,8 @@ export class MoveCoordinator {
     })
     this.roomTelemetry = new RoomTelemetryService({ rooms, nodes, telemetry: this.telemetry,
       requestFull: roomId => this.requestFull(roomId), onGap: onTelemetryGap,
+      onRejected: (roomId, rejection) => this.recordPlanSkipped('telemetry_rejected', roomId, { rejection }),
+      onLegacyPlayer: (roomId, playerId) => this.recordPlanSkipped('legacy_identity', roomId, { playerId }),
       onReset: roomId => this.roomStability.delete(roomId), onAccepted: () => this.requestPlan() })
     this.planner = new MovePlanner(options.planner)
     this.levelIsolationPlanner = new LevelIsolationPlanner(options.levelIsolation)
@@ -163,18 +163,14 @@ export class MoveCoordinator {
           this.transactions.leave(tx, id); this.completeIfResolved(tx)
         }
       } else {
-        if (sessionId === undefined || lvSeq === undefined) {
-          this.recordPlanSkipped('stale_observation', roomId, {
-            playerId: id,
-            reasonDetail: 'player.join missing sessionId or lvSeq'
-          })
-          this.requestFull(roomId)
-          return false
-        }
-        const joined: PlayerTelemetry = { playerId: player.playerId, status: 'ACTIVE', sessionId, lvSeq,
+        // Pre-repair nodes omit the connection identity from player.join; the
+        // uuid-derived pseudo session keeps the room usable during rollout.
+        const joinedSession = sessionId ?? `legacy:${id}`
+        if (sessionId === undefined) this.recordPlanSkipped('legacy_identity', roomId, { playerId: id })
+        const joined: PlayerTelemetry = { playerId: player.playerId, status: 'ACTIVE', sessionId: joinedSession, lvSeq: lvSeq ?? 0,
           ...(player.level !== undefined ? { levelId: player.level } : {}) }
         this.telemetry.upsert(roomId, joined)
-        this.rooms.trackPlayer(player.playerId, event.data.nodeId, roomId, player.level, sessionId, lvSeq)
+        this.rooms.trackPlayer(player.playerId, event.data.nodeId, roomId, player.level, joinedSession, joined.lvSeq)
         this.roomTelemetry.noteJoin(roomId, joined)
         for (const tx of this.transactions.values()) if (this.active(tx) && this.matchesEvent(tx, event, 'target') && tx.plannedIds.includes(id)) { this.markArrived(tx, id); this.completeIfResolved(tx) }
       }
@@ -241,6 +237,7 @@ export class MoveCoordinator {
     // Mandatory level isolation sees every healthy room. Ordinary merge and
     // activity rebalance still require the configured stability confirmation.
     const stableRooms = allRooms.filter(room => this.isRoomStable(room.roomId, this.stablePlayers(room.roomId, now)))
+    const confirmedIds = new Set(stableRooms.map(room => room.roomId))
     const byRoom = new Map(stableRooms.map(room => [room.roomId as string, this.telemetry.listRoom(room.roomId, now)]))
     const context = {
       effectivePlayersOf: (room: RoomSnapshot) => this.capacity(room),
@@ -248,6 +245,7 @@ export class MoveCoordinator {
       physicalPlayersOf: (roomId: string) => this.telemetry.listKnownRoom(roomId as RoomId),
       isChurning: (playerId: string, at: number) => this.telemetry.isChurning(playerId as PlayerId, at),
       isIsolationSourceRoom: (room: RoomSnapshot, at: number) => this.isIsolationSourceRoom(room, at),
+      isOptionalSourceRoom: (room: RoomSnapshot) => confirmedIds.has(room.roomId),
       onBlocked: (roomId: string, reason: string, data?: Record<string, unknown>) =>
         this.recordPlannerBlocked(roomId, reason, data)
     }
@@ -319,11 +317,15 @@ export class MoveCoordinator {
   }
   private sourceUnchanged (tx: MoveTransaction): boolean {
     if (!this.active(tx)) return false
+    const now = Date.now()
     const unchanged = tx.plannedIds.every(id => {
       const location = this.rooms.getPlayerLocation(id as PlayerId), item = this.telemetry.get(id as PlayerId)
       const expected = tx.expectedParticipants.find(player => player.playerId === id)!
       return location?.roomId === tx.sourceRoomId && location.nodeId === tx.sourceNodeId && location.leavingAt === undefined &&
-        item?.roomId === tx.sourceRoomId && (expected.sessionId === undefined || item.sessionId === expected.sessionId) &&
+        item?.roomId === tx.sourceRoomId && item.status === 'ACTIVE' && item.receivedAt <= now &&
+        now - item.receivedAt <= 10_000 && location.sessionId === item.sessionId && location.lvSeq === item.lvSeq &&
+        location.level === item.levelId &&
+        (expected.sessionId === undefined || item.sessionId === expected.sessionId) &&
         (expected.levelId === undefined || item.levelId === expected.levelId) && (expected.lvSeq === undefined || item.lvSeq === expected.lvSeq)
     })
     if (!unchanged) return false
@@ -408,12 +410,13 @@ export class MoveCoordinator {
     for (const [key, at] of this.skipEvents) if (now - at > 60_000) this.skipEvents.delete(key)
   }
   private recordPlannerBlocked (roomId: string, reason: string, data?: Record<string, unknown>): void {
-    const mapped: PlanSkipReason = reason === 'isolation_no_target' ? 'isolation_no_target' : 'source_not_candidate'
+    const mapped: PlanSkipReason = reason === 'isolation_no_target' ? 'isolation_no_target' : reason === 'bond_incomplete' ? 'bond_incomplete' : 'source_not_candidate'
     this.recordPlanSkipped(mapped, roomId, data)
   }
   /** Rate-limited plan.skipped event: once per sourceRoomId+reason per 15s. */
   private recordPlanSkipped (reason: PlanSkipReason, sourceRoomId: string, extra: Record<string, unknown> = {}): void {
     const now = Date.now()
+    if (!this.lastSkipByRoom.has(sourceRoomId) && this.lastSkipByRoom.size >= 4096) this.lastSkipByRoom.delete(this.lastSkipByRoom.keys().next().value!)
     this.lastSkipByRoom.set(sourceRoomId, { reason, at: now })
     const key = `${sourceRoomId}\u0000${reason}`
     const last = this.skipEvents.get(key)
@@ -422,26 +425,71 @@ export class MoveCoordinator {
     this.skipEvents.set(key, now)
     this.record({ category: 'move', event: 'plan.skipped', message: `plan skipped: ${reason}`, roomId: sourceRoomId, data: { reason, ...extra } })
   }
-  public stabilitySnapshot (now = Date.now()): Array<{
-    roomId: string
-    cycles: number
-    seq: number | undefined
-    gap: boolean
-    busyTx: boolean
-    busyCancellations: boolean
-    backoffUntil: number | undefined
-    recentArrivalAgoMs: number | undefined
-    remigrateBlockedPlayerIds: string[]
-    lastSkip: { reason: PlanSkipReason; at: number } | undefined
-  }> {
+  /** Live group readiness; a quiet event log never implies planner health. */
+  private groupReadiness (roomId: RoomId, now: number) {
+    const players = this.telemetry.listKnownRoom(roomId)
+    const remaining = new Set(players)
+    const groups = []
+    while (remaining.size > 0) {
+      const component = [remaining.values().next().value!]
+      remaining.delete(component[0]!)
+      for (const player of component) for (const peer of remaining) {
+        if (Math.max(player.affinity?.[peer.playerId] ?? 0, peer.affinity?.[player.playerId] ?? 0) < 0.9) continue
+        component.push(peer); remaining.delete(peer)
+      }
+      const blockers = new Set<string>()
+      let readyAt = 0
+      const levels = new Set(component.map(player => player.levelId))
+      if (levels.size !== 1) blockers.add('bond_levels_differ')
+      for (const player of component) {
+        if (player.receivedAt > now || now - player.receivedAt > 10_000) blockers.add('stale_observation')
+        if (player.status !== 'ACTIVE') blockers.add('not_active')
+        if (player.sessionId === undefined || player.lvSeq === undefined) blockers.add('missing_identity')
+        if (player.levelId === undefined) blockers.add('unknown_level')
+        const location = this.rooms.getPlayerLocation(player.playerId)
+        if (location?.roomId !== roomId || location.sessionId !== player.sessionId || location.lvSeq !== player.lvSeq || location.leavingAt !== undefined) blockers.add('location_mismatch')
+        readyAt = Math.max(readyAt, (player.levelChangedAt ?? 0) + (this.options.levelIsolation?.levelChangeCooldownMs ?? 6_000),
+          (player.roomJoinedAt ?? 0) + (this.options.levelIsolation?.joinSettleMs ?? 6_000))
+      }
+      if (readyAt > now) blockers.add('settling')
+      if (component.length > (this.options.levelIsolation?.maxPlayersPerMove ?? 7)) blockers.add('group_too_large')
+      const protectedLevels = this.options.levelIsolation?.protectedLevels ?? []
+      if (component.some(player => player.levelId !== undefined && protectedLevels.includes(player.levelId))) blockers.add('protected_level')
+      groups.push({ playerIds: component.map(player => player.playerId), levelIds: [...levels].filter(level => level !== undefined),
+        ready: blockers.size === 0, settleRemainingMs: Math.max(0, readyAt - now), blockers: [...blockers] })
+    }
+    return groups
+  }
+  public stabilitySnapshot (now = Date.now()) {
     return this.rooms.listRooms().map(room => {
       const roomId = room.roomId as string
       const stability = this.roomStability.get(roomId)
       const remigrateBlockedPlayerIds = this.telemetry.listRoom(room.roomId, now)
         .filter(player => now - (this.migratedPlayers.get(player.playerId) ?? player.lastMigratedAt ?? -Infinity) < (this.options.remigrateCooldownMs ?? 20_000))
         .map(player => player.playerId as string)
+      const stalePlayers = this.telemetry.listKnownRoom(room.roomId).filter(player => player.receivedAt > now || now - player.receivedAt > 10_000)
+        .slice(0, 64).map(player => ({ playerId: player.playerId, ageMs: now - player.receivedAt }))
+      const requiredCycles = this.options.confirmationCycles ?? 3
+      const confirmed = (stability?.cycles ?? 0) >= requiredCycles || (requiredCycles <= 1 && this.roomTelemetry.revision(room.roomId) === undefined)
+      const blockers: string[] = []
+      if (room.draining) blockers.push('draining')
+      if (this.rooms.isNodeSuspected(room.nodeId)) blockers.push('node_suspected')
+      if (!this.nodes.isAvailableForCommand(room.nodeId)) blockers.push('node_unavailable')
+      if (this.roomTelemetry.hasGap(room.roomId)) blockers.push('telemetry_gap')
+      if (this.roomBusy(roomId, now)) blockers.push('room_busy')
+      const groups = this.groupReadiness(room.roomId, now)
       return {
         roomId,
+        currentBlockers: blockers,
+        optionalBlockers: [...blockers, ...(!confirmed ? ['confirmation_pending'] : []),
+          ...(remigrateBlockedPlayerIds.length ? ['remigrate_cooldown'] : []),
+          ...(now - (this.recentArrivals.get(roomId) ?? -Infinity) < (this.options.arrivalCooldownMs ?? 15_000) ? ['arrival_cooldown'] : [])],
+        stalePlayers,
+        groups: groups.slice(0, 64),
+        groupsTruncated: groups.length > 64,
+        requiredCycles,
+        confirmationRemainingCycles: Math.max(0, requiredCycles - (stability?.cycles ?? 0)),
+        telemetryRejection: this.roomTelemetry.gapSnapshot(room.roomId)?.rejection,
         cycles: stability?.cycles ?? 0,
         seq: stability?.seq ?? this.roomTelemetry.revision(room.roomId),
         gap: this.roomTelemetry.hasGap(room.roomId),

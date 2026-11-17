@@ -17,14 +17,14 @@ import { createManagerRuntime } from '../dist/manager-host/ManagerRuntime.js'
 const room = (id = 'r', nodeId = 'n') => ({ roomId: id, nodeId, udpHost: '127.0.0.1', udpPort: 41000, capacity: 8, players: 0, version: 0, draining: false })
 const observed = (playerId, extra = {}) => ({ playerId, sessionId: `s-${playerId}`, lvSeq: 1, status: 'ACTIVE', ...extra })
 const event = (seq, players, extra = {}) => ({ event: 'room.telemetry', data: { nodeId: 'n', roomId: 'r', kind: 'full', seq, players, ...extra } })
-function fixture () {
+function fixture (options = {}) {
   const rooms = new RoomCache({ maxRooms: 100, staleRoomMs: 600000 })
   rooms.upsertRoom(room())
   const nodes = new NodeRegistry({ circuitOpenMs: 10, failureThreshold: 5, backpressureLimitBytes: 1000 })
   nodes.register({ nodeId: 'n', connectedAt: 10, protocolVersion: 1, writable: true, remoteAddress: '', async send () {}, close () {} })
   const telemetry = new TelemetryStore()
   let resyncs = 0
-  const service = new RoomTelemetryService({ rooms, nodes, telemetry, requestFull: () => resyncs++ })
+  const service = new RoomTelemetryService({ rooms, nodes, telemetry, requestFull: () => resyncs++, ...options })
   return { rooms, nodes, telemetry, service, resyncs: () => resyncs }
 }
 const flush = () => new Promise(resolve => setImmediate(resolve))
@@ -62,6 +62,75 @@ test('session replacement and explicit unknown level clear the old level in ever
   f.service.accept(event(3, []), 'r')
   assert.equal(f.telemetry.get('p'), undefined)
   assert.equal(f.rooms.getPlayerLocation('p'), undefined)
+})
+
+test('full and delta reject against BOTH roster and stored generations before any mutation', () => {
+  for (const kind of ['full', 'delta']) for (const newerView of ['roster', 'telemetry', 'location']) {
+    const f = fixture()
+    f.service.accept(event(1, [observed('p', { levelId: 1 }), observed('unchanged')]), 'r')
+    if (newerView === 'roster') f.service.noteJoin('r', observed('p', { levelId: 3, lvSeq: 3 }))
+    if (newerView === 'telemetry') f.telemetry.upsert('r', observed('p', { levelId: 3, lvSeq: 3 }))
+    if (newerView === 'location') f.rooms.trackPlayer('p', 'n', 'r', 3, 's-p', 3)
+    const before = { room: structuredClone(f.rooms.getRoom('r')), player: structuredClone(f.telemetry.get('p')),
+      location: structuredClone(f.rooms.getPlayerLocation('p')), untouched: structuredClone(f.telemetry.get('unchanged')) }
+    assert.equal(f.service.accept(event(2, [observed('new'), observed('p', { levelId: 2, lvSeq: 2 })],
+      { kind, baseSeq: 1, removedPlayers: ['unchanged'] }), 'r'), false, `${kind}/${newerView}`)
+    assert.deepEqual(f.rooms.getRoom('r'), before.room)
+    assert.deepEqual(f.telemetry.get('p'), before.player)
+    assert.deepEqual(f.rooms.getPlayerLocation('p'), before.location)
+    assert.deepEqual(f.telemetry.get('unchanged'), before.untouched)
+    assert.equal(f.telemetry.get('new'), undefined)
+    assert.equal(f.rooms.getPlayerLocation('new'), undefined)
+    assert.equal(f.service.revision('r'), 1)
+    assert.equal(f.service.count('r'), 2)
+    assert.equal(f.resyncs(), 1)
+    assert.equal(f.service.gapSnapshot('r').rejection.view, newerView)
+    assert.equal(f.service.gapSnapshot('r').rejection.reason, 'old_generation')
+    assert.equal(f.service.accept(event(3, [observed('p', { levelId: 3, lvSeq: 3 })]), 'r'), true)
+    assert.equal(f.service.hasGap('r'), false)
+  }
+})
+
+test('legacy node without sessionId stays usable through a stable pseudo-session', async () => {
+  const { NodeEventSchema } = await import('../dist/types/contracts.js')
+  let legacy = 0
+  const f = fixture({ onLegacyPlayer: () => legacy++ })
+  const parsed = NodeEventSchema.parse(event(1, [{ playerId: 'p', levelId: 2, lvSeq: 1, status: 'ACTIVE' }]))
+  assert.equal(f.service.accept(parsed, 'r'), true)
+  assert.equal(legacy, 1)
+  assert.equal(f.telemetry.get('p').sessionId, 'legacy:p')
+  assert.equal(f.telemetry.get('p').levelId, 2)
+  assert.equal(f.service.hasGap('r'), false)
+  // The pseudo-session still enforces generation ordering for this player.
+  assert.equal(f.service.accept(event(2, [{ playerId: 'p', levelId: 3, lvSeq: 0, status: 'ACTIVE' }]), 'r'), false)
+  assert.equal(f.service.gapSnapshot('r').rejection.reason, 'old_generation')
+})
+
+test('delta keepalives refresh only incoming players; full reconciles ghosts older than five minutes', () => {
+  let now = 1_000_000
+  const f = fixture({ clock: () => now })
+  assert.equal(f.service.accept(event(1, [observed('frozen'), observed('live')]), 'r'), true)
+  const frozen = f.telemetry.get('frozen')
+  for (let seq = 2; seq <= 5; seq++) {
+    now += 300_000
+    assert.equal(f.service.accept(event(seq, [observed('live')], { kind: 'delta', baseSeq: seq - 1 }), 'r'), true)
+    assert.equal(f.telemetry.get('frozen'), frozen, 'copied delta roster is not a fresh observation')
+    assert.equal(f.telemetry.get('live').receivedAt, now)
+  }
+  // A lifecycle-only ghost is outside the accepted roster and the five-minute view.
+  f.telemetry.upsert('r', observed('ghost'), now - 900_000)
+  f.rooms.trackPlayer('ghost', 'n', 'r', 1, 's-ghost', 1)
+  assert.deepEqual(f.telemetry.listRoom('r', now).map(p => p.playerId), ['live'])
+  assert.equal(f.telemetry.listKnownRoom('r').length, 3)
+  now += 1000
+  assert.equal(f.service.accept(event(6, [observed('live')]), 'r'), true)
+  assert.deepEqual(f.telemetry.listKnownRoom('r').map(p => p.playerId), ['live'])
+  for (const id of ['frozen', 'ghost']) {
+    assert.equal(f.telemetry.get(id), undefined)
+    assert.equal(f.rooms.getPlayerLocation(id), undefined)
+  }
+  assert.equal(f.telemetry.get('live').receivedAt, now)
+  assert.equal(f.service.count('r'), 1)
 })
 
 test('capacity facts validate whole records and never add remote reservations twice', () => {
