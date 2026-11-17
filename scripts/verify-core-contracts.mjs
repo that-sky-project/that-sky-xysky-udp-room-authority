@@ -191,7 +191,7 @@ test('node socket rejects retired events without fanout, while ownership and tel
     send('room.created', { roomId: 'r', udpHost: '127.0.0.1', port: 41000, players: 0, version: 1 });
     await waitUntil(() => runtime.rooms.getRoom('r'), 'room.created not applied');
     const telemetry = (seq, fields = {}) => contracts.NodeEventSchema.parse(event('room.telemetry', {
-      roomId: 'r', seq, kind: 'full', players: [{ playerId: 'p', levelId: 42, position: [1, 2, 3], stateAt: Date.now() }], ...fields
+      roomId: 'r', seq, kind: 'full', players: [{ playerId: 'p', sessionId: 'session-p', lvSeq: 1, status: 'ACTIVE', levelId: 42, position: [1, 2, 3], stateAt: Date.now() }], ...fields
     }));
     assert.equal(gateway.applyNodeEvent(telemetry(1)), true);
     assert.equal(gateway.applyNodeEvent(telemetry(1)), false, 'duplicate sequence is rejected');

@@ -41,15 +41,16 @@ export class RoomTelemetryService {
   public noteJoin(roomId: RoomId, player: PlayerTelemetry): void {
     const roster = this.rosters.get(roomId)
     // The next accepted frame is the observation used for stability; a join is
-    // not a fabricated telemetry revision.
+    // not a fabricated telemetry revision. Roster view only: stability is NOT
+    // reset here, so a stream of visitors joining/leaving cannot freeze
+    // planning for the room's settled core.
     if (roster) roster.players.set(player.playerId, player)
-    this.options.onReset?.(roomId)
   }
   public noteLeave(roomId: RoomId, playerId: PlayerId, sessionId?: string): void {
     const roster = this.rosters.get(roomId)
     const before = roster?.players.get(playerId)
+    // Roster view only; see noteJoin — no stability reset on transient churn.
     if (!sessionId || !before?.sessionId || before.sessionId === sessionId) roster?.players.delete(playerId)
-    this.options.onReset?.(roomId)
   }
 
   public accept(event: INodeEvent, roomId: RoomId): boolean {
@@ -68,8 +69,10 @@ export class RoomTelemetryService {
     const next = delta ? new Map(previous!.players) : new Map<string, PlayerTelemetry>()
     for (const id of data.removedPlayers ?? []) next.delete(id)
     const incoming = new Set<string>()
+    const acceptedIncoming = new Map<string, PlayerTelemetry>()
     for (const player of data.players) {
-      if (incoming.has(player.playerId)) return this.reject(roomId)
+      if (incoming.has(player.playerId) || player.sessionId === undefined ||
+          player.lvSeq === undefined || player.status === undefined) return this.reject(roomId)
       incoming.add(player.playerId)
       const location = rooms.getPlayerLocation(player.playerId)
       if (location && location.roomId !== roomId && location.leavingAt === undefined) {
@@ -82,6 +85,7 @@ export class RoomTelemetryService {
         if (distance >= 128 || (distance === 0 && before.levelId !== undefined && player.levelId !== undefined && before.levelId !== player.levelId)) return this.reject(roomId)
       }
       next.set(player.playerId, { ...player })
+      acceptedIncoming.set(player.playerId, player)
     }
     if (next.size > room.capacity || next.size > 8) return this.reject(roomId)
     const physical = data.physicalPlayers ?? Math.max(next.size, data.activePlayers ?? next.size)
@@ -92,16 +96,24 @@ export class RoomTelemetryService {
     // No awaited work below: all views commit as one synchronous accepted update.
     if (!rooms.acceptTelemetryRoom({ ...room, players: physical, version: seq })) return false
     const oldPlayers = new Map<string, PlayerTelemetry>(previous?.players)
-    if (!delta) for (const player of telemetry.listRoom(roomId)) oldPlayers.set(player.playerId, player)
+    if (!delta) {
+      for (const player of telemetry.listKnownRoom(roomId)) oldPlayers.set(player.playerId, player)
+    }
     for (const before of oldPlayers.values()) if (!next.has(before.playerId)) {
       telemetry.remove(before.playerId, roomId, before.sessionId)
       rooms.removePlayer(before.playerId, roomId, before.sessionId)
     }
-    for (const player of next.values()) {
+    // A delta carries only changed/keepalive players. Refresh exactly those
+    // observations; copied roster entries retain their last real observation
+    // time. A full frame is authoritative for every member in `next`.
+    const refreshed = delta ? acceptedIncoming.values() : next.values()
+    for (const player of refreshed) {
       telemetry.upsert(roomId, player, this.clock())
       rooms.trackPlayer(player.playerId, data.nodeId, roomId, player.levelId, player.sessionId, player.lvSeq)
     }
     this.rosters.set(roomId, { seq, players: next, nodeId: data.nodeId, ...(epoch !== undefined ? { connectedAt: epoch } : {}) })
+    // Stability resets ONLY on an epoch change or a repaired gap — never on
+    // ordinary join/leave churn (see noteJoin/noteLeave).
     if (!sameEpoch || this.gaps.delete(roomId)) this.options.onReset?.(roomId)
     this.options.onAccepted?.()
     return true

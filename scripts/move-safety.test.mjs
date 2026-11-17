@@ -47,13 +47,13 @@ test('partial failures are immutable, idempotent, and completion uses surviving 
     f.moves.executor.execute = async ({ moveId }) => ({ ok: true, moveId });
     const tx = await begin(f, 'manual');
     f.moves.telemetry.tryReserve('b', tx.moveId, 2, 8, 0, 35000);
-    f.moves.ingest(ev('player.join', 'b', { player: { playerId: 'q' } }));
+    f.moves.ingest(ev('player.join', 'b', { player: { playerId: 'q', sessionId: 's-q-target', lvSeq: 1 } }));
     f.moves.ingest(ev('player.leave', 'a', { player: { playerId: 'q' } }));
     f.moves.ingest(ev('move.result', 'a', { moveId: tx.moveId, accepted: false, failedPlayerIds: ['q', 'foreign'] }));
     f.moves.ingest(ev('move.result', 'a', { moveId: tx.moveId, accepted: false, failedPlayerIds: ['q'] }));
     assert.deepEqual(f.moves.list()[0].playerIds, ['p','q']);
     assert.equal(f.moves.telemetry.reserved('b'), 1, 'arrived q converts its slot; remaining p stays held until arrival or cancellation ACK');
-    f.moves.ingest(ev('player.join', 'b', { player: { playerId: 'p' } }));
+    f.moves.ingest(ev('player.join', 'b', { player: { playerId: 'p', sessionId: 's-p-target', lvSeq: 1 } }));
     f.moves.ingest(ev('player.leave', 'a', { player: { playerId: 'p' } }));
     assert.equal(f.moves.list()[0].status, 'completed');
   } finally { await f.cleanup(); }
@@ -91,18 +91,18 @@ test('telemetry gap/version failures are atomic across room, location, roster an
   try {
     const runtime = { ...f, metrics: { inc(){}, set(){} }, events: { record(){} }, reservations: { confirm(){} } };
     const gateway = Object.create(ManagerGateway.prototype); Object.assign(gateway, { runtime, log:logger, metrics:runtime.metrics, telemetrySeq:new Map(), telemetryStaleWarnAt:new Map() });
-    assert.equal(gateway.applyNodeEvent(ev('room.telemetry','a',{seq:1,kind:'full',players:[{playerId:'p',levelId:1,sessionId:'s-p'}]})),true);
-    gateway.applyNodeEvent(ev('room.telemetry','a',{seq:2,kind:'delta',baseSeq:999,players:[{playerId:'evil',levelId:9}]}));
+    assert.equal(gateway.applyNodeEvent(ev('room.telemetry','a',{seq:1,kind:'full',players:[{playerId:'p',levelId:1,sessionId:'s-p',lvSeq:1,status:'ACTIVE'}]})),true);
+    gateway.applyNodeEvent(ev('room.telemetry','a',{seq:2,kind:'delta',baseSeq:999,players:[{playerId:'evil',levelId:9,sessionId:'s-evil',lvSeq:1,status:'ACTIVE'}]}));
     assert.equal(f.rooms.getPlayerLocation('evil'),undefined);
     assert.equal(f.moves.telemetry.get('evil'),undefined);
     assert.equal(f.moves.hasTelemetryGap('a'),true);
     await new Promise(resolve=>setImmediate(resolve)); assert.ok(f.sent.some(command=>command.cmd==='room.sync'));
-    gateway.applyNodeEvent(ev('room.telemetry','a',{seq:3,kind:'delta',baseSeq:1,players:[{playerId:'evil'}]}));
+    gateway.applyNodeEvent(ev('room.telemetry','a',{seq:3,kind:'delta',baseSeq:1,players:[{playerId:'evil',sessionId:'s-evil',lvSeq:1,status:'ACTIVE'}]}));
     assert.equal(f.moves.telemetry.get('evil'),undefined,'gap remains frozen until full');
     gateway.applyNodeEvent(ev('room.telemetry','a',{seq:4,kind:'full',players:[]}));
     assert.equal(f.moves.telemetry.get('p'),undefined); assert.equal(f.rooms.getPlayerLocation('p'),undefined);
     f.rooms.upsertRoom({...room('a'),version:10});
-    gateway.applyNodeEvent(ev('room.telemetry','a',{seq:5,kind:'full',players:[{playerId:'old',levelId:99}]}));
+    gateway.applyNodeEvent(ev('room.telemetry','a',{seq:5,kind:'full',players:[{playerId:'old',levelId:99,sessionId:'s-old',lvSeq:1,status:'ACTIVE'}]}));
     assert.equal(f.rooms.getPlayerLocation('old'),undefined); assert.equal(f.moves.telemetry.get('old'),undefined);
   } finally { await f.cleanup(); }
 });
@@ -111,8 +111,8 @@ test('late source telemetry cannot overwrite a target join; expected-room remova
   store.upsert('a',{playerId:'p',sessionId:'old'}); store.upsert('b',{playerId:'p',sessionId:'new'});
   const f = fixture();
   try {
-    f.moves.ingest(ev('player.join','b',{player:{playerId:'p',sessionId:'new'}}));
-    f.moves.ingest(ev('room.telemetry','a',{seq:2,kind:'full',players:[{playerId:'p',sessionId:'s-p',levelId:99}]}));
+    f.moves.ingest(ev('player.join','b',{player:{playerId:'p',sessionId:'new',lvSeq:1}}));
+    f.moves.ingest(ev('room.telemetry','a',{seq:2,kind:'full',players:[{playerId:'p',sessionId:'s-p',lvSeq:1,status:'ACTIVE',levelId:99}]}));
     assert.equal(f.moves.telemetry.get('p').roomId,'b');
     store.remove('p','a','old'); assert.equal(store.get('p').roomId,'b');
   } finally { void f.cleanup(); }

@@ -131,7 +131,7 @@ export const NodeEventSchema = z
                   .object({
                     playerId: stringId.transform(asPlayerId),
                     sessionId: sessionId.optional(),
-                    lvSeq: z.number().int().nonnegative().optional(),
+                    lvSeq: z.number().int().min(0).max(255).optional(),
                     status: z.enum(['ACTIVE', 'MOVING']).optional(),
                     levelId: z.number().int().nonnegative().optional(),
                     position: z
@@ -140,7 +140,8 @@ export const NodeEventSchema = z
                     velocity: z.number().nonnegative().optional(),
                     stateAt: unixMs.optional(),
                     affinity: z.record(z.number().min(0).max(1)).optional(),
-                    lastMoveAt: unixMs.optional()
+                    lastMoveAt: unixMs.optional(),
+                    isHost: z.boolean().optional()
                   })
                   .passthrough()
                   .transform(value => omitRetiredFields(value, ['benchId', 'seatId']))
@@ -252,6 +253,8 @@ export interface PlayerTelemetry {
   stateAt?: UnixMs | undefined
   affinity?: Record<string, number> | undefined
   lastMoveAt?: UnixMs | undefined
+  /** Reported by the owning node; the manager never computes it. */
+  isHost?: boolean | undefined
 }
 
 export const ManagerCommandSchema = z

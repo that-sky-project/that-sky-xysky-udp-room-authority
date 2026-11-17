@@ -8,18 +8,39 @@ export interface StoredTelemetry extends PlayerTelemetry {
   levelChangedAt?: number | undefined
   roomJoinedAt?: number | undefined
 }
-export interface TelemetryStoreOptions { stateEmaHalfLifeMs: number }
+export interface TelemetryStoreOptions {
+  stateEmaHalfLifeMs: number
+  /** A player with this many level changes inside churnWindowMs is quarantined
+   *  from planning candidates (bond closure still applies). */
+  churnMaxChanges?: number | undefined
+  churnWindowMs?: number | undefined
+  /** Churn quarantine ends only after this long since the last level change
+   *  AND the window condition no longer holds. */
+  churnQuarantineMs?: number | undefined
+}
 interface ReservationHold { expiresAt: number; slots: number }
+const CHURN_BUFFER_CAP = 8
 export class TelemetryStore {
   private readonly players = new Map<PlayerId, StoredTelemetry>()
   private readonly playersByRoom = new Map<RoomId, Set<PlayerId>>()
   private readonly reservations = new Map<RoomId, Map<string, ReservationHold>>()
+  private readonly levelChanges = new Map<PlayerId, number[]>()
+  private readonly churnLatch = new Set<PlayerId>()
   public constructor (private readonly options: TelemetryStoreOptions = { stateEmaHalfLifeMs: 3_000 }) {}
   public upsert (roomId: RoomId, input: PlayerTelemetry, now = Date.now()): StoredTelemetry {
     const previous = this.players.get(input.playerId)
-    // A delayed packet from the same session cannot regress its level sequence.
-    if (previous?.roomId === roomId && previous.sessionId === input.sessionId &&
-        previous.lvSeq !== undefined && input.lvSeq !== undefined && ((input.lvSeq - previous.lvSeq + 256) & 255) >= 128) return previous
+    // Generation ordering is meaningful only for the same explicit server
+    // connection identity. Missing identities must never be treated as the
+    // same session (`undefined === undefined`) or a replacement connection can
+    // be silently frozen at its predecessor's generation.
+    if (previous?.roomId === roomId && previous.sessionId !== undefined &&
+        input.sessionId !== undefined && previous.sessionId === input.sessionId &&
+        previous.lvSeq !== undefined && input.lvSeq !== undefined) {
+      const distance = (input.lvSeq - previous.lvSeq + 256) & 255
+      const conflictingLevel = distance === 0 && previous.levelId !== undefined &&
+        input.levelId !== undefined && input.levelId !== 0 && previous.levelId !== input.levelId
+      if (distance >= 128 || conflictingLevel) return previous
+    }
     const roomChanged = previous !== undefined && previous.roomId !== roomId
     const sessionChanged = previous !== undefined && input.sessionId !== undefined && previous.sessionId !== input.sessionId
     const base = sessionChanged ? undefined : previous
@@ -34,12 +55,39 @@ export class TelemetryStore {
       levelChangedAt: levelChanged ? now : base?.levelChangedAt,
       roomJoinedAt: roomChanged || sessionChanged || previous === undefined ? now : previous.roomJoinedAt ?? now
     }
+    if (levelChanged) this.trackLevelChange(input.playerId, now)
     if (roomChanged) this.playersByRoom.get(previous.roomId)?.delete(input.playerId)
     const index = this.playersByRoom.get(roomId) ?? new Set<PlayerId>()
     index.add(input.playerId)
     this.playersByRoom.set(roomId, index)
     this.players.set(input.playerId, next)
     return next
+  }
+  private trackLevelChange (playerId: PlayerId, now: number): void {
+    const changes = this.levelChanges.get(playerId) ?? []
+    changes.push(now)
+    if (changes.length > CHURN_BUFFER_CAP) changes.splice(0, changes.length - CHURN_BUFFER_CAP)
+    this.levelChanges.set(playerId, changes)
+  }
+  /** True while a player is switching levels faster than the churn window
+   *  allows. Once triggered the quarantine latches until the last change is
+   *  churnQuarantineMs old AND fewer than churnMaxChanges remain inside the
+   *  window. Bonds to a churning player are never waived. */
+  public isChurning (playerId: PlayerId, now = Date.now()): boolean {
+    const changes = this.levelChanges.get(playerId)
+    if (!changes || changes.length === 0) {
+      this.churnLatch.delete(playerId)
+      return false
+    }
+    const maxChanges = this.options.churnMaxChanges ?? 3
+    const windowMs = this.options.churnWindowMs ?? 60_000
+    const quarantineMs = this.options.churnQuarantineMs ?? 120_000
+    let withinWindow = 0
+    for (const at of changes) if (now - at <= windowMs) withinWindow += 1
+    const last = changes[changes.length - 1]!
+    if (withinWindow >= maxChanges) this.churnLatch.add(playerId)
+    else if (now - last >= quarantineMs) this.churnLatch.delete(playerId)
+    return this.churnLatch.has(playerId)
   }
   private smooth (prev: number | undefined, value: number, prevAt: number | undefined, now: number): number {
     if (prev === undefined || prevAt === undefined) return value
@@ -54,6 +102,8 @@ export class TelemetryStore {
     const index = this.playersByRoom.get(current.roomId)
     index?.delete(playerId)
     if (index?.size === 0) this.playersByRoom.delete(current.roomId)
+    this.levelChanges.delete(playerId)
+    this.churnLatch.delete(playerId)
     return true
   }
   public removeRoom (roomId: RoomId): void {
@@ -62,11 +112,33 @@ export class TelemetryStore {
   }
   public get (playerId: PlayerId): StoredTelemetry | undefined { return this.players.get(playerId) }
   public list (): StoredTelemetry[] { return [...this.players.values()] }
+  /** Every indexed observation for a room, including expired entries. Used only
+   *  for authoritative full-snapshot reconciliation and diagnostics; planners
+   *  must use a freshness-bounded view. */
+  public listKnownRoom (roomId: RoomId): StoredTelemetry[] {
+    const result: StoredTelemetry[] = []
+    for (const id of this.playersByRoom.get(roomId) ?? []) {
+      const player = this.players.get(id)
+      if (player) result.push(player)
+    }
+    return result
+  }
   public listRoom (roomId: RoomId, now = Date.now()): StoredTelemetry[] {
     const result: StoredTelemetry[] = []
     for (const id of this.playersByRoom.get(roomId) ?? []) {
       const player = this.players.get(id)
       if (player && now - player.receivedAt <= 5 * 60_000 && player.status !== 'MOVING') result.push(player)
+    }
+    return result
+  }
+  /** Physical roster: every player observed in the room including MOVING ones,
+   *  bounded by the same 5-minute freshness window as listRoom. Hard-bond
+   *  closure must be validated against this list, never the settled view. */
+  public listPhysical (roomId: RoomId, now = Date.now()): StoredTelemetry[] {
+    const result: StoredTelemetry[] = []
+    for (const id of this.playersByRoom.get(roomId) ?? []) {
+      const player = this.players.get(id)
+      if (player && now - player.receivedAt <= 5 * 60_000) result.push(player)
     }
     return result
   }

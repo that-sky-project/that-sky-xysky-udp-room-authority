@@ -138,7 +138,21 @@ export class ManagerHttpApi {
                 return { ...roomData, playerCount: players.length, players }
               })
           }))
-        this.writeJson(res, 200, { code: ErrorCode.OK, data: { nodes } })
+        const plannerByRoom = new Map(
+          this.runtime.moves
+            .stabilitySnapshot()
+            .map(entry => [entry.roomId, entry])
+        )
+        const data = {
+          nodes: nodes.map(node => ({
+            ...node,
+            rooms: node.rooms.map(room => ({
+              ...room,
+              planner: plannerByRoom.get(room.roomId) ?? null
+            }))
+          }))
+        }
+        this.writeJson(res, 200, { code: ErrorCode.OK, data })
         return
       }
       if (method === 'POST' && url.pathname === '/debug/move') {

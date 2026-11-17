@@ -15,6 +15,7 @@ import { loadConfig } from '../dist/config/index.js'
 import { createManagerRuntime } from '../dist/manager-host/ManagerRuntime.js'
 
 const room = (id = 'r', nodeId = 'n') => ({ roomId: id, nodeId, udpHost: '127.0.0.1', udpPort: 41000, capacity: 8, players: 0, version: 0, draining: false })
+const observed = (playerId, extra = {}) => ({ playerId, sessionId: `s-${playerId}`, lvSeq: 1, status: 'ACTIVE', ...extra })
 const event = (seq, players, extra = {}) => ({ event: 'room.telemetry', data: { nodeId: 'n', roomId: 'r', kind: 'full', seq, players, ...extra } })
 function fixture () {
   const rooms = new RoomCache({ maxRooms: 100, staleRoomMs: 600000 })
@@ -30,10 +31,10 @@ const flush = () => new Promise(resolve => setImmediate(resolve))
 
 test('full snapshots validate player generation before any indexed view changes; u8 wrap survives', () => {
   const f = fixture()
-  assert.equal(f.service.accept(event(1, [{ playerId: 'p', sessionId: 's', levelId: 1, lvSeq: 254 }]), 'r'), true)
-  assert.equal(f.service.accept(event(2, [{ playerId: 'p', sessionId: 's', levelId: 2, lvSeq: 255 }]), 'r'), true)
-  assert.equal(f.service.accept(event(3, [{ playerId: 'p', sessionId: 's', levelId: 3, lvSeq: 0 }]), 'r'), true)
-  assert.equal(f.service.accept(event(4, [{ playerId: 'p', sessionId: 's', levelId: 99, lvSeq: 255 }]), 'r'), false)
+  assert.equal(f.service.accept(event(1, [observed('p', { sessionId: 's', levelId: 1, lvSeq: 254 })]), 'r'), true)
+  assert.equal(f.service.accept(event(2, [observed('p', { sessionId: 's', levelId: 2, lvSeq: 255 })]), 'r'), true)
+  assert.equal(f.service.accept(event(3, [observed('p', { sessionId: 's', levelId: 3, lvSeq: 0 })]), 'r'), true)
+  assert.equal(f.service.accept(event(4, [observed('p', { sessionId: 's', levelId: 99, lvSeq: 255 })]), 'r'), false)
   assert.equal(f.rooms.getRoom('r').version, 3)
   assert.equal(f.rooms.getPlayerLocation('p').level, 3)
   assert.equal(f.telemetry.get('p').levelId, 3)
@@ -43,8 +44,8 @@ test('full snapshots validate player generation before any indexed view changes;
 
 test('rejected telemetry cannot sneak room mutations through data.rooms; cumulative roster is bounded', () => {
   const f = fixture()
-  f.service.accept(event(1, Array.from({ length: 8 }, (_, i) => ({ playerId: String(i) }))), 'r')
-  const bad = event(2, [{ playerId: 'ninth' }], { kind: 'delta', baseSeq: 1, rooms: [{ ...room(), players: 0, version: 99 }] })
+  f.service.accept(event(1, Array.from({ length: 8 }, (_, i) => observed(String(i)))), 'r')
+  const bad = event(2, [observed('ninth')], { kind: 'delta', baseSeq: 1, rooms: [{ ...room(), players: 0, version: 99 }] })
   f.rooms.applyNodeEvent(bad)
   assert.equal(f.rooms.getRoom('r').version, 1)
   assert.equal(f.service.accept(bad, 'r'), false)
@@ -54,8 +55,8 @@ test('rejected telemetry cannot sneak room mutations through data.rooms; cumulat
 
 test('session replacement and explicit unknown level clear the old level in every view', () => {
   const f = fixture()
-  f.service.accept(event(1, [{ playerId: 'p', sessionId: 'old', levelId: 42, lvSeq: 5 }]), 'r')
-  f.service.accept(event(2, [{ playerId: 'p', sessionId: 'new', levelId: 0, lvSeq: 0 }]), 'r')
+  f.service.accept(event(1, [observed('p', { sessionId: 'old', levelId: 42, lvSeq: 5 })]), 'r')
+  f.service.accept(event(2, [observed('p', { sessionId: 'new', levelId: 0, lvSeq: 0 })]), 'r')
   assert.equal(f.rooms.getPlayerLocation('p').level, undefined)
   assert.equal(f.telemetry.get('p').levelId, undefined)
   f.service.accept(event(3, []), 'r')
@@ -135,7 +136,7 @@ test('config phase limits project into the real runtime with shared allocation a
   assert.equal(config.moveConfirmationCycles, 3)
   assert.equal(config.movePrepareTimeoutMs, 15000)
   assert.equal(config.moveReservationTtlMs, 35000)
-  assert.equal(config.levelChangeCooldownMs, 8000)
+  assert.equal(config.levelChangeCooldownMs, 6000)
   for (const yaml of ['move: {level_isolation_max_players: 8}', 'rooms: {max_players_per_room: 9}',
     'rooms: {max_players_per_room: 4, preferred_fill_target: 6}', 'move: {retry_base_ms: 20, retry_max_ms: 10}',
     'move: {arrival_timeout_ms: 40000, reservation_ttl_ms: 35000}']) assert.throws(() => configFrom(yaml))

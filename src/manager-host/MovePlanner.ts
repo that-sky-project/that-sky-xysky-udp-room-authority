@@ -20,6 +20,18 @@ export interface MovePlan {
 export interface PlanningContext {
   effectivePlayersOf?: (room: RoomSnapshot) => number
   isCandidateRoom?: (room: RoomSnapshot, role: 'source' | 'target', now: number) => boolean
+  /** Mandatory level isolation bypasses ordinary arrival/remigration cooldowns,
+   *  but still requires a healthy, idle source room. */
+  isIsolationSourceRoom?: (room: RoomSnapshot, now: number) => boolean
+  /** Optional bounded diagnostic hook for planner-internal blockers. */
+  onBlocked?: (roomId: string, reason: string, data?: Record<string, unknown>) => void
+  /** Full physical roster of a room (incl. MOVING players). Hard bonds are
+   *  validated against this roster so a bonded peer on cooldown, on another
+   *  level or MOVING can never be split off by a singleton plan. */
+  physicalPlayersOf?: (roomId: string) => StoredTelemetry[]
+  /** True while a player is flapping levels and must stay out of the
+   *  candidate set; their hard bonds still block partners. */
+  isChurning?: (playerId: string, now: number) => boolean
 }
 
 export interface MovePlannerOptions {
@@ -62,7 +74,7 @@ const DEFAULT_OPTIONS: MovePlannerOptions = {
   isolationPressureWeight: 0.6,
   stalePressureWeight: 0.4,
   clusterSplitPenalty: 0.05,
-  levelChangeCooldownMs: 8_000,
+  levelChangeCooldownMs: 6_000,
   joinSettleMs: 6_000,
   protectedLevels: []
 }
@@ -87,6 +99,12 @@ export class MovePlanner {
   }
   public getWeights (): Readonly<typeof this.weights> {
     return { ...this.weights }
+  }
+  public get levelChangeCooldownMs (): number {
+    return this.options.levelChangeCooldownMs
+  }
+  public get joinSettleMs (): number {
+    return this.options.joinSettleMs
   }
   public activity (
     room: RoomSnapshot,
@@ -198,10 +216,16 @@ export class MovePlanner {
       const roomPlayers = byRoom.get(source.roomId) ?? []
       if (!sourceRoom || roomPlayers.length > 8 || context.isCandidateRoom?.(sourceRoom, 'source', now) === false) continue
       if (this.hasProtected(roomPlayers)) continue
-      if (roomPlayers.some(player => !this.isSettled(player, now))) continue
+      // Only stale telemetry freezes a room: unsettled visitors (join/level
+      // cooldown, MOVING) must never block planning for the settled core.
+      if (this.hasStaleTelemetry(roomPlayers, now)) continue
+      // Bonds are validated against the full physical source roster, so a
+      // bonded peer on cooldown, on another level or MOVING blocks singletons.
+      const bondRoster = context.physicalPlayersOf?.(source.roomId) ?? roomPlayers
       const sourcePlayers = roomPlayers.filter(
         p =>
           this.isSettled(p, now) &&
+          !this.isChurningPlayer(p, now, context) &&
           (!p.lastMigratedAt ||
             now - p.lastMigratedAt >= this.options.moveCooldownMs)
       )
@@ -233,7 +257,8 @@ export class MovePlanner {
         const groups = this.candidateGroups(
           levelPlayers,
           Math.min(levelPlayers.length, capacity),
-          now
+          now,
+          bondRoster
         )
         const clusterMembers = this.clusterMembers(levelPlayers, now)
         for (const group of groups) {
@@ -317,6 +342,16 @@ export class MovePlanner {
       (player.levelChangedAt ?? 0) <= levelCutoff &&
       (player.roomJoinedAt ?? 0) <= joinCutoff
     )
+  }
+  /** Room gate: only players whose telemetry went quiet for more than 10s
+   *  (or is from the future) freeze planning for the whole room. */
+  private hasStaleTelemetry (players: StoredTelemetry[], now: number): boolean {
+    return players.some(
+      player => now - player.receivedAt > 10_000 || player.receivedAt > now
+    )
+  }
+  private isChurningPlayer (player: StoredTelemetry, now: number, context: PlanningContext): boolean {
+    return context.isChurning?.(player.playerId as string, now) ?? false
   }
   private velocityOf (p: StoredTelemetry): number {
     return p.emaVelocity ?? p.velocity ?? 0
@@ -502,7 +537,8 @@ export class MovePlanner {
   private candidateGroups (
     players: StoredTelemetry[],
     maxSize: number,
-    now: number
+    now: number,
+    bondRoster: StoredTelemetry[]
   ): StoredTelemetry[][] {
     const limit = Math.min(maxSize, players.length, 7)
     if (limit <= 0) return []
@@ -510,7 +546,7 @@ export class MovePlanner {
     const seen = new Set<string>()
     const add = (group: StoredTelemetry[]): void => {
       if (group.length === 0 || group.length > limit) return
-      if (!this.respectsHardRelations(group, players)) return
+      if (!this.respectsHardRelations(group, bondRoster)) return
       const key = group
         .map(p => p.playerId)
         .slice()

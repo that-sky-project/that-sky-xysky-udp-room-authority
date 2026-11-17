@@ -36,7 +36,7 @@ export const configSchema = z.object({
     cluster_radius: z.number().finite().positive().default(12), isolation_pressure_weight: unit(0.6), stale_pressure_weight: unit(0.4),
     merge_pressure_threshold: unit(0.25), minimum_gain: z.number().finite().default(0.15),
     level_isolation_min_level_players: integer(1, 7), level_isolation_max_players: integer(7, 7),
-    level_isolation_sparse_room_threshold: integer(2, 8), level_change_cooldown_ms: integer(8_000, 120_000),
+    level_isolation_sparse_room_threshold: integer(2, 8), level_change_cooldown_ms: integer(6_000, 120_000),
     join_settle_ms: integer(6_000, 120_000), protected_levels: levelIds
   }).strict().default({}),
   debug: z.object({ api_token: z.string().default(''), log_buffer_size: integer(2000) }).strict().default({})

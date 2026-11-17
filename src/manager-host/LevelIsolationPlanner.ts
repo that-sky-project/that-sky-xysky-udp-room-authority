@@ -1,6 +1,7 @@
 import type { RoomSnapshot } from '../types/contracts.js'
 import type { Logger } from '../infra/logger/logger.js'
 import type { PlanningContext } from './MovePlanner.js'
+import type { PlayerId } from '../types/branded.js'
 import type { StoredTelemetry, TelemetryStore } from './TelemetryStore.js'
 export interface LevelIsolationPlan {
   playerIds: string[]
@@ -45,7 +46,7 @@ const DEFAULT_OPTIONS: LevelIsolationOptions = {
   // failed wholesale at commit and fell back to single-player migrations.
   maxPlayersPerMove: 7,
   sparseRoomThreshold: 2,
-  levelChangeCooldownMs: 8_000,
+  levelChangeCooldownMs: 6_000,
   joinSettleMs: 6_000,
   protectedLevels: []
 }
@@ -63,6 +64,9 @@ export class LevelIsolationPlanner {
       )
     )
   }
+  public get levelChangeCooldownMs (): number {
+    return this.options.levelChangeCooldownMs
+  }
   public plan (
     rooms: RoomSnapshot[],
     telemetry: TelemetryStore,
@@ -76,17 +80,25 @@ export class LevelIsolationPlanner {
     let budget = this.options.maxPlayersPerMove * Math.max(1, rooms.length)
     const occupancy = new Map<string, number>()
     const byRoom = new Map<string, StoredTelemetry[]>()
-    // Index once: TelemetryStore.listRoom used to scan every player for each room.
-    for (const player of telemetry.list()) {
-      const players = byRoom.get(player.roomId) ?? []
-      players.push(player)
-      byRoom.set(player.roomId, players)
-    }
+    const physicalByRoom = new Map<string, StoredTelemetry[]>()
+    // Isolation acts only on observations fresh enough to execute safely. Older
+    // records remain in the bounded physical roster for hard-bond closure and
+    // capacity, but an unrelated frozen record cannot poison the whole room.
     for (const room of rooms) {
-      const players = byRoom.get(room.roomId) ?? []
-      byRoom.set(room.roomId, players)
-      occupancy.set(room.roomId, context.effectivePlayersOf?.(room) ?? Math.max(room.players, players.length))
+      const observed = telemetry.list()
+        .filter(player => player.roomId === room.roomId && player.receivedAt <= now && now - player.receivedAt <= 10_000)
+      byRoom.set(room.roomId, observed)
+      const fallbackPhysical = typeof telemetry.listPhysical === 'function'
+        ? telemetry.listPhysical(room.roomId, now)
+        : telemetry.list().filter(player => player.roomId === room.roomId)
+      physicalByRoom.set(room.roomId,
+        context.physicalPlayersOf?.(room.roomId) ?? fallbackPhysical)
+      occupancy.set(room.roomId, context.effectivePlayersOf?.(room) ?? Math.max(room.players, observed.length))
     }
+    // Churn is useful only for optional balancing/consolidation. Mandatory
+    // level isolation obeys the six-second settle window and must eventually
+    // move a coherent group even if its members switched maps repeatedly.
+    const churningIds = new Set<string>()
     const levelsByRoom = new Map<string, Set<number>>()
     for (const [roomId, players] of byRoom) {
       levelsByRoom.set(
@@ -102,8 +114,8 @@ export class LevelIsolationPlanner {
     for (const room of rooms) {
       if (budget <= 0) break
       let players = byRoom.get(room.roomId) ?? []
-      if (room.draining || players.length > 8 || this.hasUnsettled(players, now) ||
-          context.isCandidateRoom?.(room, 'source', now) === false) continue
+      if (room.draining || players.length > 8 ||
+          (context.isIsolationSourceRoom?.(room, now) ?? context.isCandidateRoom?.(room, 'source', now)) === false) continue
       let forcedGroups: RoomLevelGroup[] = []
       const protectedPlayers =
         this.protectedLevels.size > 0
@@ -112,11 +124,11 @@ export class LevelIsolationPlanner {
       if (protectedPlayers.length > 0) {
         const others = players.filter(p => !this.isProtectedLevel(p.levelId))
         if (others.length === 0) continue
-        forcedGroups = this.groupByLevel(others, now)
+        forcedGroups = this.groupByLevel(others, now, churningIds)
         if (forcedGroups.length === 0) continue
       }
       let groups =
-        protectedPlayers.length > 0 ? [] : this.groupByLevel(players, now)
+        protectedPlayers.length > 0 ? [] : this.groupByLevel(players, now, churningIds)
       while ((forcedGroups.length > 0 || groups.length >= 2) && budget > 0) {
         const forced = forcedGroups.shift()
         const source: RoomLevelGroup | undefined =
@@ -126,7 +138,7 @@ export class LevelIsolationPlanner {
           break
         const movable = this.filterByAffinity(source.players.filter(
           p => !claimedPlayers.has(p.playerId as string)
-        ), players, claimedPlayers)
+        ), physicalByRoom.get(room.roomId) ?? players, claimedPlayers)
         if (movable.length === 0) {
           // Defer a conflicting bond, but still permit unrelated coherent groups.
           if (forced) continue
@@ -172,6 +184,11 @@ export class LevelIsolationPlanner {
             },
             'level isolation: no target fits the bonded group'
           )
+          context.onBlocked?.(room.roomId as string, 'isolation_no_target', {
+            levelId: source.levelId,
+            playerIds: movable.map(player => player.playerId),
+            emptyRooms: [...occupancy.values()].filter(v => v === 0).length
+          })
           if (forced) continue
           break
         }
@@ -208,7 +225,7 @@ export class LevelIsolationPlanner {
           levelsByRoom.get(room.roomId)?.delete(source.levelId)
         }
         if (forced) continue
-        groups = this.groupByLevel(players, now)
+        groups = this.groupByLevel(players, now, churningIds)
       }
     }
     this.consolidateSparseSameLevel(
@@ -223,7 +240,8 @@ export class LevelIsolationPlanner {
       budget,
       now,
       log,
-      context
+      context,
+      churningIds
     )
     return plans
   }
@@ -239,7 +257,8 @@ export class LevelIsolationPlanner {
     budget: number,
     now: number,
     log?: Logger,
-    context: PlanningContext = {}
+    context: PlanningContext = {},
+    churningIds: Set<string> = new Set()
   ): void {
     const threshold = this.options.sparseRoomThreshold
     const sparseByLevel = new Map<
@@ -296,6 +315,7 @@ export class LevelIsolationPlanner {
           p =>
             p.levelId === levelId &&
             !claimedPlayers.has(p.playerId as string) &&
+            !churningIds.has(p.playerId as string) &&
             this.isSettled(p, now)
         )
         const sourcePlayers = this.filterByAffinity(
@@ -403,11 +423,13 @@ export class LevelIsolationPlanner {
   }
   private groupByLevel (
     players: StoredTelemetry[],
-    now: number
+    now: number,
+    churningIds: Set<string> = new Set()
   ): RoomLevelGroup[] {
     const byLevel = new Map<number, StoredTelemetry[]>()
     for (const player of players) {
       if (player.levelId === undefined) continue
+      if (churningIds.has(player.playerId as string)) continue
       if (!this.isSettled(player, now)) continue
       const group = byLevel.get(player.levelId) ?? []
       group.push(player)
@@ -430,7 +452,10 @@ export class LevelIsolationPlanner {
   ): StoredTelemetry[] {
     const candidateIds = new Set(candidates.map(p => p.playerId as string))
     // Reject an entire connected component when any hard-bond mate is outside
-    // the coherent level/settled candidate set. Never expand across levels.
+    // the coherent level/settled candidate set. `allRoomPlayers` is the room's
+    // full physical roster (incl. MOVING and churning players), so bonds to a
+    // peer that is MOVING, mid-cooldown or churning still block the partner.
+    // Never expand across levels.
     const blocked = new Set<string>()
     let changed = true
     while (changed) {
@@ -473,8 +498,17 @@ export class LevelIsolationPlanner {
     return (
       now - player.receivedAt <= 10_000 &&
       player.receivedAt <= now &&
+      player.status !== 'MOVING' &&
       (player.levelChangedAt ?? 0) <= levelCutoff &&
       (player.roomJoinedAt ?? 0) <= joinCutoff
+    )
+  }
+  /** A stale player is excluded from isolation candidates, not used as a
+   *  room-wide veto. The manager requests a full sync separately while fresh,
+   *  unrelated level groups continue to be isolated. */
+  private hasStale (players: StoredTelemetry[], now: number): boolean {
+    return players.some(
+      player => now - player.receivedAt > 10_000 || player.receivedAt > now
     )
   }
   private hasUnsettled (players: StoredTelemetry[], now: number): boolean {

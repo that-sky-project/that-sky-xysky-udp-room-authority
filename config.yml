@@ -102,7 +102,7 @@ move:
   # joined a room (in-game "join friend" teleport / cross-room move), is still
   # loading and is excluded from level grouping and migration decisions until
   # the window passes. The room itself stays usable for its other players.
-  level_change_cooldown_ms: 8000
+  level_change_cooldown_ms: 6000
   join_settle_ms: 6000
   # Temporary quarantine for a specific map (level id). While a player is on
   # this level nobody in their room is migrated or merged, and allocation keeps
