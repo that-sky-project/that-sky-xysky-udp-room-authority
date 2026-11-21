@@ -10,6 +10,7 @@ import type {
   RoomSnapshot
 } from '../types/contracts.js'
 import { ErrorCode, HermesError } from '../types/errors.js'
+import { parseUdpHost } from '../types/udpEndpoint.js'
 export interface CrossCoordinatorOptions {
   commandTimeoutMs: number
   reservationTtlMs?: number
@@ -95,6 +96,11 @@ export class CrossCoordinator {
     },
     signal?: AbortSignal
   ): Promise<INodeAck> {
+    if (parseUdpHost(plan.to.udpHost)?.kind !== 'ipv4' || !Number.isInteger(plan.to.udpPort) ||
+        plan.to.udpPort < 1 || plan.to.udpPort > 65535) {
+      throw new HermesError(ErrorCode.PROTOCOL_ERROR, 'move destination must be a resolved IPv4 UDP endpoint')
+    }
+    if (plan.to.expiresAt <= Date.now()) throw new HermesError(ErrorCode.STALE_PLAN, 'move destination lease expired')
     const firstPlayerId = plan.playerIds[0]
     if (!firstPlayerId)
       throw new HermesError(ErrorCode.BAD_REQUEST, 'move has no players')

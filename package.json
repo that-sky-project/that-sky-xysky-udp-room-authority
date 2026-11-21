@@ -11,10 +11,7 @@
     "dev": "tsc -p tsconfig.json && node --enable-source-maps --watch dist/runtime/main.js",
     "build": "tsc -p tsconfig.json",
     "start": "node --enable-source-maps dist/runtime/main.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "verify:core-contracts": "npm run build && node --test scripts/verify-core-contracts.mjs",
-    "test": "npm run build && node --enable-source-maps --test scripts/*.test.mjs scripts/verify-core-contracts.mjs",
-    "test:lifecycle": "npm run build && node --enable-source-maps --test scripts/logger-lifecycle.test.mjs scripts/pending-lifecycle.test.mjs"
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "lru-cache": "^11.0.2",

@@ -1,5 +1,4 @@
-import { resolve4 } from 'node:dns/promises'
-import { isIP } from 'node:net'
+import { UdpEndpointResolver, type UdpResolutionScope } from './UdpEndpointResolver.js'
 import type { CrossCoordinator } from './CrossCoordinator.js'
 import { applyCapacityFacts } from './CapacityFacts.js'
 import type { DebugEventInput, DebugEventLog } from './DebugEventLog.js'
@@ -8,7 +7,7 @@ import type { PolicyEngine } from './PolicyEngine.js'
 import type { ReservationTracker } from './ReservationTracker.js'
 import type { RoomCache } from './RoomCache.js'
 import type { Logger } from '../infra/logger/logger.js'
-import { asUdpHost, asUnixMs, type PlayerId, type RoomId, type UdpHost } from '../types/branded.js'
+import { asUnixMs, type PlayerId, type RoomId, type UdpHost } from '../types/branded.js'
 import type {
   IAllocationReply,
   IAllocationRequest,
@@ -27,7 +26,7 @@ export interface RequestRouterOptions {
   retryBaseMs?: number
   retryMaxMs?: number
   maxAttempts?: number
-  resolveIpv4?: (hostname: string) => Promise<string[]>
+  endpoints?: UdpEndpointResolver
 }
 
 interface AllocationFlight {
@@ -41,6 +40,8 @@ const EMPTY_LEVELS: ReadonlySet<number> = new Set<number>()
 export class RequestRouter {
   private stopped = false
   private readonly flights = new Map<PlayerId, AllocationFlight>()
+  private readonly endpoints: UdpEndpointResolver
+  private readonly ownsEndpoints: boolean
   private readonly backoff = new Map<RoomId, { failures: number; until: number }>()
 
   public constructor (
@@ -56,7 +57,10 @@ export class RequestRouter {
     private readonly events?: DebugEventLog,
     /** Shared occupancy includes allocation and migration holds exactly once. */
     private readonly effectivePlayersOf?: (room: RoomSnapshot) => number
-  ) {}
+  ) {
+    this.ownsEndpoints = !options.endpoints
+    this.endpoints = options.endpoints ?? new UdpEndpointResolver()
+  }
 
   public async allocate (
     request: IAllocationRequest,
@@ -100,19 +104,27 @@ export class RequestRouter {
     if (this.stopped) return
     this.stopped = true
     for (const flight of this.flights.values()) flight.controller.abort(this.cancelled())
+    if (this.ownsEndpoints) this.endpoints.stop()
     this.backoff.clear()
   }
 
   private async requestRoom (
     request: IAllocationRequest,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    scope: UdpResolutionScope = this.endpoints.createScope(signal),
+    retries = 0
   ): Promise<IAllocationReply> {
+    if (retries >= 3) throw new HermesError(ErrorCode.STALE_PLAN, 'allocation room changed repeatedly during address resolution')
     const playerId = request.playerId
     const knownLocation = this.rooms.getPlayerLocation(playerId)
     if (knownLocation) {
       const room = this.rooms.getRoom(knownLocation.roomId)
       if (room) {
-        const udpHost = await this.resolveUdpHost(room, signal)
+        const endpoint = await scope.resolve(room)
+        if (this.rooms.getPlayerLocation(playerId)?.roomId !== room.roomId || !this.sameEndpoint(room)) {
+          return this.requestRoom(request, signal, scope, retries + 1)
+        }
+        const udpHost = endpoint.udpHost
         this.log?.info(
           {
             playerId,
@@ -142,7 +154,8 @@ export class RequestRouter {
     if (held) {
       const room = this.rooms.getRoom(held.roomId)
       if (room) {
-        const udpHost = await this.resolveUdpHost(room, signal)
+        const { udpHost } = await scope.resolve(room)
+        if (!this.sameEndpoint(room)) return this.requestRoom(request, signal, scope, retries + 1)
         if (this.reservations.confirmedHoldFor(playerId) === held) {
           this.record({
             category: 'allocation', event: 'allocation.reused',
@@ -204,12 +217,18 @@ export class RequestRouter {
 
       attempts += 1
       try {
-        const udpHost = await this.resolveUdpHost(selection.room, signal)
+        const { udpHost } = await scope.resolve(selection.room)
+        if (!this.sameEndpoint(selection.room)) throw new HermesError(ErrorCode.STALE_PLAN, 'allocation target endpoint changed')
+        if (this.reservations.roomFor(playerId) !== selection.room.roomId) throw new HermesError(ErrorCode.STALE_PLAN, 'allocation hold expired during DNS')
+        const connectedAt = this.nodes.getTransport?.(selection.room.nodeId)?.connectedAt
         const ack = await this.withSignal(this.coordinator.reserveRoom(
           selection.room,
           playerId,
           signal
         ), signal)
+        if (!this.sameEndpoint(selection.room) || this.nodes.getTransport?.(selection.room.nodeId)?.connectedAt !== connectedAt) {
+          throw new HermesError(ErrorCode.STALE_PLAN, 'allocation target changed while reserving')
+        }
         this.applyFacts(selection.room, ack)
         if (ack.code !== ErrorCode.OK) {
           throw new HermesError(
@@ -351,23 +370,10 @@ export class RequestRouter {
     this.events?.record(event)
   }
 
-  private async resolveUdpHost (room: RoomSnapshot, signal?: AbortSignal): Promise<UdpHost> {
-    if (signal?.aborted) throw signal.reason ?? this.cancelled()
-    if (!(room.isDomainNode ?? isIP(room.udpHost) === 0)) return room.udpHost
-    try {
-      const addresses = await this.withSignal((this.options.resolveIpv4 ?? resolve4)(room.udpHost), signal)
-      const address = addresses.find(value => isIP(value) === 4)
-      if (!address) throw new Error('DNS returned no IPv4 address')
-      return asUdpHost(address)
-    } catch (error) {
-      if (signal?.aborted) throw signal.reason ?? this.cancelled()
-      this.log?.warn({ err: error, roomId: room.roomId, nodeId: room.nodeId, udpHost: room.udpHost }, 'allocation DNS resolution failed')
-      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'room UDP hostname could not be resolved to IPv4', {
-        roomId: room.roomId,
-        nodeId: room.nodeId,
-        hostname: room.udpHost
-      })
-    }
+  private sameEndpoint (room: RoomSnapshot): boolean {
+    const current = this.rooms.getRoom(room.roomId)
+    return current !== undefined && current.nodeId === room.nodeId &&
+      current.udpHost === room.udpHost && current.udpPort === room.udpPort
   }
 
   private assignmentFor (

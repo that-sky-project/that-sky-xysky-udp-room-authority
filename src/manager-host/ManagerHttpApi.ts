@@ -6,10 +6,15 @@ import type { Logger } from '../infra/logger/logger.js'
 import { jsonStringify } from '../infra/ws/json.js'
 import type { ManagerRuntime } from './ManagerRuntime.js'
 import type { MetricsRegistry } from './MetricsRegistry.js'
-import { asNodeId, asPlayerId, asRoomId, type PlayerId } from '../types/branded.js'
+import { asNodeId, asPlayerId, asRoomId } from '../types/branded.js'
 import { AllocationRequestSchema, BatchRoomLookupSchema, NodeEventSchema, type INodeEvent, type RoomLookup } from '../types/contracts.js'
 import { ErrorCode, HermesError, isHermesError } from '../types/errors.js'
-interface HttpPorts { signal: AbortSignal; isStopping(): boolean; refreshMetrics(): void; applyEvent(event: INodeEvent): boolean }
+interface HttpPorts {
+  signal: AbortSignal
+  isStopping(): boolean
+  refreshMetrics(): void
+  applyEvent(event: INodeEvent): boolean
+}
 const isPlanningEvent = (event: INodeEvent): boolean => ['room.telemetry', 'player.join', 'player.leave'].includes(event.event)
 
 /** HTTP routes own parsing and presentation, not socket lifecycle or business stores. */
@@ -201,8 +206,8 @@ export class ManagerHttpApi {
         if (!encodedPlayerId)
           throw new HermesError(ErrorCode.BAD_REQUEST, 'playerId is required')
         const playerId = asPlayerId(decodeURIComponent(encodedPlayerId))
-
-        const data = this.lookupRoom(playerId)
+        const lookupSignal = this.createLookupSignal()
+        const data = await this.runtime.roomLookup.lookup(playerId, lookupSignal)
         if (!data)
           throw new HermesError(
             ErrorCode.NOT_FOUND,
@@ -217,13 +222,7 @@ export class ManagerHttpApi {
         const request = BatchRoomLookupSchema.parse(
           JSON.parse(await this.readBody(req, 256 * 1024))
         )
-        const rooms: Record<
-          string,
-          ReturnType<ManagerHttpApi['lookupRoom']>
-        > = {}
-        for (const playerId of request.playerIds) {
-          rooms[playerId] = this.lookupRoom(asPlayerId(playerId))
-        }
+        const rooms = await this.runtime.roomLookup.lookupMany(request.playerIds.map(asPlayerId), this.createLookupSignal())
         this.writeJson(res, 200, { code: ErrorCode.OK, data: { rooms } })
         return
       }
@@ -257,6 +256,8 @@ export class ManagerHttpApi {
       case ErrorCode.CONFLICT: return 409
       case ErrorCode.BAD_REQUEST: return 400
       case ErrorCode.PAYLOAD_TOO_LARGE: return 413
+      case ErrorCode.NODE_UNAVAILABLE: return 503
+      case ErrorCode.NODE_TIMEOUT: return 504
       default: return 400
     }
   }
@@ -278,24 +279,11 @@ export class ManagerHttpApi {
     }
   }
 
-  private lookupRoom (playerId: PlayerId): RoomLookup | null {
-    const location = this.runtime.rooms.getPlayerLocation(playerId)
-    if (!location) return null
-
-    const room = this.runtime.rooms.getRoom(location.roomId)
-    if (!room) return null
-
-    const telemetry = this.runtime.moves.telemetry.get(playerId)
-    return {
-      playerId,
-      roomId: room.roomId,
-      udp: { host: room.udpHost, port: room.udpPort },
-      players: room.players,
-      capacity: room.capacity,
-      level: location.level ?? null,
-      levelId: telemetry?.levelId ?? null,
-      updatedAt: location.updatedAt
-    }
+  private createLookupSignal (): AbortSignal {
+    return AbortSignal.any([
+      this.ports.signal,
+      AbortSignal.timeout(this.config.allocationRequestTimeoutMs)
+    ])
   }
 
   private requireDebugToken (req: IncomingMessage): void {

@@ -1,4 +1,4 @@
-import { isIP } from 'node:net'
+import { isDomainUdpHost } from '../types/udpEndpoint.js'
 import type { NodeId, UnixMs } from '../types/branded.js'
 import { asUnixMs } from '../types/branded.js'
 import type {
@@ -71,7 +71,7 @@ export class NodeRegistry {
       nodeId: event.data.nodeId,
       isDomainNode:
         (event.event === 'room.created' || event.event === 'room.updated') && event.data.udpHost !== undefined
-          ? isIP(event.data.udpHost) === 0
+          ? isDomainUdpHost(event.data.udpHost)
           : existing?.isDomainNode ?? false,
       load: event.data.load ?? existing?.load ?? 0,
       capacity:

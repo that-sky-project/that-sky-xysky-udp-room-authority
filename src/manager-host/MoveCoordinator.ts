@@ -14,6 +14,7 @@ import type { RoomCache } from './RoomCache.js'
 import { MovePlanner, type MovePlan, type MovePlannerOptions } from './MovePlanner.js'
 import { TelemetryStore } from './TelemetryStore.js'
 import { LevelIsolationPlanner, type LevelIsolationPlan, type LevelIsolationOptions } from './LevelIsolationPlanner.js'
+import type { UdpEndpointResolver } from './UdpEndpointResolver.js'
 import { MoveExecutor, type MoveExecuteOutcome } from './MoveExecutor.js'
 
 export interface MoveCoordinatorOptions {
@@ -29,7 +30,7 @@ export interface MoveCoordinatorOptions {
   arrivalCooldownMs?: number
   remigrateCooldownMs?: number
   effectivePlayersOf?: ((room: RoomSnapshot) => number) | undefined
-  resolveIpv4?: (hostname: string) => Promise<string[]>
+  endpoints?: UdpEndpointResolver
   stateEmaHalfLifeMs?: number
   confirmationCycles?: number
   planner?: Partial<MovePlannerOptions>
@@ -102,7 +103,12 @@ export class MoveCoordinator {
       reservationTtlMs: options.reservationTtlMs ?? 35_000, prepareTtlMs: options.reservationTtlMs ?? 35_000,
       prepareTimeoutMs: options.prepareTimeoutMs ?? options.moveTransactionTimeoutMs ?? 15_000,
       redirectTtlMs: options.arrivalTimeoutMs ?? 30_000,
-      ...(options.resolveIpv4 ? { resolveIpv4: options.resolveIpv4 } : {}),
+      ...(options.endpoints ? { endpoints: options.endpoints } : {}),
+      validateTarget: expected => {
+        const current = rooms.getRoom(expected.roomId)
+        return current !== undefined && current.nodeId === expected.nodeId &&
+          current.udpHost === expected.udpHost && current.udpPort === expected.udpPort
+      },
       effectivePlayersOf: room => options.effectivePlayersOf?.(room) ?? this.effectivePlayers(room),
       applyTargetFacts: (room, facts) => this.applyTargetFacts(room, facts)
     }, log)

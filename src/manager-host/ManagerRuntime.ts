@@ -8,6 +8,8 @@ import { RequestRouter } from './RequestRouter.js'
 import { RoomCache } from './RoomCache.js'
 import { MoveCoordinator } from './MoveCoordinator.js'
 import { MetricsRegistry } from './MetricsRegistry.js'
+import { UdpEndpointResolver, type UdpEndpointResolverOptions } from './UdpEndpointResolver.js'
+import { RoomLookupService } from './RoomLookupService.js'
 import type { ManagerConfig } from '../config/index.js'
 import type { Logger } from '../infra/logger/logger.js'
 export interface ManagerRuntime {
@@ -21,11 +23,15 @@ export interface ManagerRuntime {
   moves: MoveCoordinator
   metrics: MetricsRegistry
   events: DebugEventLog
+  endpoints: UdpEndpointResolver
+  roomLookup: RoomLookupService
 }
 export const createManagerRuntime = (
   config: ManagerConfig,
-  logger?: Logger
+  logger?: Logger,
+  endpointOptions: UdpEndpointResolverOptions = {}
 ): ManagerRuntime => {
+  const endpoints = new UdpEndpointResolver(endpointOptions)
   const metrics = new MetricsRegistry()
   const events = new DebugEventLog(config.debugLogBufferSize)
   const nodes = new NodeRegistry({
@@ -66,6 +72,7 @@ export const createManagerRuntime = (
     pending,
     coordinator,
     {
+      endpoints,
       moveBudgetPerCycle: config.moveBudgetPerCycle,
       prepareTimeoutMs: config.movePrepareTimeoutMs,
       arrivalTimeoutMs: config.moveArrivalTimeoutMs,
@@ -113,6 +120,7 @@ export const createManagerRuntime = (
     reservations,
     coordinator,
     {
+      endpoints,
       nodeStaleMs: config.nodeStaleMs,
       assignmentTtlMs: config.assignmentTtlMs,
       candidateRoomLimit: config.candidateRoomLimit,
@@ -128,6 +136,8 @@ export const createManagerRuntime = (
     room => moves.effectivePlayers(room) + reservations.count(room.roomId)
   )
   return {
+    endpoints,
+    roomLookup: new RoomLookupService(rooms, moves.telemetry, endpoints),
     nodes,
     rooms,
     pending,

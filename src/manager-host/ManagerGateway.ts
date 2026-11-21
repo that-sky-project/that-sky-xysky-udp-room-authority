@@ -207,6 +207,7 @@ export class ManagerGateway {
   private async drain (): Promise<void> {
     const server = this.server
     const nodeServer = this.nodeServer
+    this.runtime.endpoints.stop()
     this.runtime.router.stop()
     this.runtime.pending.close(new HermesError(ErrorCode.NODE_UNAVAILABLE, 'manager is shutting down'))
     const movesStopped = this.runtime.moves.stop()

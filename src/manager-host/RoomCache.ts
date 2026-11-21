@@ -1,4 +1,4 @@
-import { isIP } from 'node:net'
+import { parseUdpHost } from '../types/udpEndpoint.js'
 import { LRUCache } from 'lru-cache'
 import type {
   NodeId,
@@ -71,8 +71,10 @@ export class RoomCache {
     if (previous && previous.nodeId !== room.nodeId) {
       this.roomsByNode.get(previous.nodeId)?.delete(room.roomId)
     }
+    const endpoint = parseUdpHost(room.udpHost)
+    if (!endpoint) return false
     this.removeCandidateIndex(room.roomId)
-    const next = { ...room, isDomainNode: isIP(room.udpHost) === 0, lastChangedAt: asUnixMs(Date.now()) }
+    const next = { ...room, udpHost: endpoint.host, isDomainNode: endpoint.kind === 'hostname', lastChangedAt: asUnixMs(Date.now()) }
     this.rooms.set(room.roomId, next)
     this.indexRoom(room.nodeId, room.roomId)
     this.indexCandidate(next)

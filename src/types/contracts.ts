@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { parseUdpHost } from './udpEndpoint.js'
 import type {
   CommandId,
   NodeId,
@@ -23,6 +24,14 @@ import {
 } from './branded.js'
 
 const stringId = z.string().min(1).max(128)
+const udpHost = z.string().min(1).max(255).transform((value, ctx) => {
+  const parsed = parseUdpHost(value)
+  if (!parsed) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'expected UDP host without URL or port' })
+    return z.NEVER
+  }
+  return parsed.host
+})
 // Node ConnectionSession uses positive numeric ids. Normalize only validated
 // numeric ids; do not coerce null, booleans or arbitrary objects into identities.
 const sessionId = z.union([
@@ -62,7 +71,7 @@ export const RoomSnapshotSchema = z
   .object({
     roomId: stringId.transform(asRoomId),
     nodeId: stringId.transform(asNodeId),
-    udpHost: z.string().min(1).max(255).transform(asUdpHost),
+    udpHost: udpHost,
     udpPort: port,
     players: z.number().int().min(0).max(8),
     capacity: z.number().int().min(1).max(8).default(8),
@@ -122,7 +131,7 @@ export const NodeEventSchema = z
         nodeId: stringId.transform(asNodeId).optional(),
         roomId: stringId.transform(asRoomId).optional(),
         port: port.optional(),
-        udpHost: z.string().min(1).max(255).transform(asUdpHost).optional(),
+        udpHost: udpHost.optional(),
         player: PlayerSchema.optional(),
         players: z
           .union([
