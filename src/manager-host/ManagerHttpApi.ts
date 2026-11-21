@@ -118,9 +118,16 @@ export class ManagerHttpApi {
       }
       if (method === 'GET' && url.pathname === '/debug/allnode') {
         this.requireDebugToken(req)
+        const summary = { totalPlayers: 0, occupiedRooms: 0, totalRooms: 0 }
+        for (const room of this.runtime.rooms.listRooms()) {
+          summary.totalPlayers += room.players
+          if (room.players > 0) summary.occupiedRooms += 1
+          summary.totalRooms += 1
+        }
         const nodes = this.runtime.nodes
           .listHealth()
-          .map(({ nodeId: internalNodeId, ...node }) => ({
+          .map(({ nodeId: internalNodeId, circuitOpenUntil: _circuitOpenUntil,
+            consecutiveFailures: _consecutiveFailures, backpressureBytes: _backpressureBytes, ...node }) => ({
             ...node,
             rooms: this.runtime.rooms
               .listRoomsByNode(internalNodeId)
@@ -144,6 +151,7 @@ export class ManagerHttpApi {
             .map(entry => [entry.roomId, entry])
         )
         const data = {
+          summary,
           nodes: nodes.map(node => ({
             ...node,
             rooms: node.rooms.map(room => ({

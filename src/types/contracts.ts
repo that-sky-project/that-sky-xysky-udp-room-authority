@@ -75,7 +75,9 @@ export const RoomSnapshotSchema = z
   })
   .strict()
 
-export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema>
+export type RoomSnapshot = z.infer<typeof RoomSnapshotSchema> & {
+  isDomainNode?: boolean
+}
 
 export const AllocationRequestSchema = z
   .object({

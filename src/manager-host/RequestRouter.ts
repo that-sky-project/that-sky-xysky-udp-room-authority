@@ -1,3 +1,5 @@
+import { resolve4 } from 'node:dns/promises'
+import { isIP } from 'node:net'
 import type { CrossCoordinator } from './CrossCoordinator.js'
 import { applyCapacityFacts } from './CapacityFacts.js'
 import type { DebugEventInput, DebugEventLog } from './DebugEventLog.js'
@@ -6,7 +8,7 @@ import type { PolicyEngine } from './PolicyEngine.js'
 import type { ReservationTracker } from './ReservationTracker.js'
 import type { RoomCache } from './RoomCache.js'
 import type { Logger } from '../infra/logger/logger.js'
-import { asUnixMs, type PlayerId, type RoomId } from '../types/branded.js'
+import { asUdpHost, asUnixMs, type PlayerId, type RoomId, type UdpHost } from '../types/branded.js'
 import type {
   IAllocationReply,
   IAllocationRequest,
@@ -25,6 +27,7 @@ export interface RequestRouterOptions {
   retryBaseMs?: number
   retryMaxMs?: number
   maxAttempts?: number
+  resolveIpv4?: (hostname: string) => Promise<string[]>
 }
 
 interface AllocationFlight {
@@ -109,6 +112,7 @@ export class RequestRouter {
     if (knownLocation) {
       const room = this.rooms.getRoom(knownLocation.roomId)
       if (room) {
+        const udpHost = await this.resolveUdpHost(room, signal)
         this.log?.info(
           {
             playerId,
@@ -130,7 +134,7 @@ export class RequestRouter {
             capacity: room.capacity
           }
         })
-        return { code: ErrorCode.OK, data: this.assignmentFor(room, playerId) }
+        return { code: ErrorCode.OK, data: this.assignmentFor(room, udpHost) }
       }
     }
 
@@ -138,13 +142,16 @@ export class RequestRouter {
     if (held) {
       const room = this.rooms.getRoom(held.roomId)
       if (room) {
-        this.record({
-          category: 'allocation', event: 'allocation.reused',
-          message: `player ${playerId} reuses acknowledged room ${room.roomId}`,
-          roomId: room.roomId, nodeId: room.nodeId, playerIds: [playerId],
-          data: { reason: 'acknowledged_reservation', expiresAt: held.expiresAt }
-        })
-        return { code: ErrorCode.OK, data: this.assignmentFor(room, playerId, held.expiresAt) }
+        const udpHost = await this.resolveUdpHost(room, signal)
+        if (this.reservations.confirmedHoldFor(playerId) === held) {
+          this.record({
+            category: 'allocation', event: 'allocation.reused',
+            message: `player ${playerId} reuses acknowledged room ${room.roomId}`,
+            roomId: room.roomId, nodeId: room.nodeId, playerIds: [playerId],
+            data: { reason: 'acknowledged_reservation', expiresAt: held.expiresAt }
+          })
+          return { code: ErrorCode.OK, data: this.assignmentFor(room, udpHost, held.expiresAt) }
+        }
       }
       this.reservations.release(playerId)
     }
@@ -197,6 +204,7 @@ export class RequestRouter {
 
       attempts += 1
       try {
+        const udpHost = await this.resolveUdpHost(selection.room, signal)
         const ack = await this.withSignal(this.coordinator.reserveRoom(
           selection.room,
           playerId,
@@ -253,7 +261,7 @@ export class RequestRouter {
         })
         return {
           code: ErrorCode.OK,
-          data: this.assignmentFor(selection.room, playerId, expiresAt)
+          data: this.assignmentFor(selection.room, udpHost, expiresAt)
         }
       } catch (error) {
         this.reservations.release(playerId)
@@ -343,21 +351,35 @@ export class RequestRouter {
     this.events?.record(event)
   }
 
+  private async resolveUdpHost (room: RoomSnapshot, signal?: AbortSignal): Promise<UdpHost> {
+    if (signal?.aborted) throw signal.reason ?? this.cancelled()
+    if (!(room.isDomainNode ?? isIP(room.udpHost) === 0)) return room.udpHost
+    try {
+      const addresses = await this.withSignal((this.options.resolveIpv4 ?? resolve4)(room.udpHost), signal)
+      const address = addresses.find(value => isIP(value) === 4)
+      if (!address) throw new Error('DNS returned no IPv4 address')
+      return asUdpHost(address)
+    } catch (error) {
+      if (signal?.aborted) throw signal.reason ?? this.cancelled()
+      this.log?.warn({ err: error, roomId: room.roomId, nodeId: room.nodeId, udpHost: room.udpHost }, 'allocation DNS resolution failed')
+      throw new HermesError(ErrorCode.NODE_UNAVAILABLE, 'room UDP hostname could not be resolved to IPv4', {
+        roomId: room.roomId,
+        nodeId: room.nodeId,
+        hostname: room.udpHost
+      })
+    }
+  }
+
   private assignmentFor (
-    room: {
-      roomId: RoomAssignment['roomId']
-      nodeId: RoomAssignment['nodeId']
-      udpHost: RoomAssignment['udpHost']
-      udpPort: RoomAssignment['udpPort']
-    },
-    playerId: PlayerId,
+    room: RoomSnapshot,
+    udpHost: UdpHost,
     leaseExpiresAt?: number
   ): RoomAssignment {
     const expiresAt = asUnixMs(leaseExpiresAt ?? (Date.now() + this.options.assignmentTtlMs))
     return {
       roomId: room.roomId,
       nodeId: room.nodeId,
-      udpHost: room.udpHost,
+      udpHost,
       udpPort: room.udpPort,
       expiresAt
     }

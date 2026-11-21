@@ -1,3 +1,4 @@
+import { isIP } from 'node:net'
 import type { NodeId, UnixMs } from '../types/branded.js'
 import { asUnixMs } from '../types/branded.js'
 import type {
@@ -18,6 +19,7 @@ export interface NodeTransport {
 
 export interface NodeHealth {
   nodeId: NodeId
+  isDomainNode: boolean
   load: number
   capacity: number
   lastSeenAt: UnixMs
@@ -45,6 +47,7 @@ export class NodeRegistry {
     this.transports.set(transport.nodeId, transport)
     this.health.set(transport.nodeId, {
       nodeId: transport.nodeId,
+      isDomainNode: false,
       load: 0,
       capacity: 0,
       lastSeenAt: asUnixMs(Date.now()),
@@ -66,6 +69,10 @@ export class NodeRegistry {
     const existing = this.health.get(event.data.nodeId)
     const next: NodeHealth = {
       nodeId: event.data.nodeId,
+      isDomainNode:
+        (event.event === 'room.created' || event.event === 'room.updated') && event.data.udpHost !== undefined
+          ? isIP(event.data.udpHost) === 0
+          : existing?.isDomainNode ?? false,
       load: event.data.load ?? existing?.load ?? 0,
       capacity:
         event.data.capacity ??

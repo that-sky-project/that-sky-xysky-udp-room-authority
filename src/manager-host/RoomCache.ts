@@ -1,3 +1,4 @@
+import { isIP } from 'node:net'
 import { LRUCache } from 'lru-cache'
 import type {
   NodeId,
@@ -71,7 +72,7 @@ export class RoomCache {
       this.roomsByNode.get(previous.nodeId)?.delete(room.roomId)
     }
     this.removeCandidateIndex(room.roomId)
-    const next = { ...room, lastChangedAt: asUnixMs(Date.now()) }
+    const next = { ...room, isDomainNode: isIP(room.udpHost) === 0, lastChangedAt: asUnixMs(Date.now()) }
     this.rooms.set(room.roomId, next)
     this.indexRoom(room.nodeId, room.roomId)
     this.indexCandidate(next)
