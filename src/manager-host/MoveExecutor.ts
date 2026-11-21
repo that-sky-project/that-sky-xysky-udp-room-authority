@@ -1,5 +1,7 @@
-import type { PlayerId } from '../types/branded.js'
-import { asProtocolVersion, asUnixMs } from '../types/branded.js'
+import { resolve4 } from 'node:dns/promises'
+import { isIP } from 'node:net'
+import type { PlayerId, UdpHost } from '../types/branded.js'
+import { asProtocolVersion, asUdpHost, asUnixMs } from '../types/branded.js'
 import type { RoomSnapshot } from '../types/contracts.js'
 import { ErrorCode } from '../types/errors.js'
 import type { Logger } from '../infra/logger/logger.js'
@@ -13,6 +15,7 @@ export interface MoveExecutorOptions {
   prepareTtlMs: number
   redirectTtlMs: number
   prepareTimeoutMs?: number
+  resolveIpv4?: (hostname: string) => Promise<string[]>
   effectivePlayersOf?: ((room: RoomSnapshot) => number) | undefined
   applyTargetFacts?: ((room: RoomSnapshot, facts: Record<string, unknown>) => void) | undefined
 }
@@ -53,6 +56,7 @@ export class MoveExecutor {
       const targetConnectedAt = transport.connectedAt
       const deadline = AbortSignal.timeout(this.options.prepareTimeoutMs ?? 15_000)
       const prepareSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
+      const udpHost = await this.resolveTargetUdpHost(target, prepareSignal)
       prepareSent = true
       const ack = await this.pending.send({ v: asProtocolVersion(1), cmd: 'move.prepare', data: {
         moveId, roomId: target.roomId, playerIds, expectedVersion: target.version, ttlMs: this.options.prepareTtlMs
@@ -80,7 +84,7 @@ export class MoveExecutor {
         sourceNodeId: source.nodeId, sourceConnectedAt, fromRoomId: source.roomId,
         ...(input.expectedParticipants ? { expectedParticipants: input.expectedParticipants } : {}),
         ...(reservationToken ? { reservationToken } : {}),
-        to: { roomId: target.roomId, nodeId: target.nodeId, udpHost: target.udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(deliveryDeadline) }, reason
+        to: { roomId: target.roomId, nodeId: target.nodeId, udpHost, udpPort: target.udpPort, expiresAt: asUnixMs(deliveryDeadline) }, reason
       }, signal)
       if (commitAck.code !== ErrorCode.OK) return { ok: false, moveId, reason: 'failed', permanent: commitAck.code === ErrorCode.BAD_REQUEST || commitAck.code === ErrorCode.NOT_FOUND, error: new Error(ackDetail(commitAck)) }
       const committedAt = Date.now()
@@ -91,6 +95,32 @@ export class MoveExecutor {
       if (!prepareSent) this.telemetry.releaseReservation(target.roomId, moveId)
       this.log?.warn({ err: error, moveId, sourceRoomId: source.roomId, targetRoomId: target.roomId }, 'move failed')
       return { ok: false, moveId, reason: 'failed', error }
+    }
+  }
+  private async resolveTargetUdpHost (target: RoomSnapshot, signal: AbortSignal): Promise<UdpHost> {
+    if (signal.aborted) throw signal.reason ?? new Error('move target DNS resolution aborted')
+    const isDomainNode = target.isDomainNode ?? isIP(target.udpHost) === 0
+    if (!isDomainNode) return target.udpHost
+
+    const resolve = this.options.resolveIpv4 ?? resolve4
+    const lookup = Promise.resolve().then(() => resolve(target.udpHost))
+    const addresses = await this.withSignal(lookup, signal)
+    const ipv4 = addresses.find(address => isIP(address) === 4)
+    if (!ipv4) throw new Error(`target hostname ${target.udpHost} has no IPv4 A record`)
+    return asUdpHost(ipv4)
+  }
+
+  private async withSignal<T> (promise: Promise<T>, signal: AbortSignal): Promise<T> {
+    if (signal.aborted) throw signal.reason ?? new Error('move target DNS resolution aborted')
+    let onAbort: () => void = () => {}
+    const aborted = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason ?? new Error('move target DNS resolution aborted'))
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      return await Promise.race([promise, aborted])
+    } finally {
+      signal.removeEventListener('abort', onAbort)
     }
   }
 }

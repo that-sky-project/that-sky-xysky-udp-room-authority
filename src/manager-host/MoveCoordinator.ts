@@ -29,6 +29,7 @@ export interface MoveCoordinatorOptions {
   arrivalCooldownMs?: number
   remigrateCooldownMs?: number
   effectivePlayersOf?: ((room: RoomSnapshot) => number) | undefined
+  resolveIpv4?: (hostname: string) => Promise<string[]>
   stateEmaHalfLifeMs?: number
   confirmationCycles?: number
   planner?: Partial<MovePlannerOptions>
@@ -101,6 +102,7 @@ export class MoveCoordinator {
       reservationTtlMs: options.reservationTtlMs ?? 35_000, prepareTtlMs: options.reservationTtlMs ?? 35_000,
       prepareTimeoutMs: options.prepareTimeoutMs ?? options.moveTransactionTimeoutMs ?? 15_000,
       redirectTtlMs: options.arrivalTimeoutMs ?? 30_000,
+      ...(options.resolveIpv4 ? { resolveIpv4: options.resolveIpv4 } : {}),
       effectivePlayersOf: room => options.effectivePlayersOf?.(room) ?? this.effectivePlayers(room),
       applyTargetFacts: (room, facts) => this.applyTargetFacts(room, facts)
     }, log)
@@ -315,7 +317,7 @@ export class MoveCoordinator {
     }
     return undefined
   }
-  private sourceUnchanged (tx: MoveTransaction): boolean {
+  private sourceUnchanged (tx: MoveTransaction, ignoreHardBonds = false): boolean {
     if (!this.active(tx)) return false
     const now = Date.now()
     const unchanged = tx.plannedIds.every(id => {
@@ -329,12 +331,10 @@ export class MoveCoordinator {
         (expected.levelId === undefined || item.levelId === expected.levelId) && (expected.lvSeq === undefined || item.lvSeq === expected.lvSeq)
     })
     if (!unchanged) return false
-    // Commit-time bond closure: a bond formed after planning (peer switched
-    // into the source room / updated affinity) blocks the redirect; the
-    // caller fails the transaction and queues cancellation, never redirects.
-    return this.bondedPeerOutsidePlan(tx.plannedIds, tx.sourceRoomId, Date.now()) === undefined
+    // Debug/manual moves deliberately override affinity bonds; automatic plans still close the bond again at commit time.
+    return ignoreHardBonds || this.bondedPeerOutsidePlan(tx.plannedIds, tx.sourceRoomId, Date.now()) === undefined
   }
-  private async executePlan (plan: MovePlan | LevelIsolationPlan, source: RoomSnapshot, target: RoomSnapshot, signal?: AbortSignal): Promise<{ tx: MoveTransaction | undefined; reason: PlanSkipReason | undefined }> {
+  private async executePlan (plan: MovePlan | LevelIsolationPlan, source: RoomSnapshot, target: RoomSnapshot, signal?: AbortSignal, ignoreHardBonds = false): Promise<{ tx: MoveTransaction | undefined; reason: PlanSkipReason | undefined }> {
     const now = Date.now()
     if (!plan.playerIds.length) return { tx: undefined, reason: undefined }
     if (plan.playerIds.length > 7) return { tx: undefined, reason: 'plan_too_large' }
@@ -342,7 +342,7 @@ export class MoveCoordinator {
     if (this.roomBusy(source.roomId, now)) return { tx: undefined, reason: 'busy_source' }
     if (this.roomBusy(target.roomId, now)) return { tx: undefined, reason: 'busy_target' }
     if (this.capacity(target) + plan.playerIds.length > target.capacity) return { tx: undefined, reason: 'target_capacity' }
-    const bondedPeerId = this.bondedPeerOutsidePlan(plan.playerIds, source.roomId, now)
+    const bondedPeerId = ignoreHardBonds ? undefined : this.bondedPeerOutsidePlan(plan.playerIds, source.roomId, now)
     if (bondedPeerId !== undefined) {
       this.record({ category: 'move', event: 'plan.rejected', message: `plan rejected: ${plan.playerIds.join(',')} hard-bonded to ${bondedPeerId} outside the plan`, roomId: source.roomId, playerIds: [...plan.playerIds], data: { bondedPeerId } })
       return { tx: undefined, reason: 'bond_incomplete' }
@@ -351,7 +351,7 @@ export class MoveCoordinator {
     const reason: RedirectReason = plan.reason === 'level_isolation' ? 'level-isolation' : plan.reason === 'level_consolidation' ? 'level-consolidation' : plan.reason === 'low_activity_merge' ? 'merge' : 'capacity-rebalance'
     const outcome = await this.executor.execute({ moveId: tx.moveId, playerIds: [...tx.plannedIds], source, target, reason,
       now: Date.now(), ...(signal ? { signal } : {}), expectedParticipants: tx.expectedParticipants,
-      validateSource: () => this.sourceUnchanged(tx), isLive: () => this.active(tx),
+      validateSource: () => this.sourceUnchanged(tx, ignoreHardBonds), isLive: () => this.active(tx),
       onPrepared: facts => this.transactions.prepared(tx, facts)
     })
     this.applyOutcome(tx, outcome)
@@ -393,7 +393,13 @@ export class MoveCoordinator {
     if (!source || !target) throw new Error('source or target room not found')
     if (!this.isRoomPlannable(source) || !this.isRoomPlannable(target)) throw new Error('move room is unhealthy or telemetry is incomplete')
     for (const id of input.playerIds) if (this.rooms.getPlayerLocation(id as PlayerId)?.roomId !== source.roomId) throw new Error('player not in source room')
-    const { tx, reason } = await this.executePlan({ ...input, gain: 0, reason: input.reason === 'merge' ? 'low_activity_merge' : 'player_rebalance' }, source, target, signal)
+    const { tx, reason } = await this.executePlan(
+      { ...input, gain: 0, reason: input.reason === 'merge' ? 'low_activity_merge' : 'player_rebalance' },
+      source,
+      target,
+      signal,
+      true
+    )
     if (!tx) throw new Error(reason === 'bond_incomplete' ? 'move rejected: planned players are hard-bonded to someone outside the plan' : 'target capacity or source/target is busy')
     if (tx.status === 'failed' && signal.aborted) throw new Error('move aborted')
     return tx

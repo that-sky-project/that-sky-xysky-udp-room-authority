@@ -124,6 +124,57 @@ test('MOVING physical occupants and remote reservations count against target cap
     assert.equal((await executor.execute({moveId:'m',playerIds:['p'],source:room('a',2),target:room('b',8),reason:'merge',now:Date.now()})).reason,'no_capacity');
   } finally { await f.cleanup(); }
 });
+test('域名目标迁移在 prepare 前现场解析，move.commit 使用 IPv4 但快照保留域名', async () => {
+  const f = fixture();
+  const queried = [];
+  try {
+    const target = { ...f.rooms.getRoom('b'), udpHost: 'target.example.test' };
+    f.rooms.upsertRoom(target);
+    const currentTarget = f.rooms.getRoom('b');
+    const executor = new MoveExecutor(f.nodes, f.pending, f.cross, f.moves.telemetry, {
+      reservationTtlMs: 35000, prepareTtlMs: 35000, redirectTtlMs: 30000,
+      resolveIpv4: async hostname => { queried.push(hostname); return ['192.0.2.41', '192.0.2.42']; }
+    });
+    const result = await executor.execute({ moveId: 'dns-move', playerIds: ['p'], source: f.rooms.getRoom('a'), target: currentTarget, reason: 'merge', now: Date.now() });
+    assert.equal(result.ok, true);
+    assert.deepEqual(queried, ['target.example.test']);
+    assert.deepEqual(f.sent.map(command => command.cmd), ['move.prepare', 'move.commit']);
+    const commit = f.sent.find(command => command.cmd === 'move.commit');
+    assert.equal(commit.data.udpHost, '192.0.2.41');
+    assert.equal(commit.data.udpPort, currentTarget.udpPort);
+    assert.equal(currentTarget.udpHost, 'target.example.test');
+    assert.equal(f.rooms.getRoom('b').udpHost, 'target.example.test');
+    assert.equal(f.rooms.getRoom('b').isDomainNode, true);
+  } finally { await f.cleanup(); }
+});
+test('迁移目标域名解析失败时不发 prepare/commit 且释放本地容量预留', async () => {
+  const f = fixture();
+  try {
+    f.rooms.upsertRoom({ ...f.rooms.getRoom('b'), udpHost: 'missing.example.test' });
+    const executor = new MoveExecutor(f.nodes, f.pending, f.cross, f.moves.telemetry, {
+      reservationTtlMs: 35000, prepareTtlMs: 35000, redirectTtlMs: 30000,
+      resolveIpv4: async () => { throw new Error('ENOTFOUND'); }
+    });
+    const result = await executor.execute({ moveId: 'dns-fail', playerIds: ['p'], source: f.rooms.getRoom('a'), target: f.rooms.getRoom('b'), reason: 'merge', now: Date.now() });
+    assert.equal(result.ok, false);
+    assert.deepEqual(f.sent, []);
+    assert.equal(f.moves.telemetry.reserved('b'), 0);
+  } finally { await f.cleanup(); }
+});
+test('IPv4 迁移目标原样使用，不执行 DNS', async () => {
+  const f = fixture();
+  let queries = 0;
+  try {
+    const executor = new MoveExecutor(f.nodes, f.pending, f.cross, f.moves.telemetry, {
+      reservationTtlMs: 35000, prepareTtlMs: 35000, redirectTtlMs: 30000,
+      resolveIpv4: async () => { queries++; return ['192.0.2.41']; }
+    });
+    const result = await executor.execute({ moveId: 'ipv4-move', playerIds: ['p'], source: f.rooms.getRoom('a'), target: f.rooms.getRoom('b'), reason: 'merge', now: Date.now() });
+    assert.equal(result.ok, true);
+    assert.equal(queries, 0);
+    assert.equal(f.sent.find(command => command.cmd === 'move.commit').data.udpHost, '127.0.0.1');
+  } finally { await f.cleanup(); }
+});
 test('control contracts preserve ordinary session fences and expose room.sync', () => {
   const data = NodeEventSchema.parse(ev('player.join','a',{player:{playerId:'p',sessionId:'s',lvSeq:1},sessionId:'s',connectedAt:100})).data;
   assert.equal(data.player.sessionId,'s'); assert.equal(data.sessionId,'s');

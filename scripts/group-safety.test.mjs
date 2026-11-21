@@ -331,20 +331,17 @@ const seedLevelChange = (f, roomId, playerId, fromLevel, toLevel, extra = {}, no
   f.moves.telemetry.upsert(roomId, { playerId, levelId: toLevel, sessionId: 's-' + playerId, lvSeq: 2, status: 'ACTIVE', ...extra }, now)
 }
 
-test('pre-prepare bond violation records plan.rejected and creates no transaction', async () => {
+test('debug manual move overrides hard bonds outside the requested player group', async () => {
   const events = new DebugEventLog(100)
   const f = fixture({}, events)
   try {
     seed(f, 'a', 'p', 1, { affinity: { q: 1 } })
     seed(f, 'a', 'q', 1)
-    await assert.rejects(f.moves.manualMove({ sourceRoomId: 'a', targetRoomId: 'b', playerIds: ['p'] }), /bonded/)
-    assert.equal(f.moves.list().length, 0, 'no transaction was created')
-    const rejected = events.list({ category: 'move' }).entries.filter(e => e.event === 'plan.rejected')
-    assert.equal(rejected.length, 1)
-    assert.equal(rejected[0].roomId, 'a')
-    assert.deepEqual(rejected[0].playerIds, ['p'])
-    assert.equal(rejected[0].data.bondedPeerId, 'q')
-    assert.match(rejected[0].message, /q/)
+    const tx = await f.moves.manualMove({ sourceRoomId: 'a', targetRoomId: 'b', playerIds: ['p'] })
+    assert.equal(tx.status, 'committed')
+    assert.deepEqual(tx.plannedIds, ['p'], 'manual request moves exactly the explicitly requested players')
+    assert.ok(f.sent.some(command => command.cmd === 'move.commit'))
+    assert.equal(events.list({ category: 'move' }).entries.some(event => event.event === 'plan.rejected'), false)
   } finally { await f.cleanup() }
 })
 
@@ -361,7 +358,13 @@ test('post-prepare reverse bond fails the transaction and queues cancellation wi
     const original = f.cross.redirectPlayers.bind(f.cross)
     let redirects = 0
     f.cross.redirectPlayers = async (...args) => { redirects++; return original(...args) }
-    const tx = await f.moves.manualMove({ sourceRoomId: 'a', targetRoomId: 'b', playerIds: ['p'] })
+    // 通过自动规划执行，调试手动迁移的豁免不应影响自动路径。
+    f.moves.planner.calibrate = () => {}
+    f.moves.planner.plan = () => [{ sourceRoomId: 'a', targetRoomId: 'b', playerIds: ['p'], gain: 1, reason: 'player_rebalance' }]
+    f.moves.levelIsolationPlanner.plan = () => []
+    const txs = await f.moves.planAndExecute()
+    const tx = txs[0]
+    assert.ok(tx)
     assert.equal(tx.status, 'failed')
     assert.equal(redirects, 0, 'commit-time closure blocks the redirect')
     assert.ok(f.sent.some(c => c.cmd === 'move.cancel' && c.data.moveId === tx.moveId), 'cancellation queued')
