@@ -124,6 +124,10 @@ export class ManagerHttpApi {
           if (room.players > 0) summary.occupiedRooms += 1
           summary.totalRooms += 1
         }
+        if (url.searchParams.get('type') === 'summary') {
+          this.writeJson(res, 200, { code: ErrorCode.OK, data: { summary } })
+          return
+        }
         const nodes = this.runtime.nodes
           .listHealth()
           .map(({ nodeId: internalNodeId, circuitOpenUntil: _circuitOpenUntil,

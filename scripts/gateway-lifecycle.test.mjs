@@ -148,6 +148,27 @@ test('/debug/allnode 汇总全部缓存房间，并仅在输出中隐藏通道�
   assert.deepEqual((await getAllNodes()).data.summary, { totalPlayers: 1, occupiedRooms: 1, totalRooms: 3 })
 })
 
+test('/debug/allnode?type=summary 只返回汇总且不构建节点和规划明细', async t => {
+  const { gateway, runtime, config } = fixture()
+  t.after(() => gateway.stop())
+  await gateway.start()
+  config.debugApiToken = 'summary-test-token'
+  const address = `http://${addressOf(gateway)}/debug/allnode?type=summary`
+  assert.equal((await fetch(address)).status, 401)
+  const headers = { 'x-debug-token': 'summary-test-token' }
+  runtime.nodes.listHealth = () => assert.fail('summary 模式不应读取节点明细')
+  runtime.moves.stabilitySnapshot = () => assert.fail('summary 模式不应构建规划明细')
+  t.after(() => { delete runtime.nodes.listHealth; delete runtime.moves.stabilitySnapshot })
+  const empty = await (await fetch(address, { headers })).json()
+  assert.deepEqual(empty, { code: 0, data: { summary: { totalPlayers: 0, occupiedRooms: 0, totalRooms: 0 } } })
+  for (const [roomId, players] of [['r1', 4], ['r2', 0], ['r3', 2]]) {
+    runtime.rooms.upsertRoom({ roomId, nodeId: 'n', players, udpHost: '127.0.0.1', udpPort: 41000, capacity: 8, version: 1, draining: false })
+  }
+  const response = await fetch(address, { headers })
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { code: 0, data: { summary: { totalPlayers: 6, occupiedRooms: 2, totalRooms: 3 } } })
+})
+
 test('unexpected HTTP and node processing failures include stack and task context', async t => {
   const { gateway, runtime, logs } = fixture()
   t.after(() => gateway.stop())
